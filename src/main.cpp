@@ -17,6 +17,7 @@
 #include <popops/codelets.hpp>
 
 #include "ipu/ipu_utils.hpp"
+#include <radfoam_types.hpp>
 
 template <typename T>
 std::string vector_slice_to_string(const std::vector<T>& vec, size_t start, size_t end) {
@@ -44,15 +45,6 @@ std::string vector_slice_to_string(const std::vector<T>& vec, size_t start, size
 
 
 // ─── Point type ────────────────────────────────────────────────────
-struct LocalPoint {
-    float   x, y, z;
-    uint8_t r, g, b, _pad;
-    float   density;
-    uint32_t adj_end;
-};
-static_assert(sizeof(LocalPoint) == 24, "Unexpected LocalPoint size");
-
-// ─── Register the compound type with HighFive ─────────────────────
 static inline HighFive::CompoundType makeLocalPointType()
 {
     using namespace HighFive;
@@ -70,12 +62,6 @@ static inline HighFive::CompoundType makeLocalPointType()
 }
 HIGHFIVE_REGISTER_TYPE(LocalPoint, makeLocalPointType);
 
-struct NeighborPoint {
-    float x, y, z;
-    uint32_t gid;
-};
-static_assert(sizeof(NeighborPoint) == 16, "Unexpected NeighborPoint size");
-
 // ─── Register the compound type with HighFive ─────────────────────
 static inline HighFive::CompoundType makeNeighborPointType()
 {
@@ -89,20 +75,6 @@ static inline HighFive::CompoundType makeNeighborPointType()
 }
 HIGHFIVE_REGISTER_TYPE(NeighborPoint, makeNeighborPointType);
 
-struct vec3f {
-    float x, y, z;
-};
-
-// A 28-byte ray record, laid out as 8 × uint32 words
-struct Ray {
-  uint16_t x, y;         // pixel coords
-  float    t;            // ray distance
-  float    transmittance;
-  float    r, g, b;      // accumulated color
-  uint32_t next_cell;    // for traversal
-};
-static_assert(sizeof(Ray) == 28, "Ray must be 28B");
-
 // ─── Acquire an IPU (or an IPU Model if no hardware is available) ─
 poplar::Device acquireDevice()
 {
@@ -113,6 +85,35 @@ poplar::Device acquireDevice()
 
     throw std::runtime_error("No available IPU device");
 }
+
+void h5_load_test_print(const std::vector<LocalPoint>& local_points,
+                        const std::vector<NeighborPoint>& neighbor_points,
+                        const std::vector<uint16_t>& adjacency_list,
+                        size_t index) {
+    std::cout << "" << std::endl;
+    ipu_utils::logger()->info("Local points size: {}", local_points.size());
+    if (index < local_points.size()) {
+        const auto& pt = local_points[index];
+        ipu_utils::logger()->info("Local point[{}]: x={}, y={}, z={}", index, pt.x, pt.y, pt.z);
+    } else {
+        ipu_utils::logger()->warn("Index {} out of bounds for local_points", index);
+    }
+
+    ipu_utils::logger()->info("Neighbor points size: {}", neighbor_points.size());
+    if (index < neighbor_points.size()) {
+        const auto& nb = neighbor_points[index];
+        ipu_utils::logger()->info("Neighbor point[{}]: x={}, y={}, z={}", index, nb.x, nb.y, nb.z);
+    } else {
+        ipu_utils::logger()->warn("Index {} out of bounds for neighbor_points", index);
+    }
+
+    ipu_utils::logger()->info("Loaded {} adjacency entries", adjacency_list.size());
+    ipu_utils::logger()->info("Adjacency [{}:{}]: {}", 
+                              0, std::min<size_t>(10, adjacency_list.size()), 
+                              vector_slice_to_string(adjacency_list, 0, 10));
+    std::cout << "" << std::endl;
+}
+
 
 int main(int argc, char** argv)
 {
@@ -126,28 +127,16 @@ int main(int argc, char** argv)
         auto local_ds = file.getGroup("part0000").getDataSet("local_pts");
         std::vector<LocalPoint> local_points;
         local_ds.read(local_points);
-        ipu_utils::logger()->info("Loaded {} local points", local_points.size());
-        ipu_utils::logger()->info("Loaded local point[0]: x={}, y={}, z={}", 
-                                  local_points[0].x, local_points[0].y, local_points[0].z);
-
-        const float x = local_points[0].x;
-        const float y = local_points[0].y;
-        const float z = local_points[0].z;
-
+        
         auto neighbor_ds = file.getGroup("part0000").getDataSet("neighbor_pts");
         std::vector<NeighborPoint> neighbor_points;
         neighbor_ds.read(neighbor_points);
 
-        ipu_utils::logger()->info("Loaded {} neighbor points", neighbor_points.size());
-        ipu_utils::logger()->info("Loaded neighbor point[0]: x={}, y={}, z={}", 
-                                  neighbor_points[0].x, neighbor_points[0].y, neighbor_points[0].z);
-
         auto adj_ds = file.getGroup("part0000").getDataSet("adjacency_list");
         std::vector<uint16_t> adjacency_list;
         adj_ds.read(adjacency_list);
-        ipu_utils::logger()->info("Loaded {} adjacency entries", adjacency_list.size());
-        ipu_utils::logger()->info("Adjacency [0:10]: {}", vector_slice_to_string(adjacency_list, 0, 10));
 
+        h5_load_test_print(local_points, neighbor_points, adjacency_list, 0);
 
         // ─── Build a simple Poplar graph ───────────────────────────
         ipu_utils::StreamableTensor inputLocal("input_local");
@@ -161,9 +150,10 @@ int main(int argc, char** argv)
 
         auto device = acquireDevice();
         poplar::Graph graph(device.getTarget());
-        const std::string codeletFile = std::string(POPC_PREFIX) + "/codelets/codelets.cpp";
+        const std::string codeletFile = std::string(POPC_PREFIX) + "/src/codelets/codelets.cpp";
+        const std::string incPath = std::string(POPC_PREFIX) + "/include/";
         const std::string glmPath = std::string(POPC_PREFIX) + "/external/glm/";
-        const std::string includes = " -I " + glmPath;
+        const std::string includes = " -I " + incPath + " -I " + glmPath;
         ipu_utils::logger()->debug("POPC_PREFIX: {}", POPC_PREFIX);
         popops::addCodelets(graph);
         graph.addCodelets(codeletFile, poplar::CodeletFileType::Auto, "-O3" + includes);
@@ -211,10 +201,6 @@ int main(int argc, char** argv)
         // Device computation: sum both tensors
         auto cs = graph.addComputeSet("sum_xyz");
         auto vertex = graph.addVertex(cs, "RayTrace");
-
-        // Use only the first 3 elements of each point set
-        // auto localSlice = inputLocal.get().slice(0, 3);
-        // auto neighborSlice = inputNeighbors.get().slice(0, 3);
 
         graph.connect(vertex["local_pts"], inputLocal.get());
         graph.connect(vertex["neighbor_pts"], inputNeighbors.get());

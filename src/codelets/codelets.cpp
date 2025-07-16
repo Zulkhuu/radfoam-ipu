@@ -2,26 +2,7 @@
 
 #include <glm/mat4x4.hpp>
 #include <glm/gtc/type_ptr.hpp>
-
-struct LocalPoint {
-    float   x, y, z;
-    uint8_t r, g, b, _pad;
-    float   density;
-    uint32_t adj_end;
-};
-
-struct NeighborPoint {
-    float x, y, z;
-    uint32_t gid;
-};
-
-struct Ray {
-  uint16_t x, y;         // pixel coords
-  float    t;            // ray distance
-  float    transmittance;
-  float    r, g, b;      // accumulated color
-  uint32_t next_cell;    // for traversal
-};
+#include <radfoam_types.hpp>
 
 static const glm::mat4 View(
     glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),
@@ -90,7 +71,6 @@ public:
     return true;
   }
 };
-
 
 class RayGen : public poplar::Vertex {
 public:
