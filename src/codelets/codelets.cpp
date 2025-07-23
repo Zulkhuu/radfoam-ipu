@@ -3,6 +3,7 @@
 #include <glm/mat4x4.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <radfoam_types.hpp>
+#include <ipu/tile_config.hpp>
 
 static const glm::mat4 View(
     glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),
@@ -71,8 +72,8 @@ public:
     *result_u16 = tile_id; //ray_in1.x; //local_pt->adj_end;
     *result_float = local_pt->x;
     
-    for (unsigned i = 0; i < 12; ++i)
-      framebuffer[i] = i*2;
+    for (unsigned i = 0; i < framebuffer.size(); ++i)
+      framebuffer[i] = 255 - tile_id/4;
 
     return true;
   }

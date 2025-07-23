@@ -1,22 +1,35 @@
+#pragma once
 #include <cassert>
+#include <cstddef>
 
-// ───── Image Dimensions (Pixels) ──────────────────────────────────
-constexpr float kFullImageWidth  = 1280.0f;
-constexpr float kFullImageHeight = 768.0f;
+// -----------------------------------------------------------------------------
+// Full image dimensions (pixels)
+// -----------------------------------------------------------------------------
+constexpr std::size_t kFullImageWidth  = 1280;
+constexpr std::size_t kFullImageHeight = 768;
 
-// ───── Tiling Configuration ───────────────────────────────────────
-// Number of horizontal and vertical tiles used to divide the image
-constexpr int kNumTilesX = 32;
-constexpr int kNumTilesY = 32;
+// -----------------------------------------------------------------------------
+// Tile grid configuration
+// -----------------------------------------------------------------------------
+constexpr std::size_t kNumTilesX = 32;  // Horizontal tile count
+constexpr std::size_t kNumTilesY = 32;  // Vertical tile count
+constexpr std::size_t kNumTraceTiles = 1024;  // Total number of tiles
 
-// ───── Tile Dimensions (Pixels) ───────────────────────────────────
-// Dimensions of a framebuffer slice in a single tile 
-constexpr int kTileWidth  = 40;
-constexpr int kTileHeight = 24;
+// -----------------------------------------------------------------------------
+// Tile dimensions (pixels)
+// -----------------------------------------------------------------------------
+constexpr std::size_t kTileWidth  = 40; // kFullImageWidth  / kNumTilesX;
+constexpr std::size_t kTileHeight = 24; // kFullImageHeight / kNumTilesY;
 
-// ───── Sanity Check ───────────────────────────────────────────────
-// Ensure that tiling evenly divides the image
-static_assert(  kTileWidth  * kNumTilesX == static_cast<int>(kFullImageWidth),  
-                "Tile width doesn't evenly divide image width");
-static_assert(  kTileHeight * kNumTilesY == static_cast<int>(kFullImageHeight), 
-                "Tile height doesn't evenly divide image height");
+// Per-tile framebuffer size (RGB: 3 bytes per pixel)
+constexpr std::size_t kTileFramebufferSize = 960; // kTileWidth * kTileHeight * 3;
+
+// -----------------------------------------------------------------------------
+// Sanity checks
+// -----------------------------------------------------------------------------
+static_assert(kNumTilesX  * kNumTilesY == kNumTraceTiles,
+              "Number of tiles does not match total trace tiles");
+static_assert(kTileWidth  * kNumTilesX == kFullImageWidth,
+              "Tile width does not evenly divide full image width");
+static_assert(kTileHeight * kNumTilesY == kFullImageHeight,
+              "Tile height does not evenly divide full image height");
