@@ -71,11 +71,11 @@ public:
     
     // *result_u16 = adjacency.size(); //local_pt->adj_end;
     // *result_float = nbr_pt->x;
-    *result_u16 = tile_id; //ray_in1.x; //local_pt->adj_end;
+    *result_u16 = ray_in1.x; //local_pt->adj_end;
     *result_float = local_pt->x;
     
     for (unsigned i = 0; i < framebuffer.size(); ++i)
-      framebuffer[i] = tile_id%256;
+      framebuffer[i] = (255 - tile_id/4 + ray_in1.x)%256;
 
     return true;
   }
@@ -85,13 +85,14 @@ class RayGen : public poplar::Vertex {
 public:
   poplar::Input<poplar::Vector<uint8_t>> raysIn;
   poplar::Output<poplar::Vector<uint8_t>> raysOut;
+  poplar::Input<unsigned> exec_count; 
 
   bool compute() {
     constexpr int RaySize = sizeof(Ray);  
 
     int index = 1;
     Ray* ray_out1  = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*index);
-    ray_out1->x = 12;
+    ray_out1->x = exec_count;
     ray_out1->r = 0.345;
 
 

@@ -22,13 +22,15 @@ constexpr std::size_t kTileWidth  = 40; // kFullImageWidth  / kNumTilesX;
 constexpr std::size_t kTileHeight = 24; // kFullImageHeight / kNumTilesY;
 
 // Per-tile framebuffer size (RGB: 3 bytes per pixel)
-constexpr std::size_t kTileFramebufferSize = 960; // kTileWidth * kTileHeight * 3;
+constexpr std::size_t kTileFramebufferSize = 40 * 24 * 3; // kTileWidth * kTileHeight * 3;
 
 // -----------------------------------------------------------------------------
 // Sanity checks
 // -----------------------------------------------------------------------------
 static_assert(kNumTilesX  * kNumTilesY == kNumTraceTiles,
               "Number of tiles does not match total trace tiles");
+static_assert(kTileWidth * kTileHeight * 3 == kTileFramebufferSize,
+              "Full imagebuffer slice size does not match slice width and height");
 static_assert(kTileWidth  * kNumTilesX == kFullImageWidth,
               "Tile width does not evenly divide full image width");
 static_assert(kTileHeight * kNumTilesY == kFullImageHeight,

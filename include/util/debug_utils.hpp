@@ -23,4 +23,9 @@ std::string VectorSliceToString(const std::vector<T>& v,
   return oss.str();
 }
 
+bool isPoplarEngineOptionsEnabled() {
+    const char* env = std::getenv("POPLAR_ENGINE_OPTIONS");
+    return (env != nullptr && std::string(env).find("autoReport") != std::string::npos);
+}
+
 }  // namespace radfoam::util

@@ -34,6 +34,7 @@
 #include "ipu/ipu_utils.hpp"
 #include "ipu/tile_config.hpp"
 #include "io/hdf5_types.hpp"
+#include "util/debug_utils.hpp"
 
 using namespace radfoam::geometry;
 
@@ -45,7 +46,8 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
  public:
   RadiantFoamIpuBuilder(std::string h5_file, int tile_to_compute = 0)
       : h5_file_(std::move(h5_file)),
-        tile_to_compute_(tile_to_compute) {}
+        tile_to_compute_(tile_to_compute),
+				initialized_(false) {}
 
   // BuilderInterface overrides
   void build(poplar::Graph& graph, const poplar::Target& target) override;
@@ -66,22 +68,25 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
 
   // ---- members -------------------------------------------------------------
   std::string h5_file_;
-  int         tile_to_compute_ = 0;
-  bool        initialized_     = false;
-
+  int         tile_to_compute_;
+  bool        initialized_;//     = false;
+	
   std::vector<std::vector<LocalPoint>>    local_pts_;
   std::vector<std::vector<NeighborPoint>> neighbor_pts_;
   std::vector<std::vector<uint16_t>>      adjacency_;
 
   poplar::Tensor rays_a_, rays_b_;
-  poplar::Tensor result_f32_all_;
-  poplar::Tensor result_u16_all_;
-  poplar::Tensor framebuffer_all_;
 
   std::vector<ipu_utils::StreamableTensor> local_tensors_;
   std::vector<ipu_utils::StreamableTensor> neighbor_tensors_;
   std::vector<ipu_utils::StreamableTensor> adj_tensors_;
 
+	ipu_utils::StreamableTensor execCountT {"exec_count"};
+	ipu_utils::StreamableTensor fb_read_all {"fb_read_all"};
+	ipu_utils::StreamableTensor result_f32_read {"result_f32_read"};
+	ipu_utils::StreamableTensor result_u16_read {"result_u16_read"};
+	unsigned execCounterHost = 0;
+	
   poplar::program::Sequence per_tile_writes_;
 };
 
@@ -120,18 +125,15 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
   rays_a_ = graph.addVariable(poplar::UNSIGNED_CHAR, {kTotalBytes}, "raysA");
   rays_b_ = graph.addVariable(poplar::UNSIGNED_CHAR, {kTotalBytes}, "raysB");
 
-  result_f32_all_ = graph.addVariable(poplar::FLOAT, {kNumTraceTiles});
-  result_u16_all_ = graph.addVariable(poplar::UNSIGNED_SHORT, {kNumTraceTiles});
-  framebuffer_all_ =
-      graph.addVariable(poplar::UNSIGNED_CHAR,
-                        {kNumTraceTiles, kTileFramebufferSize});
+	result_f32_read.buildTensor(graph, poplar::FLOAT, {kNumTraceTiles});
+	result_u16_read.buildTensor(graph, poplar::UNSIGNED_SHORT, {kNumTraceTiles});
+  fb_read_all.buildTensor(graph, poplar::UNSIGNED_CHAR, {kNumTraceTiles, kTileFramebufferSize});
 
   // Faster mapping via poputil helpers (instead of manual loop):
-  poputil::mapTensorLinearlyWithOffset(graph, result_f32_all_, 0);
-  poputil::mapTensorLinearlyWithOffset(graph, result_u16_all_, 0);
-  poputil::mapTensorLinearlyWithOffset(
-      graph,
-      framebuffer_all_.reshape({kNumTraceTiles, kTileFramebufferSize}),
+  poputil::mapTensorLinearlyWithOffset(graph, result_f32_read.get(), 0);
+  poputil::mapTensorLinearlyWithOffset(graph, result_u16_read.get(), 0);
+  poputil::mapTensorLinearlyWithOffset(graph,
+      fb_read_all.get().reshape({kNumTraceTiles, kTileFramebufferSize}),
       0);
 
   // Zero-init rays buffers once per run
@@ -176,10 +178,10 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
     graph.connect(v["raysIn"],  slice_b);
     graph.connect(v["raysOut"], slice_a);
 
-    graph.connect(v["result_float"], result_f32_all_.slice({tid}, {tid + 1}).reshape({}));
-    graph.connect(v["result_u16"], result_u16_all_.slice({tid}, {tid + 1}).reshape({}));
+    graph.connect(v["result_float"], result_f32_read.get().slice({tid}, {tid + 1}).reshape({}));
+    graph.connect(v["result_u16"], result_u16_read.get().slice({tid}, {tid + 1}).reshape({}));
 
-    auto framebuffer_slice = framebuffer_all_.slice({tid, 0}, {tid + 1, kTileFramebufferSize}).reshape({kTileFramebufferSize});
+    auto framebuffer_slice = fb_read_all.get().slice({tid, 0}, {tid + 1, kTileFramebufferSize}).reshape({kTileFramebufferSize});
     graph.connect(v["framebuffer"], framebuffer_slice);
 
     auto tile_const = graph.addConstant(poplar::UNSIGNED_SHORT, {}, static_cast<unsigned>(tid));
@@ -206,6 +208,12 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 
     const auto slice_a = rays_a_.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
     const auto slice_b = rays_b_.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
+
+		execCountT.buildTensor(graph, poplar::UNSIGNED_INT, {});
+		graph.setTileMapping(execCountT.get(), kRaygenTile);
+		graph.connect(v["exec_count"], execCountT.get());
+		getPrograms().add("write_exec_count", execCountT.buildWrite(graph, true));
+
     graph.connect(v["raysIn"],  slice_a);
     graph.connect(v["raysOut"], slice_b);
     graph.setTileMapping(v, kRaygenTile);
@@ -222,16 +230,8 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 	result_f32_host_.resize(kNumTraceTiles);
 	result_u16_host_.resize(kNumTraceTiles);
 
-  ipu_utils::StreamableTensor fb_read_all("fb_read_all");
-  fb_read_all = framebuffer_all_.reshape({kNumTraceTiles * kTileFramebufferSize});
   getPrograms().add("fb_read_all", fb_read_all.buildRead(graph, true));
-
-	ipu_utils::StreamableTensor result_f32_read("result_f32_read");
-	result_f32_read = result_f32_all_;
 	getPrograms().add("read_result_f32", result_f32_read.buildRead(graph, true));
-
-	ipu_utils::StreamableTensor result_u16_read("result_u16_read");
-	result_u16_read = result_u16_all_;
 	getPrograms().add("read_result_u16", result_u16_read.buildRead(graph, true));
 }
 
@@ -245,36 +245,37 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& engine,
       local_tensors_[tid].connectWriteStream(engine, local_pts_[tid]);
       neighbor_tensors_[tid].connectWriteStream(engine, neighbor_pts_[tid]);
       adj_tensors_[tid].connectWriteStream(engine, adjacency_[tid]);
+			fb_read_all.connectReadStream(engine, framebuffer_host_.data());
+			result_f32_read.connectReadStream(engine, result_f32_host_.data());
+			result_u16_read.connectReadStream(engine, result_u16_host_.data());
     }
+    execCountT.connectWriteStream(engine, &execCounterHost);
     engine.run(getPrograms().getOrdinals().at("zero_rays"));
     engine.run(getPrograms().getOrdinals().at("write"));
     initialized_ = true;
   }
 
+	engine.run(getPrograms().getOrdinals().at("write_exec_count"));
   engine.run(getPrograms().getOrdinals().at("RayGenCS"));
   engine.run(getPrograms().getOrdinals().at("RayTraceCS"));
   readAllTiles(engine);
+	execCounterHost++;
 }
 
 // -----------------------------------------------------------------------------
 // readAllTiles()
 void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& engine) {
-
-  ipu_utils::StreamableTensor fb_read_all("fb_read_all");
-  fb_read_all.connectReadStream(engine, framebuffer_host_.data());
-  engine.run(getPrograms().getOrdinals().at("fb_read_all"));
-	ipu_utils::StreamableTensor result_f32_read("result_f32_read");
-
-	result_f32_read.connectReadStream(engine, result_f32_host_.data());
+	engine.run(getPrograms().getOrdinals().at("fb_read_all"));
 	engine.run(getPrograms().getOrdinals().at("read_result_f32"));
-
-	ipu_utils::StreamableTensor result_u16_read("result_u16_read");
-	result_u16_read.connectReadStream(engine, result_u16_host_.data());
 	engine.run(getPrograms().getOrdinals().at("read_result_u16"));
+
 	logger()->info("Computed results for tile {} -> float: {}, u16: {}",
 								tile_to_compute_,
 								result_f32_host_[tile_to_compute_],
 								result_u16_host_[tile_to_compute_]);
+	const size_t offset = tile_to_compute_ * kTileFramebufferSize;
+	logger()->info("Framebuffer[0:10]: {}",
+               	radfoam::util::VectorSliceToString(framebuffer_host_, offset, offset + 10));
 }
 
 // -----------------------------------------------------------------------------
@@ -303,6 +304,15 @@ int main(int argc, char** argv) {
   const int tile_to_debug =
       (argc > 2) ? std::stoi(argv[2]) : 0;
 
+	poplar::OptionFlags engine_options;
+	if (radfoam::util::isPoplarEngineOptionsEnabled()) {
+		logger()->info("Poplar auto-reporting is enabled (POPLAR_ENGINE_OPTIONS set)");
+		engine_options = {{"debug.instrument", "true"}};
+	} else {
+		logger()->info("Poplar auto-reporting is NOT enabled");
+		engine_options = {}; 
+	}
+
   RadiantFoamIpuBuilder builder(input_file, tile_to_debug);
 
   ipu_utils::RuntimeConfig cfg{/*numIpus=*/1,
@@ -316,10 +326,41 @@ int main(int argc, char** argv) {
   builder.setRuntimeConfig(cfg);
 
   ipu_utils::GraphManager mgr;
-  if (mgr.run(builder, {{"debug.instrument", "true"}}) != EXIT_SUCCESS) return 1;
+  mgr.compileOrLoad(builder, engine_options);
+	mgr.prepareEngine(engine_options);
 
-  cv::imwrite("framebuffer_full.png",
-              AssembleFullImage(builder.framebuffer_host_));
+  auto imagePtr = std::make_unique<cv::Mat>(kFullImageHeight, kFullImageWidth, CV_8UC3);
+	auto imagePtrBuffered = std::make_unique<cv::Mat>(kFullImageHeight, kFullImageWidth, CV_8UC3);
+
+	std::unique_ptr<InterfaceServer> uiServer;
+	InterfaceServer::State state;
+	state.fov = glm::radians(40.f);
+	state.device = "cpu"; // args.at("device").as<std::string>();
+	auto uiPort = 5000; // args.at("ui-port").as<int>();
+	if (uiPort) {
+		uiServer.reset(new InterfaceServer(uiPort));
+		uiServer->start();
+		uiServer->initialiseVideoStream(imagePtr->cols, imagePtr->rows);
+		uiServer->updateFov(state.fov);
+	}
+
+	AsyncTask hostProcessing;
+	auto uiUpdateFunc = [&]() {
+		uiServer->sendPreviewImage(*imagePtrBuffered);
+	};
+
+	do {
+		hostProcessing.waitForCompletion();
+		mgr.execute(builder); 
+		*imagePtr = AssembleFullImage(builder.framebuffer_host_);
+		std::swap(imagePtr, imagePtrBuffered);
+		hostProcessing.run(uiUpdateFunc);
+		state = uiServer->consumeState();
+	} while (uiServer && !state.stop);
+
+	hostProcessing.waitForCompletion();
+  // cv::imwrite("framebuffer_full.png",
+  //             AssembleFullImage(builder.framebuffer_host_));
 	
   return 0;
 }
