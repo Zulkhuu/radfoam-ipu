@@ -2,8 +2,10 @@
 
 #include <glm/mat4x4.hpp>
 #include <glm/gtc/type_ptr.hpp>
-#include <radfoam_types.hpp>
+#include <geometry/primitives.hpp>
 #include <ipu/tile_config.hpp>
+
+using namespace radfoam::geometry;
 
 static const glm::mat4 View(
     glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),
@@ -73,7 +75,7 @@ public:
     *result_float = local_pt->x;
     
     for (unsigned i = 0; i < framebuffer.size(); ++i)
-      framebuffer[i] = 255 - tile_id/4;
+      framebuffer[i] = tile_id%256;
 
     return true;
   }
