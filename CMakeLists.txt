@@ -15,6 +15,7 @@ message(STATUS "Poplar version ${POPLAR_VERSION_MAJOR}.${POPLAR_VERSION_MINOR}.$
 # ───── Dependencies ────────────────────────────────────────────────
 find_package(Boost REQUIRED COMPONENTS program_options unit_test_framework)
 find_package(OpenCV REQUIRED)
+find_package(spdlog REQUIRED)
 find_package(HDF5 REQUIRED COMPONENTS C HL)
 
 include(FetchContent)
@@ -51,8 +52,10 @@ target_link_libraries(main
   PRIVATE
     HighFive
     ${HDF5_LIBRARIES}
+    ${OpenCV_LIBS}
     ${PACKETCOMMS_LIBRARIES}
     ${VIDEOLIB_LIBRARIES}
+    spdlog::spdlog
     Boost::program_options
     Boost::unit_test_framework
     poplar popops poputil poprand pvti      # Link Poplar libraries

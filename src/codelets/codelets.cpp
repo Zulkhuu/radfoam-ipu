@@ -38,14 +38,16 @@ public:
   poplar::Input<poplar::Vector<uint8_t>> local_pts;
   poplar::Input<poplar::Vector<uint8_t>> neighbor_pts;
   poplar::Input<poplar::Vector<unsigned short>> adjacency;
-  poplar::Input<poplar::Vector<unsigned short>> scene_sizes;
+  poplar::Input<unsigned short> tile_id;
 
   poplar::Input<poplar::Vector<uint8_t>> raysIn;
   poplar::Output<poplar::Vector<uint8_t>> raysOut;
+
+  poplar::InOut<poplar::Vector<uint8_t>> framebuffer;
   
   poplar::Output<float> result_float;
   poplar::Output<unsigned short> result_u16;
-
+  
   bool compute() {
     constexpr int RaySize = sizeof(Ray);
     constexpr int LocalPointSize = sizeof(LocalPoint);
@@ -53,8 +55,8 @@ public:
     glm::mat4 invView = glm::inverse(View);
     glm::mat4 invProj = glm::inverse(Proj);
     glm::vec3 rayOrigin = glm::vec3(invView[3]);
-
-    const LocalPoint* local_pt = readStructAt<LocalPoint>(local_pts, 1000);  
+    
+    const LocalPoint* local_pt = readStructAt<LocalPoint>(local_pts, 0);  
     const NeighborPoint* nbr_pt = readStructAt<NeighborPoint>(neighbor_pts, 2);  
 
     //memcpy(&pt, local_pts.data()+LocalPointSize, LocalPointSize);
@@ -63,11 +65,15 @@ public:
 
     int index = 1;
     Ray ray_in1  = *reinterpret_cast<const Ray*>(raysIn.data()+sizeof(Ray)*index);
-
+    
     // *result_u16 = adjacency.size(); //local_pt->adj_end;
     // *result_float = nbr_pt->x;
-    *result_u16 = ray_in1.x; //local_pt->adj_end;
-    *result_float = invView[3][0];
+    *result_u16 = tile_id; //ray_in1.x; //local_pt->adj_end;
+    *result_float = local_pt->x;
+    
+    for (unsigned i = 0; i < 12; ++i)
+      framebuffer[i] = i*2;
+
     return true;
   }
 };
@@ -77,20 +83,14 @@ public:
   poplar::Input<poplar::Vector<uint8_t>> raysIn;
   poplar::Output<poplar::Vector<uint8_t>> raysOut;
 
-  poplar::InOut<poplar::Vector<uint8_t>> framebuffer;
-
   bool compute() {
     constexpr int RaySize = sizeof(Ray);  
-    constexpr int fb_width = 128;   
-    constexpr int fb_height = 72;   
 
     int index = 1;
     Ray* ray_out1  = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*index);
     ray_out1->x = 12;
     ray_out1->r = 0.345;
 
-    for (unsigned i = 0; i < 12; ++i)
-      framebuffer[i] = i*2;
 
     return true;
   }
