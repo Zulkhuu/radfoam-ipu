@@ -23,6 +23,7 @@
 
 #include <glm/glm.hpp>
 #include <glm/mat4x4.hpp>
+#include <glm/gtc/type_ptr.hpp>
 #include <glm/gtc/matrix_transform.hpp> 
 
 #include <pvti/pvti.hpp>
@@ -47,11 +48,15 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
   RadiantFoamIpuBuilder(std::string h5_file, int tile_to_compute = 0)
       : h5_file_(std::move(h5_file)),
         tile_to_compute_(tile_to_compute),
-				initialized_(false) {}
+				initialized_(false),
+				hostViewMatrix_(16),
+				hostProjMatrix_(16) {}
 
   // BuilderInterface overrides
   void build(poplar::Graph& graph, const poplar::Target& target) override;
   void execute(poplar::Engine& eng, const poplar::Device& dev) override;
+	void updateViewMatrix(const glm::mat4& view);
+	void updateProjectionMatrix(const glm::mat4& proj);
 
   // Host-visible full framebuffer
   std::vector<uint8_t> framebuffer_host_;
@@ -88,6 +93,11 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
 	unsigned execCounterHost = 0;
 	
   poplar::program::Sequence per_tile_writes_;
+	
+	std::vector<float> hostViewMatrix_;
+	std::vector<float> hostProjMatrix_;
+	ipu_utils::StreamableTensor viewMatrix_{"view_matrix"};
+	ipu_utils::StreamableTensor projMatrix_{"proj_matrix"};
 };
 
 // -----------------------------------------------------------------------------
@@ -132,9 +142,18 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
   // Faster mapping via poputil helpers (instead of manual loop):
   poputil::mapTensorLinearlyWithOffset(graph, result_f32_read.get(), 0);
   poputil::mapTensorLinearlyWithOffset(graph, result_u16_read.get(), 0);
-  poputil::mapTensorLinearlyWithOffset(graph,
-      fb_read_all.get().reshape({kNumTraceTiles, kTileFramebufferSize}),
-      0);
+  poputil::mapTensorLinearlyWithOffset(graph, fb_read_all.get().reshape({kNumTraceTiles, kTileFramebufferSize}), 0);
+
+	// Create master matrices on tile 0
+	poplar::program::Sequence broadcastMatrices;
+	viewMatrix_.buildTensor(graph, poplar::FLOAT, {4, 4});
+	graph.setTileMapping(viewMatrix_.get(), 0);
+	broadcastMatrices.add(viewMatrix_.buildWrite(graph, true));
+
+	projMatrix_.buildTensor(graph, poplar::FLOAT, {4, 4});
+	graph.setTileMapping(projMatrix_.get(), 0);
+	broadcastMatrices.add(projMatrix_.buildWrite(graph, true));
+
 
   // Zero-init rays buffers once per run
   const auto zero_const = graph.addConstant(poplar::UNSIGNED_CHAR, {kBytesPerTile}, 0);
@@ -144,8 +163,9 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 
   // ── Create RayTrace vertices per tile ─────────────────────────────────────
   auto trace_cs = graph.addComputeSet("RayTraceCS");
-
-  for (size_t tid = 0; tid < kNumTraceTiles; ++tid) {
+	
+  
+	for (size_t tid = 0; tid < kNumTraceTiles; ++tid) {
     // ---- H2D tensors -------------------------------------------------------
     ipu_utils::StreamableTensor in_local(fmt::format("local_{}", tid));
     ipu_utils::StreamableTensor in_nbr(fmt::format("nbr_{}", tid));
@@ -161,6 +181,18 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 
     // ---- Vertex -----------------------------------------------------------
     auto v = graph.addVertex(trace_cs, "RayTrace");
+
+	// Clone view matrix and broadcast
+		auto localView = graph.clone(viewMatrix_.get(), "view_matrix_tile_" + std::to_string(tid));
+		graph.setTileMapping(localView, tid);
+		broadcastMatrices.add(poplar::program::Copy(viewMatrix_.get(), localView));
+		graph.connect(v["view_matrix"], localView.flatten());
+
+		// Clone projection matrix and broadcast
+		auto localProj = graph.clone(projMatrix_.get(), "proj_matrix_tile_" + std::to_string(tid));
+		graph.setTileMapping(localProj, tid);
+		broadcastMatrices.add(poplar::program::Copy(projMatrix_.get(), localProj));
+		graph.connect(v["projection_matrix"], localProj.flatten());
 
     graph.connect(v["local_pts"],    in_local.get());
     graph.connect(v["neighbor_pts"], in_nbr.get());
@@ -200,6 +232,7 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
   }
 
   getPrograms().add("RayTraceCS", poplar::program::Execute(trace_cs));
+	getPrograms().add("broadcast_matrices", broadcastMatrices);
 
   // ── RayGen (single tile) ─────────────────────────────────────────────────
   {
@@ -248,18 +281,39 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& engine,
 			fb_read_all.connectReadStream(engine, framebuffer_host_.data());
 			result_f32_read.connectReadStream(engine, result_f32_host_.data());
 			result_u16_read.connectReadStream(engine, result_u16_host_.data());
+
     }
+		viewMatrix_.connectWriteStream(engine, hostViewMatrix_);
+  	projMatrix_.connectWriteStream(engine, hostProjMatrix_);
     execCountT.connectWriteStream(engine, &execCounterHost);
     engine.run(getPrograms().getOrdinals().at("zero_rays"));
     engine.run(getPrograms().getOrdinals().at("write"));
     initialized_ = true;
   }
 
+	engine.run(getPrograms().getOrdinals().at("broadcast_matrices"));
 	engine.run(getPrograms().getOrdinals().at("write_exec_count"));
   engine.run(getPrograms().getOrdinals().at("RayGenCS"));
   engine.run(getPrograms().getOrdinals().at("RayTraceCS"));
   readAllTiles(engine);
 	execCounterHost++;
+}
+
+void RadiantFoamIpuBuilder::updateViewMatrix(const glm::mat4& view) {
+  // Graphcore expects row-major floats; glm::value_ptr is column-major
+  glm::mat4 transposed = glm::transpose(view);
+  const float* ptr = glm::value_ptr(transposed);
+  for (size_t i = 0; i < 16; ++i) {
+    hostViewMatrix_[i] = ptr[i];
+  }
+}
+
+void RadiantFoamIpuBuilder::updateProjectionMatrix(const glm::mat4& proj) {
+  glm::mat4 transposed = glm::transpose(proj);
+  const float* ptr = glm::value_ptr(transposed);
+  for (size_t i = 0; i < 16; ++i) {
+    hostProjMatrix_[i] = ptr[i];
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -300,67 +354,121 @@ static cv::Mat AssembleFullImage(const std::vector<uint8_t>& tiles) {
 }
 
 int main(int argc, char** argv) {
-  const std::string input_file = (argc > 1) ? argv[1] : "./data/garden.h5";
-  const int tile_to_debug =
-      (argc > 2) ? std::stoi(argv[2]) : 0;
 
-	poplar::OptionFlags engine_options;
-	if (radfoam::util::isPoplarEngineOptionsEnabled()) {
-		logger()->info("Poplar auto-reporting is enabled (POPLAR_ENGINE_OPTIONS set)");
-		engine_options = {{"debug.instrument", "true"}};
-	} else {
-		logger()->info("Poplar auto-reporting is NOT enabled");
-		engine_options = {}; 
+	glm::mat4 ViewMatrix(
+    glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),
+    glm::vec4( 0.484514f, -0.874620f, -0.016920f, 0.000000f),
+    glm::vec4(-0.874087f, -0.484810f,  0.030524f, 0.000000f),
+    glm::vec4(-0.000000f, -0.000000f, -6.700000f, 1.000000f)
+	);
+
+	glm::mat4 ProjectionMatrix(
+    glm::vec4(1.299038f, 0.000000f,  0.000000f,  0.000000f),
+    glm::vec4(0.000000f, 1.732051f,  0.000000f,  0.000000f),
+    glm::vec4(0.000000f, 0.000000f, -1.002002f, -1.000000f),
+    glm::vec4(0.000000f, 0.000000f, -0.200200f,  0.000000f)
+	);
+
+  // ------------------------------
+  // Profiling Trace Setup (PVTI)
+  // ------------------------------
+  pvti::TraceChannel traceChannel = {"RadiantFoamIpu"};
+
+  // ------------------------------
+  // Input Arguments
+  // ------------------------------
+  const std::string inputFile = (argc > 1) ? argv[1] : "./data/garden.h5";
+  const int tileToDebug       = (argc > 2) ? std::stoi(argv[2]) : 0;
+	bool enableUI = true;
+	for (int i = 1; i < argc; ++i) {
+		if (std::string(argv[i]) == "--no-ui") {
+			enableUI = false;
+		}
 	}
+  // ------------------------------
+  // Poplar Engine Options
+  // ------------------------------
+  poplar::OptionFlags engineOptions;
+  if (radfoam::util::isPoplarEngineOptionsEnabled()) {
+    logger()->info("Poplar auto-reporting is enabled (POPLAR_ENGINE_OPTIONS set)");
+    engineOptions = {{"debug.instrument", "true"}};
+  } else {
+    logger()->info("Poplar auto-reporting is NOT enabled");
+    engineOptions = {};
+  }
 
-  RadiantFoamIpuBuilder builder(input_file, tile_to_debug);
+  // ------------------------------
+  // Build and Configure IPU Graph
+  // ------------------------------
+  RadiantFoamIpuBuilder builder(inputFile, tileToDebug);
 
-  ipu_utils::RuntimeConfig cfg{/*numIpus=*/1,
-                               /*numReplicas=*/1,
-                               /*exeName=*/"radiantfoam_ipu",
-                               /*useIpuModel=*/false,
-                               /*saveExe=*/false,
-                               /*loadExe=*/false,
-                               /*compileOnly=*/false,
-                               /*deferredAttach=*/false};
+  ipu_utils::RuntimeConfig cfg{
+    /*numIpus=*/1,
+    /*numReplicas=*/1,
+    /*exeName=*/"radiantfoam_ipu",
+    /*useIpuModel=*/false,
+    /*saveExe=*/false,
+    /*loadExe=*/false,
+    /*compileOnly=*/false,
+    /*deferredAttach=*/false
+  };
   builder.setRuntimeConfig(cfg);
 
   ipu_utils::GraphManager mgr;
-  mgr.compileOrLoad(builder, engine_options);
-	mgr.prepareEngine(engine_options);
 
-  auto imagePtr = std::make_unique<cv::Mat>(kFullImageHeight, kFullImageWidth, CV_8UC3);
-	auto imagePtrBuffered = std::make_unique<cv::Mat>(kFullImageHeight, kFullImageWidth, CV_8UC3);
+  // Compile and Prepare Engine with Tracepoints
+  pvti::Tracepoint::begin(&traceChannel, "constructing_graph");
+  mgr.compileOrLoad(builder, engineOptions);
+  mgr.prepareEngine(engineOptions);
+  pvti::Tracepoint::end(&traceChannel, "constructing_graph");
 
-	std::unique_ptr<InterfaceServer> uiServer;
-	InterfaceServer::State state;
-	state.fov = glm::radians(40.f);
-	state.device = "cpu"; // args.at("device").as<std::string>();
-	auto uiPort = 5000; // args.at("ui-port").as<int>();
-	if (uiPort) {
-		uiServer.reset(new InterfaceServer(uiPort));
-		uiServer->start();
-		uiServer->initialiseVideoStream(imagePtr->cols, imagePtr->rows);
-		uiServer->updateFov(state.fov);
-	}
+  // ------------------------------
+  // UI Setup
+  // ------------------------------
+  auto imagePtr         = std::make_unique<cv::Mat>(kFullImageHeight, kFullImageWidth, CV_8UC3);
+  auto imagePtrBuffered = std::make_unique<cv::Mat>(kFullImageHeight, kFullImageWidth, CV_8UC3);
 
+  std::unique_ptr<InterfaceServer> uiServer;
+  InterfaceServer::State state;
+  state.fov    = glm::radians(40.f);
+  state.device = "cpu"; // Could parameterize if needed
+  const int uiPort = 5000;
+
+	if (enableUI && uiPort) {
+    uiServer = std::make_unique<InterfaceServer>(uiPort);
+    uiServer->start();
+    uiServer->initialiseVideoStream(imagePtr->cols, imagePtr->rows);
+    uiServer->updateFov(state.fov);
+  }
+
+  // ------------------------------
+  // Main Execution & UI Loop
+  // ------------------------------
 	AsyncTask hostProcessing;
 	auto uiUpdateFunc = [&]() {
-		uiServer->sendPreviewImage(*imagePtrBuffered);
+		if (enableUI && uiServer) {
+			uiServer->sendPreviewImage(*imagePtrBuffered);
+		}
 	};
 
 	do {
-		hostProcessing.waitForCompletion();
-		mgr.execute(builder); 
+		ViewMatrix[2][2] += 2;
+		ProjectionMatrix[2][2] += 1;
+		builder.updateViewMatrix(ViewMatrix);
+		builder.updateProjectionMatrix(ProjectionMatrix);
+
+		if (enableUI) hostProcessing.waitForCompletion();
+		mgr.execute(builder);
 		*imagePtr = AssembleFullImage(builder.framebuffer_host_);
 		std::swap(imagePtr, imagePtrBuffered);
-		hostProcessing.run(uiUpdateFunc);
-		state = uiServer->consumeState();
-	} while (uiServer && !state.stop);
+		if (enableUI) hostProcessing.run(uiUpdateFunc);
 
-	hostProcessing.waitForCompletion();
-  // cv::imwrite("framebuffer_full.png",
-  //             AssembleFullImage(builder.framebuffer_host_));
-	
+		state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
+	} while (!enableUI || (uiServer && !state.stop));
+
+	if (enableUI) hostProcessing.waitForCompletion();
+
+  cv::imwrite("framebuffer_full.png", AssembleFullImage(builder.framebuffer_host_));
+
   return 0;
 }
