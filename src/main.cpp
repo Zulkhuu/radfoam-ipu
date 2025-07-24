@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include <cxxopts.hpp>
 #include <spdlog/fmt/fmt.h>
 
 #include <highfive/H5File.hpp>
@@ -377,14 +378,27 @@ int main(int argc, char** argv) {
   // ------------------------------
   // Input Arguments
   // ------------------------------
-  const std::string inputFile = (argc > 1) ? argv[1] : "./data/garden.h5";
-  const int tileToDebug       = (argc > 2) ? std::stoi(argv[2]) : 0;
-	bool enableUI = true;
-	for (int i = 1; i < argc; ++i) {
-		if (std::string(argv[i]) == "--no-ui") {
-			enableUI = false;
-		}
+	cxxopts::Options options("radiantfoam_ipu", "RadiantFoam IPU Renderer");
+
+	options.add_options()
+    ("i,input", "Input HDF5 file", cxxopts::value<std::string>()->default_value("./data/garden.h5"))
+    ("t,tile", "Tile to debug", cxxopts::value<int>()->default_value("0"))
+    ("no-ui", "Disable UI server", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
+    ("p,port", "UI port", cxxopts::value<int>()->default_value("5000"))
+    ("h,help", "Print usage");
+
+	auto result = options.parse(argc, argv);
+
+	if (result.count("help")) {
+		std::cout << options.help() << std::endl;
+		return 0;
 	}
+
+	std::string inputFile = result["input"].as<std::string>();
+	int tileToDebug = result["tile"].as<int>();
+	bool enableUI = !result.count("no-ui");
+	int uiPort = result["port"].as<int>();
+
   // ------------------------------
   // Poplar Engine Options
   // ------------------------------
@@ -432,7 +446,6 @@ int main(int argc, char** argv) {
   InterfaceServer::State state;
   state.fov    = glm::radians(40.f);
   state.device = "cpu"; // Could parameterize if needed
-  const int uiPort = 5000;
 
 	if (enableUI && uiPort) {
     uiServer = std::make_unique<InterfaceServer>(uiPort);

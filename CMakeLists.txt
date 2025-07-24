@@ -26,6 +26,13 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(HighFive)
 
+FetchContent_Declare(
+  cxxopts
+  GIT_REPOSITORY https://github.com/jarro2783/cxxopts.git
+  GIT_TAG        v3.2.0  # Use latest stable tag or specific version you need
+)
+FetchContent_MakeAvailable(cxxopts)
+
 # External Libraries:
 add_subdirectory(external/packetcomms)
 add_subdirectory(external/videolib)
@@ -55,6 +62,7 @@ target_link_libraries(main
     ${OpenCV_LIBS}
     ${PACKETCOMMS_LIBRARIES}
     ${VIDEOLIB_LIBRARIES}
+    cxxopts
     spdlog::spdlog
     Boost::program_options
     Boost::unit_test_framework
