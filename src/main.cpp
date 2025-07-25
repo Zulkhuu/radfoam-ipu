@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <cstdint>
 #include <cstring>
+#include <random>
 
 #include <cxxopts.hpp>
 #include <spdlog/fmt/fmt.h>
@@ -37,10 +38,107 @@
 #include "ipu/tile_config.hpp"
 #include "io/hdf5_types.hpp"
 #include "util/debug_utils.hpp"
+#include "util/nanoflann.hpp"
 
 using namespace radfoam::geometry;
 
 using ipu_utils::logger;
+
+class KDTreeManager {
+public:
+    explicit KDTreeManager(const std::string& h5_path) {
+        loadPointsFromHDF5(h5_path);
+        buildKDTree();
+    }
+
+    const std::vector<GenericPoint>& getPoints() const { return points_; }
+
+    // Map glm::vec3 → (cluster_id, local_id)
+    GenericPoint getNearestNeighbor(const glm::vec3& p) const {
+        float query_pt[3] = {p.x, p.y, p.z};
+        size_t nearest_idx = getNearestIndex(query_pt);
+        return points_[nearest_idx];
+    }
+
+    // Random point from loaded dataset
+    GenericPoint getRandomPoint() const {
+        if (points_.empty()) throw std::runtime_error("No points loaded");
+        static std::mt19937 rng{std::random_device{}()};
+        std::uniform_int_distribution<size_t> dist(0, points_.size() - 1);
+        return points_[dist(rng)];
+    }
+		void printRandomPoint() const {
+			if (points_.empty())
+					throw std::runtime_error("No points loaded");
+
+			static std::mt19937 rng{std::random_device{}()};
+			std::uniform_int_distribution<size_t> dist(0, points_.size() - 1);
+			const auto &pt = points_[dist(rng)];
+
+			fmt::print("Random Point:\n");
+			fmt::print("  {:<12} {:>10.4f}\n", "X:", pt.x);
+			fmt::print("  {:<12} {:>10.4f}\n", "Y:", pt.y);
+			fmt::print("  {:<12} {:>10.4f}\n", "Z:", pt.z);
+			fmt::print("  {:<12} {:>10}\n", "Cluster ID:", pt.cluster_id);
+			fmt::print("  {:<12} {:>10}\n", "Local ID:", pt.local_id);
+	}
+
+
+private:
+    std::vector<GenericPoint> points_;
+
+    // --- nanoflann adapter
+    struct PointCloudAdaptor {
+        const std::vector<GenericPoint>& pts;
+        inline size_t kdtree_get_point_count() const { return pts.size(); }
+        inline float kdtree_get_pt(const size_t idx, const size_t dim) const {
+            if (dim == 0) return pts[idx].x;
+            else if (dim == 1) return pts[idx].y;
+            else return pts[idx].z;
+        }
+        template <class BBOX> bool kdtree_get_bbox(BBOX&) const { return false; }
+    };
+
+    using KDTreeType = nanoflann::KDTreeSingleIndexAdaptor<
+        nanoflann::L2_Simple_Adaptor<float, PointCloudAdaptor>,
+        PointCloudAdaptor,
+        3 /* dimensions */
+    >;
+
+    std::unique_ptr<KDTreeType> kdtree_;
+    std::unique_ptr<PointCloudAdaptor> adaptor_;
+
+    void loadPointsFromHDF5(const std::string& h5_path) {
+        HighFive::File f(h5_path, HighFive::File::ReadOnly);
+        points_.clear();
+
+        for (size_t tid = 0; tid < kNumTraceTiles; ++tid) {
+            const auto g = f.getGroup(fmt::format("part{:04}", tid));
+            std::vector<LocalPoint> local_pts;
+            g.getDataSet("local_pts").read(local_pts);
+
+            for (size_t i = 0; i < local_pts.size(); ++i) {
+                const auto &p = local_pts[i];
+                points_.push_back({ p.x, p.y, p.z, (uint16_t)tid, (uint16_t)i });
+            }
+        }
+    }
+
+    void buildKDTree() {
+        adaptor_ = std::make_unique<PointCloudAdaptor>(PointCloudAdaptor{points_});
+        kdtree_ = std::make_unique<KDTreeType>(3, *adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(10 /* max leaf */));
+        kdtree_->buildIndex();
+    }
+
+    size_t getNearestIndex(const float query_pt[3]) const {
+        size_t ret_index;
+        float out_dist_sqr;
+        nanoflann::KNNResultSet<float> resultSet(1);
+        resultSet.init(&ret_index, &out_dist_sqr);
+        kdtree_->findNeighbors(resultSet, query_pt, nanoflann::SearchParameters(10));
+        return ret_index;
+    }
+};
 
 // -----------------------------------------------------------------------------
 // RadiantFoamIpuBuilder
@@ -398,6 +496,22 @@ int main(int argc, char** argv) {
 	int tileToDebug = result["tile"].as<int>();
 	bool enableUI = !result.count("no-ui");
 	int uiPort = result["port"].as<int>();
+
+	KDTreeManager kdtree(inputFile);
+	// std::cout << "Total local points collected: " << kdtree.getPoints().size() << std::endl;
+	// for(int i=0; i<10; i++)
+	// 	kdtree.printRandomPoint();
+	glm::mat4 inverseView = glm::inverse(ViewMatrix);
+	glm::vec3 cameraPos = glm::vec3(inverseView[3]);
+	auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
+	fmt::print("Camera position ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
+							cameraPos.x, cameraPos.y, cameraPos.z);
+	fmt::print("Closest Point to Camera:\n"
+							"  Cluster: {:>5}\n"
+							"  Local  : {:>5}\n"
+							"  Position: ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
+							camera_cell.cluster_id, camera_cell.local_id, 
+							camera_cell.x, camera_cell.y, camera_cell.z);
 
   // ------------------------------
   // Poplar Engine Options

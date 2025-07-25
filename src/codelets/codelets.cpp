@@ -81,7 +81,7 @@ public:
     *result_u16 = ray_in1.x; //local_pt->adj_end;
     *result_float = View[0][2]; // local_pt->x;
     
-    for (unsigned i = 10; i < framebuffer.size(); ++i)
+    for (unsigned i = 0; i < framebuffer.size(); ++i)
       framebuffer[i] = (255 - tile_id/4 + ray_in1.x)%256;
     
     return true;

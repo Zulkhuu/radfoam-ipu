@@ -27,6 +27,13 @@ struct Ray {
 };
 static_assert(sizeof(Ray) == 28, "Ray size mismatch");
 
+struct GenericPoint {
+  float x, y, z;        // 3D position
+  uint16_t cluster_id;  // Which cluster this point belongs to
+  uint16_t local_id;    // Index inside the cluster
+};
+static_assert(sizeof(GenericPoint) == 16, "GenericPoint size mismatch");
+
 // ── TOOD: Half-precision structures ───────────────────────────────────────────────
 
 }  // namespace radfoam::geometry
