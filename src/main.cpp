@@ -156,6 +156,7 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
   void execute(poplar::Engine& eng, const poplar::Device& dev) override;
 	void updateViewMatrix(const glm::mat4& view);
 	void updateProjectionMatrix(const glm::mat4& proj);
+	void updateCameraCell(const GenericPoint& cell);
 
   // Host-visible full framebuffer
   std::vector<uint8_t> framebuffer_host_;
@@ -197,6 +198,9 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
 	std::vector<float> hostProjMatrix_;
 	ipu_utils::StreamableTensor viewMatrix_{"view_matrix"};
 	ipu_utils::StreamableTensor projMatrix_{"proj_matrix"};
+
+	std::array<uint8_t, 4> hostCameraCellInfo_ = {0, 0, 0, 0};
+	ipu_utils::StreamableTensor cameraCellInfo_{"camera_cell_info"};
 };
 
 // -----------------------------------------------------------------------------
@@ -252,7 +256,6 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 	projMatrix_.buildTensor(graph, poplar::FLOAT, {4, 4});
 	graph.setTileMapping(projMatrix_.get(), 0);
 	broadcastMatrices.add(projMatrix_.buildWrite(graph, true));
-
 
   // Zero-init rays buffers once per run
   const auto zero_const = graph.addConstant(poplar::UNSIGNED_CHAR, {kBytesPerTile}, 0);
@@ -340,16 +343,20 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 
     const auto slice_a = rays_a_.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
     const auto slice_b = rays_b_.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
+    graph.connect(v["raysIn"],  slice_a);
+    graph.connect(v["raysOut"], slice_b);
 
 		execCountT.buildTensor(graph, poplar::UNSIGNED_INT, {});
 		graph.setTileMapping(execCountT.get(), kRaygenTile);
 		graph.connect(v["exec_count"], execCountT.get());
 		getPrograms().add("write_exec_count", execCountT.buildWrite(graph, true));
 
-    graph.connect(v["raysIn"],  slice_a);
-    graph.connect(v["raysOut"], slice_b);
-    graph.setTileMapping(v, kRaygenTile);
+		cameraCellInfo_.buildTensor(graph, poplar::UNSIGNED_CHAR, {4});
+		graph.setTileMapping(cameraCellInfo_.get(), kRaygenTile); 
+		graph.connect(v["camera_cell_info"], cameraCellInfo_.get());
+		getPrograms().add("write_camera_cell_info", cameraCellInfo_.buildWrite(graph, true));
 
+    graph.setTileMapping(v, kRaygenTile);
     getPrograms().add("RayGenCS", poplar::program::Execute(raygen_cs));
   }
 
@@ -385,6 +392,7 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& engine,
 		viewMatrix_.connectWriteStream(engine, hostViewMatrix_);
   	projMatrix_.connectWriteStream(engine, hostProjMatrix_);
     execCountT.connectWriteStream(engine, &execCounterHost);
+    cameraCellInfo_.connectWriteStream(engine, hostCameraCellInfo_.data());
     engine.run(getPrograms().getOrdinals().at("zero_rays"));
     engine.run(getPrograms().getOrdinals().at("write"));
     initialized_ = true;
@@ -392,6 +400,7 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& engine,
 
 	engine.run(getPrograms().getOrdinals().at("broadcast_matrices"));
 	engine.run(getPrograms().getOrdinals().at("write_exec_count"));
+	engine.run(getPrograms().getOrdinals().at("write_camera_cell_info"));
   engine.run(getPrograms().getOrdinals().at("RayGenCS"));
   engine.run(getPrograms().getOrdinals().at("RayTraceCS"));
   readAllTiles(engine);
@@ -413,6 +422,14 @@ void RadiantFoamIpuBuilder::updateProjectionMatrix(const glm::mat4& proj) {
   for (size_t i = 0; i < 16; ++i) {
     hostProjMatrix_[i] = ptr[i];
   }
+}
+
+void RadiantFoamIpuBuilder::updateCameraCell(const GenericPoint& cell) {
+    // cluster_id and local_id are 16-bit each
+    hostCameraCellInfo_[0] = static_cast<uint8_t>(cell.cluster_id & 0xFF);
+    hostCameraCellInfo_[1] = static_cast<uint8_t>((cell.cluster_id >> 8) & 0xFF);
+    hostCameraCellInfo_[2] = static_cast<uint8_t>(cell.local_id & 0xFF);
+    hostCameraCellInfo_[3] = static_cast<uint8_t>((cell.local_id >> 8) & 0xFF);
 }
 
 // -----------------------------------------------------------------------------
@@ -579,10 +596,16 @@ int main(int argc, char** argv) {
 	};
 
 	do {
-		ViewMatrix[2][2] += 2;
-		ProjectionMatrix[2][2] += 1;
+		// ViewMatrix[2][2] += 2;
+		// ProjectionMatrix[2][2] += 1;
+
+		glm::mat4 inverseView = glm::inverse(ViewMatrix);
+		glm::vec3 cameraPos = glm::vec3(inverseView[3]);
+		auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
+
 		builder.updateViewMatrix(ViewMatrix);
 		builder.updateProjectionMatrix(ProjectionMatrix);
+		builder.updateCameraCell(camera_cell);
 
 		if (enableUI) hostProcessing.waitForCompletion();
 		mgr.execute(builder);

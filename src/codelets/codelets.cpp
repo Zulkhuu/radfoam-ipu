@@ -78,7 +78,7 @@ public:
     
     // *result_u16 = adjacency.size(); //local_pt->adj_end;
     // *result_float = nbr_pt->x;
-    *result_u16 = ray_in1.x; //local_pt->adj_end;
+    *result_u16 = ray_in1.y; //local_pt->adj_end;
     *result_float = View[0][2]; // local_pt->x;
     
     for (unsigned i = 0; i < framebuffer.size(); ++i)
@@ -93,13 +93,18 @@ public:
   poplar::Input<poplar::Vector<uint8_t>> raysIn;
   poplar::Output<poplar::Vector<uint8_t>> raysOut;
   poplar::Input<unsigned> exec_count; 
+  poplar::Input<poplar::Vector<uint8_t>> camera_cell_info;
 
   bool compute() {
     constexpr int RaySize = sizeof(Ray);  
 
+    uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
+    uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
+
     int index = 1;
     Ray* ray_out1  = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*index);
-    ray_out1->x = exec_count;
+    ray_out1->x = cluster_id;
+    ray_out1->y = local_id;
     ray_out1->r = 0.345;
 
 
