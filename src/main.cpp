@@ -177,7 +177,7 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
   bool        initialized_;//     = false;
 	
   std::vector<std::vector<LocalPoint>>    local_pts_;
-  std::vector<std::vector<NeighborPoint>> neighbor_pts_;
+  std::vector<std::vector<GenericPoint>> neighbor_pts_;
   std::vector<std::vector<uint16_t>>      adjacency_;
 
   poplar::Tensor rays_a_, rays_b_;
@@ -274,7 +274,7 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
     ipu_utils::StreamableTensor in_adj(fmt::format("adj_{}", tid));
 
     in_local.buildTensor(graph, poplar::UNSIGNED_CHAR, {sizeof(LocalPoint) * local_pts_[tid].size()});
-    in_nbr.buildTensor(graph,  poplar::UNSIGNED_CHAR, {sizeof(NeighborPoint) * neighbor_pts_[tid].size()});
+    in_nbr.buildTensor(graph,  poplar::UNSIGNED_CHAR, {sizeof(GenericPoint) * neighbor_pts_[tid].size()});
     in_adj.buildTensor(graph,  poplar::UNSIGNED_SHORT, {adjacency_[tid].size()});
 
     graph.setTileMapping(in_local.get(), tid);
@@ -610,7 +610,7 @@ int main(int argc, char** argv) {
 		// ViewMatrix[2][2] += 2;
 		// ProjectionMatrix[2][2] += 1;
 		i++;
-		if(i==3) break;
+		if(i==5) break;
 		glm::mat4 inverseView = glm::inverse(ViewMatrix);
 		glm::vec3 cameraPos = glm::vec3(inverseView[3]);
 		auto camera_cell = kdtree.getNearestNeighbor(cameraPos);

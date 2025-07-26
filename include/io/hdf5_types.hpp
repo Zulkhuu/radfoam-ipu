@@ -4,7 +4,7 @@
 
 namespace h5  = HighFive;
 using radfoam::geometry::LocalPoint;
-using radfoam::geometry::NeighborPoint;
+using radfoam::geometry::GenericPoint;
 
 namespace radfoam::io {
 
@@ -22,16 +22,17 @@ HighFive::CompoundType MakeLocalPointType() {
       {"adj_end", create_datatype<uint32_t>(), offsetof(LocalPoint, adj_end)}};
 }
 
-HighFive::CompoundType MakeNeighborPointType() {
+HighFive::CompoundType MakeGenericPointType() {
   using namespace HighFive;
   return CompoundType{
-      {"x", create_datatype<float>(),   offsetof(NeighborPoint, x)},
-      {"y", create_datatype<float>(),   offsetof(NeighborPoint, y)},
-      {"z", create_datatype<float>(),   offsetof(NeighborPoint, z)},
-      {"gid", create_datatype<uint32_t>(), offsetof(NeighborPoint, gid)}};
+      {"x", create_datatype<float>(),   offsetof(GenericPoint, x)},
+      {"y", create_datatype<float>(),   offsetof(GenericPoint, y)},
+      {"z", create_datatype<float>(),   offsetof(GenericPoint, z)},
+      {"cluster_id", create_datatype<uint16_t>(), offsetof(GenericPoint, cluster_id)},
+      {"local_id", create_datatype<uint16_t>(), offsetof(GenericPoint, local_id)}};
 }
 
 }  // namespace radfoam::io
 
 HIGHFIVE_REGISTER_TYPE(LocalPoint,   radfoam::io::MakeLocalPointType)
-HIGHFIVE_REGISTER_TYPE(NeighborPoint,radfoam::io::MakeNeighborPointType)
+HIGHFIVE_REGISTER_TYPE(GenericPoint, radfoam::io::MakeGenericPointType)

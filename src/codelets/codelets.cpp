@@ -57,16 +57,16 @@ public:
   bool compute() {
     constexpr int RaySize = sizeof(Ray);
     constexpr int LocalPointSize = sizeof(LocalPoint);
-    constexpr int NeighborPointSize = sizeof(NeighborPoint); 
+    constexpr int GenericPointSize = sizeof(GenericPoint); 
     // glm::mat4 invView2 = glm::inverse(View2);
     // glm::mat4 invProj2 = glm::inverse(Proj2);
     // glm::vec3 rayOrigin = glm::vec3(invView2[3]);
     const uint16_t nLocalPts = local_pts.size() / LocalPointSize;
-    const uint16_t nNeighborPts = neighbor_pts.size() / NeighborPointSize;
+    const uint16_t nNeighborPts = neighbor_pts.size() / GenericPointSize;
     const uint16_t nTotalPts = nLocalPts + nNeighborPts;
 
     const LocalPoint* local_pt = readStructAt<LocalPoint>(local_pts, 0);  
-    const NeighborPoint* nbr_pt = readStructAt<NeighborPoint>(neighbor_pts, 2);  
+    const GenericPoint* nbr_pt = readStructAt<GenericPoint>(neighbor_pts, 2);  
 
     glm::mat4 View = glm::transpose(glm::make_mat4(view_matrix.data()));
     glm::mat4 Proj = glm::transpose(glm::make_mat4(projection_matrix.data()));
@@ -126,7 +126,7 @@ public:
             nbrPos.z = nbrPt->z;
           } else {
             // neighbor is a point from neighboring cluster
-            const NeighborPoint* nbrPt = readStructAt<NeighborPoint>(neighbor_pts, neighborIdx-nLocalPts);
+            const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, neighborIdx-nLocalPts);
             nbrPos.x = nbrPt->x;
             nbrPos.y = nbrPt->y;
             nbrPos.z = nbrPt->z;
@@ -153,8 +153,8 @@ public:
           // nextIdx == -1: ray has left the entire scene, depth = inf
           if(nextIdx >= nLocalPts) {
             // nextIdx >= nLocalPts : ray moves to next cluster/tile
-            const NeighborPoint* nbrPt = readStructAt<NeighborPoint>(neighbor_pts, nextIdx-nLocalPts);
-            *result_u16 = nextIdx; //nbrPt->gid & 0xFFFF;
+            const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, nextIdx-nLocalPts);
+            *result_u16 = nbrPt->local_id; 
           }
           break;
         }
