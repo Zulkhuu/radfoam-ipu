@@ -13,9 +13,9 @@ struct LocalPoint {
 static_assert(sizeof(LocalPoint) == 24, "LocalPoint size mismatch");
 
 struct GenericPoint {
-  float x, y, z;        // 3D position
-  uint16_t cluster_id;  // Which cluster this point belongs to
-  uint16_t local_id;    // Index inside the cluster
+  float x, y, z;
+  uint16_t cluster_id;
+  uint16_t local_id;
 };
 static_assert(sizeof(GenericPoint) == 16, "GenericPoint size mismatch");
 
@@ -24,7 +24,8 @@ struct Ray {
   float t;
   float transmittance;
   float r, g, b;
-  uint32_t next_cell;
+  uint16_t next_cluster; 
+  uint16_t next_local;
 };
 static_assert(sizeof(Ray) == 28, "Ray size mismatch");
 

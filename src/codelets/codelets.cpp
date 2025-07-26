@@ -77,8 +77,8 @@ public:
     int index = 1;
     const Ray* ray_in1 = readStructAt<Ray>(raysIn, 1); 
     
-    uint16_t local_id = ray_in1->next_cell & 0xFFFF;
-    uint16_t cluster_id = (ray_in1->next_cell >> 16) & 0xFFFF;
+    uint16_t local_id = ray_in1->next_local;
+    uint16_t cluster_id = ray_in1->next_cluster;
     
     const uint16_t& x = ray_in1->x;
     const uint16_t& y = ray_in1->y;
@@ -196,8 +196,10 @@ public:
     ray_->r = 0.0;
     ray_->g = 0.0;
     ray_->b = 0.0;
+    ray_->t = 0.0;
     ray_->transmittance = 1.0f;
-    ray_->next_cell = cluster_id << 16 | local_id;
+    ray_->next_cluster = cluster_id;
+    ray_->next_local = local_id;
 
     return true;
   }
