@@ -446,6 +446,16 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& engine) {
 	const size_t offset = tile_to_compute_ * kTileFramebufferSize;
 	logger()->info("Framebuffer[0:10]: {}",
                	radfoam::util::VectorSliceToString(framebuffer_host_, offset, offset + 10));
+
+	uint8_t cnt = framebuffer_host_[offset];
+	for(uint8_t i=1; i<=cnt; i++) {
+		uint16_t	pt_idx = framebuffer_host_[offset+i*2] << 8 | framebuffer_host_[offset+i*2+1];
+		// logger()->info("{}:{}", i, pt_idx);
+		if(pt_idx < local_pts_[tile_to_compute_].size() ) {
+			auto pt = local_pts_[tile_to_compute_][pt_idx];
+			logger()->info("{}: {}, [{}, {}, {}]", i, pt_idx, pt.x, pt.y, pt.z);
+		}
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -585,7 +595,7 @@ int main(int argc, char** argv) {
     uiServer->updateFov(state.fov);
   }
 
-  // ------------------------------
+  // ------------------------------	
   // Main Execution & UI Loop
   // ------------------------------
 	AsyncTask hostProcessing;
@@ -595,10 +605,12 @@ int main(int argc, char** argv) {
 		}
 	};
 
+	int i=0;
 	do {
 		// ViewMatrix[2][2] += 2;
 		// ProjectionMatrix[2][2] += 1;
-
+		i++;
+		if(i==3) break;
 		glm::mat4 inverseView = glm::inverse(ViewMatrix);
 		glm::vec3 cameraPos = glm::vec3(inverseView[3]);
 		auto camera_cell = kdtree.getNearestNeighbor(cameraPos);

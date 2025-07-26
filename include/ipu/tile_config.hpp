@@ -5,8 +5,8 @@
 // -----------------------------------------------------------------------------
 // Full image dimensions (pixels)
 // -----------------------------------------------------------------------------
-constexpr std::size_t kFullImageWidth  = 1280;
-constexpr std::size_t kFullImageHeight = 768;
+constexpr std::size_t kFullImageWidth  = 640;
+constexpr std::size_t kFullImageHeight = 480;
 
 // -----------------------------------------------------------------------------
 // Tile grid configuration
@@ -18,11 +18,11 @@ constexpr std::size_t kNumTraceTiles = 1024;  // Total number of tiles
 // -----------------------------------------------------------------------------
 // Tile dimensions (pixels)
 // -----------------------------------------------------------------------------
-constexpr std::size_t kTileWidth  = 40; // kFullImageWidth  / kNumTilesX;
-constexpr std::size_t kTileHeight = 24; // kFullImageHeight / kNumTilesY;
+constexpr std::size_t kTileWidth  = 20; // kFullImageWidth  / kNumTilesX;
+constexpr std::size_t kTileHeight = 15; // kFullImageHeight / kNumTilesY;
 
 // Per-tile framebuffer size (RGB: 3 bytes per pixel)
-constexpr std::size_t kTileFramebufferSize = 40 * 24 * 3; // kTileWidth * kTileHeight * 3;
+constexpr std::size_t kTileFramebufferSize = 20 * 15 * 3; // kTileWidth * kTileHeight * 3;
 
 // -----------------------------------------------------------------------------
 // Sanity checks
