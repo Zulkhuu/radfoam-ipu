@@ -58,7 +58,7 @@ public:
     constexpr int RaySize = sizeof(Ray);
     constexpr int LocalPointSize = sizeof(LocalPoint);
     constexpr int GenericPointSize = sizeof(GenericPoint); 
-    // glm::mat4 invView2 = glm::inverse(View2);
+    glm::mat4 invView2 = glm::inverse(View2);
     // glm::mat4 invProj2 = glm::inverse(Proj2);
     // glm::vec3 rayOrigin = glm::vec3(invView2[3]);
     const uint16_t nLocalPts = local_pts.size() / LocalPointSize;
@@ -91,17 +91,19 @@ public:
     eyeRay.z = -1.0f;
     eyeRay.w = 0.0f;
     glm::vec3 rayDir = glm::normalize(glm::vec3(invView * eyeRay));
-        
+    
+    glm::vec3 color(ray_in1->r, ray_in1->g, ray_in1->b);
+    float transmittance = ray_in1->transmittance;
     float t0 = ray_in1->t;
     int current = local_id;
 
     *result_u16 = 65535;
     int cntr = 1;
     while (true) {
-        const LocalPoint* p0 = readStructAt<LocalPoint>(local_pts, current); 
-        glm::vec3 currentPos(p0->x, p0->y, p0->z);
+        const LocalPoint* cur_cell = readStructAt<LocalPoint>(local_pts, current); 
+        glm::vec3 currentPos(cur_cell->x, cur_cell->y, cur_cell->z);
 
-        uint16_t end = p0->adj_end;
+        uint16_t end = cur_cell->adj_end;
         uint16_t start;
         if(current == 0) {
           start = 0;
@@ -148,22 +150,36 @@ public:
           }
         }       
         
-        t0 = std::fmax(t0, closestT);
+        float delta = closestT - t0;
+        float alpha = 1.0f - expf(-cur_cell->density * delta);
+        // glm::vec3 pointColor = glm::vec3(cur_cell->r, cur_cell->g, cur_cell->b) / 255.0f;
 
-        if (ray_in1->transmittance < 0.01f || nextIdx == -1 || nextIdx >= nLocalPts) {
+        color.x += transmittance * alpha * (cur_cell->r/255.0f);
+        color.y += transmittance * alpha * (cur_cell->g/255.0f);
+        color.z += transmittance * alpha * (cur_cell->b/255.0f);
+
+        transmittance *= (1.0f - alpha);
+
+        t0 = __builtin_fmaxf(t0, closestT);
+
+        if (transmittance < 0.01f || nextIdx == -1 || nextIdx >= nLocalPts) {
           // finished ray tracing for this one
-          // ray_in1->transmittance < 0.01f: too opaque, light cant pass anymore
+          // transmittance < 0.01f: too opaque, light cant pass anymore
           // nextIdx == -1: ray has left the entire scene, depth = inf
           if(nextIdx >= nLocalPts) {
             // nextIdx >= nLocalPts : ray moves to next cluster/tile
             const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, nextIdx-nLocalPts);
             *result_u16 = nbrPt->cluster_id; 
+            *result_float = color.z;
             ray_out1->next_cluster = nbrPt->cluster_id; 
             ray_out1->next_local = nbrPt->local_id; 
-            ray_out1->transmittance = ray_in1->transmittance; 
+            ray_out1->transmittance = transmittance; 
             ray_out1->x = ray_in1->x;
             ray_out1->y = ray_in1->y;
             ray_out1->t = t0;
+            ray_out1->r = color.x;
+            ray_out1->g = color.y;
+            ray_out1->b = color.z;
           } else {
             if(nextIdx == -1)
               *result_u16 = 65534; 
@@ -177,7 +193,7 @@ public:
     framebuffer[0] = cntr & 0xFF;
 
     // *result_u16 = nNeighborPts; // y;
-    *result_float = rayDir.x;
+    // *result_float = rayDir.x;
 
     // for (unsigned i = 0; i < framebuffer.size(); ++i)
     //   framebuffer[i] = (255 - tile_id/4 + ray_in1->x)%256;
@@ -203,7 +219,7 @@ public:
     Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*index);
 
     ray_->x = 14;
-    ray_->y = 328;
+    ray_->y = 300;
     ray_->r = 0.0;
     ray_->g = 0.0;
     ray_->b = 0.0;

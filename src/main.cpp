@@ -496,7 +496,7 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& engine) {
 	std::cout << "===========================================================================" << std::endl;
 	int overall_cntr = 0;
 	for (int tid : debug_chains_) {
-			logger()->info("Tile {} result -> float: {}, u16: {}",
+			logger()->info("Tile {} result -> float: {:>9.6f}, u16: {}",
 										tid,
 										result_f32_host_[tid],
 										result_u16_host_[tid]);
@@ -509,7 +509,7 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& engine) {
 														framebuffer_host_[offset + i * 2 + 1];
 					if (pt_idx < local_pts_[tid].size()) {
 							auto pt = local_pts_[tid][pt_idx];
-							fmt::print("[{}] {}: {:>4}, [{:>11.8f}, {:>11.8f}, {:>11.8f}]\n", overall_cntr, i, pt_idx, pt.x, pt.y, pt.z);
+							fmt::print("[{}] {}: {:>4}, [{:>9.6f}, {:>9.6f}, {:>9.6f}]\n", overall_cntr, i, pt_idx, pt.x, pt.y, pt.z);
 					}
 					overall_cntr++;
 			}
