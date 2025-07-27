@@ -76,6 +76,7 @@ public:
 
     int index = 1;
     const Ray* ray_in1 = readStructAt<Ray>(raysIn, 1); 
+    Ray* ray_out1 = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*index);
     
     uint16_t local_id = ray_in1->next_local;
     uint16_t cluster_id = ray_in1->next_cluster;
@@ -94,7 +95,7 @@ public:
     float t0 = ray_in1->t;
     int current = local_id;
 
-    *result_u16 = 0;
+    *result_u16 = 65535;
     int cntr = 1;
     while (true) {
         const LocalPoint* p0 = readStructAt<LocalPoint>(local_pts, current); 
@@ -146,6 +147,8 @@ public:
               nextIdx = neighborIdx;
           }
         }       
+        
+        t0 = std::fmax(t0, closestT);
 
         if (ray_in1->transmittance < 0.01f || nextIdx == -1 || nextIdx >= nLocalPts) {
           // finished ray tracing for this one
@@ -154,12 +157,20 @@ public:
           if(nextIdx >= nLocalPts) {
             // nextIdx >= nLocalPts : ray moves to next cluster/tile
             const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, nextIdx-nLocalPts);
-            *result_u16 = nbrPt->local_id; 
+            *result_u16 = nbrPt->cluster_id; 
+            ray_out1->next_cluster = nbrPt->cluster_id; 
+            ray_out1->next_local = nbrPt->local_id; 
+            ray_out1->transmittance = ray_in1->transmittance; 
+            ray_out1->x = ray_in1->x;
+            ray_out1->y = ray_in1->y;
+            ray_out1->t = t0;
+          } else {
+            if(nextIdx == -1)
+              *result_u16 = 65534; 
           }
           break;
         }
 
-        t0 = std::fmax(t0, closestT);
         current = nextIdx;
         cntr++;
     }
@@ -192,7 +203,7 @@ public:
     Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*index);
 
     ray_->x = 14;
-    ray_->y = 28;
+    ray_->y = 328;
     ray_->r = 0.0;
     ray_->g = 0.0;
     ray_->b = 0.0;

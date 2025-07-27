@@ -162,6 +162,7 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
   std::vector<uint8_t> framebuffer_host_;
 	std::vector<float> result_f32_host_;
 	std::vector<uint16_t> result_u16_host_;
+	std::vector<unsigned> debug_chains_;
 
  private:
   // ---- constants -----------------------------------------------------------
@@ -179,6 +180,7 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
   std::vector<std::vector<LocalPoint>>    local_pts_;
   std::vector<std::vector<GenericPoint>> neighbor_pts_;
   std::vector<std::vector<uint16_t>>      adjacency_;
+	std::vector<std::string>                paths_;
 
   poplar::Tensor rays_a_, rays_b_;
 
@@ -201,6 +203,7 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
 
 	std::array<uint8_t, 4> hostCameraCellInfo_ = {0, 0, 0, 0};
 	ipu_utils::StreamableTensor cameraCellInfo_{"camera_cell_info"};
+
 };
 
 // -----------------------------------------------------------------------------
@@ -213,6 +216,7 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
   local_pts_.resize(kNumTraceTiles);
   neighbor_pts_.resize(kNumTraceTiles);
   adjacency_.resize(kNumTraceTiles);
+	paths_.resize(kNumTraceTiles);
 
   {
     HighFive::File f(h5_file_, HighFive::File::ReadOnly);
@@ -221,6 +225,7 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
       g.getDataSet("local_pts").read(local_pts_[tid]);
       g.getDataSet("neighbor_pts").read(neighbor_pts_[tid]);
       g.getDataSet("adjacency_list").read(adjacency_[tid]);
+      g.getDataSet("path").read(paths_[tid]);
     }
   }
 
@@ -336,6 +341,35 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
   getPrograms().add("RayTraceCS", poplar::program::Execute(trace_cs));
 	getPrograms().add("broadcast_matrices", broadcastMatrices);
 
+	// Tiles in order of chaining
+	//debug_chains_ = {521, 525, 527, 539, 707, 711, 729, 731};
+	std::string filepath = "../debugchains.txt";
+	std::ifstream file(filepath);
+	if (!file.is_open()) {
+			throw std::runtime_error("Failed to open debug chains file: " + filepath);
+	}
+
+	unsigned value;
+	while (file >> value) {
+			debug_chains_.push_back(value);
+	}
+	// Program sequence for chained copies
+	poplar::program::Sequence chainCopy;
+
+	for (size_t i = 0; i + 1 < debug_chains_.size(); ++i) {
+			unsigned from = debug_chains_[i];
+			unsigned to   = debug_chains_[i + 1];
+
+			// Slice raysOut from 'from' tile (rays_a_) and raysIn for 'to' tile (rays_b_)
+			auto raysOut = rays_a_.slice(from * kBytesPerTile, (from + 1) * kBytesPerTile);
+			auto raysIn  = rays_b_.slice(to   * kBytesPerTile, (to   + 1) * kBytesPerTile);
+
+			// Add copy program
+			chainCopy.add(poplar::program::Copy(raysOut, raysIn));
+	}
+
+	getPrograms().add("ChainCopyTest", chainCopy);
+
   // ── RayGen (single tile) ─────────────────────────────────────────────────
   {
     auto raygen_cs = graph.addComputeSet("RayGenCS");
@@ -403,6 +437,7 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& engine,
 	engine.run(getPrograms().getOrdinals().at("write_camera_cell_info"));
   engine.run(getPrograms().getOrdinals().at("RayGenCS"));
   engine.run(getPrograms().getOrdinals().at("RayTraceCS"));
+  engine.run(getPrograms().getOrdinals().at("ChainCopyTest"));
   readAllTiles(engine);
 	execCounterHost++;
 }
@@ -439,22 +474,45 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& engine) {
 	engine.run(getPrograms().getOrdinals().at("read_result_f32"));
 	engine.run(getPrograms().getOrdinals().at("read_result_u16"));
 
-	logger()->info("Computed results for tile {} -> float: {}, u16: {}",
-								tile_to_compute_,
-								result_f32_host_[tile_to_compute_],
-								result_u16_host_[tile_to_compute_]);
-	const size_t offset = tile_to_compute_ * kTileFramebufferSize;
-	logger()->info("Framebuffer[0:10]: {}",
-               	radfoam::util::VectorSliceToString(framebuffer_host_, offset, offset + 10));
+	// logger()->info("Computed results for tile {} -> float: {}, u16: {}",
+	// 							tile_to_compute_,
+	// 							result_f32_host_[tile_to_compute_],
+	// 							result_u16_host_[tile_to_compute_]);
+	// const size_t offset = tile_to_compute_ * kTileFramebufferSize;
+	// logger()->info("Framebuffer[0:10]: {}",
+  //              	radfoam::util::VectorSliceToString(framebuffer_host_, offset, offset + 10));
 
-	uint8_t cnt = framebuffer_host_[offset];
-	for(uint8_t i=1; i<=cnt; i++) {
-		uint16_t	pt_idx = framebuffer_host_[offset+i*2] << 8 | framebuffer_host_[offset+i*2+1];
-		// logger()->info("{}:{}", i, pt_idx);
-		if(pt_idx < local_pts_[tile_to_compute_].size() ) {
-			auto pt = local_pts_[tile_to_compute_][pt_idx];
-			logger()->info("{}: {}, [{}, {}, {}]", i, pt_idx, pt.x, pt.y, pt.z);
-		}
+	// uint8_t cnt = framebuffer_host_[offset];
+	// for(uint8_t i=1; i<=cnt; i++) {
+	// 	uint16_t	pt_idx = framebuffer_host_[offset+i*2] << 8 | framebuffer_host_[offset+i*2+1];
+	// 	// logger()->info("{}:{}", i, pt_idx);
+	// 	if(pt_idx < local_pts_[tile_to_compute_].size() ) {
+	// 		auto pt = local_pts_[tile_to_compute_][pt_idx];
+	// 		logger()->info("{}: {}, [{}, {}, {}]", i, pt_idx, pt.x, pt.y, pt.z);
+	// 	}
+	// }
+	// std::vector<int> debugTiles = {521, 527, 525, 539};
+
+	std::cout << "===========================================================================" << std::endl;
+	int overall_cntr = 0;
+	for (int tid : debug_chains_) {
+			logger()->info("Tile {} result -> float: {}, u16: {}",
+										tid,
+										result_f32_host_[tid],
+										result_u16_host_[tid]);
+
+			const size_t offset = tid * kTileFramebufferSize;
+
+			uint8_t cnt = framebuffer_host_[offset];
+			for (uint8_t i = 1; i <= cnt; i++) {
+					uint16_t pt_idx = (framebuffer_host_[offset + i * 2] << 8) |
+														framebuffer_host_[offset + i * 2 + 1];
+					if (pt_idx < local_pts_[tid].size()) {
+							auto pt = local_pts_[tid][pt_idx];
+							fmt::print("[{}] {}: {:>4}, [{:>11.8f}, {:>11.8f}, {:>11.8f}]\n", overall_cntr, i, pt_idx, pt.x, pt.y, pt.z);
+					}
+					overall_cntr++;
+			}
 	}
 }
 
@@ -610,7 +668,7 @@ int main(int argc, char** argv) {
 		// ViewMatrix[2][2] += 2;
 		// ProjectionMatrix[2][2] += 1;
 		i++;
-		if(i==5) break;
+		if(i==builder.debug_chains_.size()+2) break;
 		glm::mat4 inverseView = glm::inverse(ViewMatrix);
 		glm::vec3 cameraPos = glm::vec3(inverseView[3]);
 		auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
