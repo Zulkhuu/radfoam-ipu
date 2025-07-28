@@ -1,6 +1,7 @@
 #include <iostream>
 #include <vector>
 #include <iomanip>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <random>
@@ -341,6 +342,39 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
   getPrograms().add("RayTraceCS", poplar::program::Execute(trace_cs));
 	getPrograms().add("broadcast_matrices", broadcastMatrices);
 
+
+  // ── RayGen (single tile) ─────────────────────────────────────────────────
+	// Dedicated buffers for RayGen
+	auto raygenInput  = graph.addVariable(poplar::UNSIGNED_CHAR, {kBytesPerTile}, "raygenInput");
+	auto raygenOutput = graph.addVariable(poplar::UNSIGNED_CHAR, {kBytesPerTile}, "raygenOutput");
+  {
+    // auto raygen_cs = graph.addComputeSet("RayGenCS");
+    auto v         = graph.addVertex(trace_cs, "RayGen");
+
+    // const auto slice_a = rayTracerOutputRays.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
+    // const auto slice_b = rayTracerInputRays.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
+    // graph.connect(v["raysIn"],  slice_a);
+    // graph.connect(v["raysOut"], slice_b);
+
+		// Map them to RayGen's tile
+		graph.setTileMapping(raygenInput,  kRaygenTile);
+		graph.setTileMapping(raygenOutput, kRaygenTile);
+		graph.connect(v["raysIn"],  raygenInput);
+		graph.connect(v["raysOut"], raygenOutput);
+
+		execCountT.buildTensor(graph, poplar::UNSIGNED_INT, {});
+		graph.setTileMapping(execCountT.get(), kRaygenTile);
+		graph.connect(v["exec_count"], execCountT.get());
+		getPrograms().add("write_exec_count", execCountT.buildWrite(graph, true));
+
+		cameraCellInfo_.buildTensor(graph, poplar::UNSIGNED_CHAR, {4});
+		graph.setTileMapping(cameraCellInfo_.get(), kRaygenTile); 
+		graph.connect(v["camera_cell_info"], cameraCellInfo_.get());
+		getPrograms().add("write_camera_cell_info", cameraCellInfo_.buildWrite(graph, true));
+
+    graph.setTileMapping(v, kRaygenTile);
+    // getPrograms().add("RayGenCS", poplar::program::Execute(raygen_cs));
+  }
 	// Tiles in order of chaining
 	//debug_chains_ = {521, 525, 527, 539, 707, 711, 729, 731};
 	std::string filepath = "../debugchains.txt";
@@ -355,6 +389,11 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 	}
 	// Program sequence for chained copies
 	poplar::program::Sequence chainCopy;
+	chainCopy.add(poplar::program::Copy(raygenOutput, rayTracerInputRays.slice(
+        tile_to_compute_ * kBytesPerTile,
+        (tile_to_compute_ + 1) * kBytesPerTile
+    ))
+	);
 
 	for (size_t i = 0; i + 1 < debug_chains_.size(); ++i) {
 			unsigned from = debug_chains_[i];
@@ -370,29 +409,6 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 
 	getPrograms().add("ChainCopyTest", chainCopy);
 
-  // ── RayGen (single tile) ─────────────────────────────────────────────────
-  {
-    auto raygen_cs = graph.addComputeSet("RayGenCS");
-    auto v         = graph.addVertex(raygen_cs, "RayGen");
-
-    const auto slice_a = rayTracerOutputRays.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
-    const auto slice_b = rayTracerInputRays.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
-    graph.connect(v["raysIn"],  slice_a);
-    graph.connect(v["raysOut"], slice_b);
-
-		execCountT.buildTensor(graph, poplar::UNSIGNED_INT, {});
-		graph.setTileMapping(execCountT.get(), kRaygenTile);
-		graph.connect(v["exec_count"], execCountT.get());
-		getPrograms().add("write_exec_count", execCountT.buildWrite(graph, true));
-
-		cameraCellInfo_.buildTensor(graph, poplar::UNSIGNED_CHAR, {4});
-		graph.setTileMapping(cameraCellInfo_.get(), kRaygenTile); 
-		graph.connect(v["camera_cell_info"], cameraCellInfo_.get());
-		getPrograms().add("write_camera_cell_info", cameraCellInfo_.buildWrite(graph, true));
-
-    graph.setTileMapping(v, kRaygenTile);
-    getPrograms().add("RayGenCS", poplar::program::Execute(raygen_cs));
-  }
 
   // ── Host-device streams & zero-init program ──────────────────────────────
   getPrograms().add("zero_rays", zero_seq);
@@ -435,7 +451,7 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& engine,
 	engine.run(getPrograms().getOrdinals().at("broadcast_matrices"));
 	engine.run(getPrograms().getOrdinals().at("write_exec_count"));
 	engine.run(getPrograms().getOrdinals().at("write_camera_cell_info"));
-  engine.run(getPrograms().getOrdinals().at("RayGenCS"));
+  // engine.run(getPrograms().getOrdinals().at("RayGenCS"));
   engine.run(getPrograms().getOrdinals().at("RayTraceCS"));
   engine.run(getPrograms().getOrdinals().at("ChainCopyTest"));
   readAllTiles(engine);
@@ -567,6 +583,7 @@ int main(int argc, char** argv) {
     ("i,input", "Input HDF5 file", cxxopts::value<std::string>()->default_value("./data/garden.h5"))
     ("t,tile", "Tile to debug", cxxopts::value<int>()->default_value("0"))
     ("no-ui", "Disable UI server", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
+    ("debug", "Enable debug reporting", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("p,port", "UI port", cxxopts::value<int>()->default_value("5000"))
     ("h,help", "Print usage");
 
@@ -579,13 +596,12 @@ int main(int argc, char** argv) {
 
 	std::string inputFile = result["input"].as<std::string>();
 	int tileToDebug = result["tile"].as<int>();
-	bool enableUI = !result.count("no-ui");
+	bool enableUI = !result["no-ui"].as<bool>();
+	bool enableDebug = result["debug"].as<bool>();
 	int uiPort = result["port"].as<int>();
 
 	KDTreeManager kdtree(inputFile);
-	// std::cout << "Total local points collected: " << kdtree.getPoints().size() << std::endl;
-	// for(int i=0; i<10; i++)
-	// 	kdtree.printRandomPoint();
+
 	glm::mat4 inverseView = glm::inverse(ViewMatrix);
 	glm::vec3 cameraPos = glm::vec3(inverseView[3]);
 	auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
@@ -601,15 +617,27 @@ int main(int argc, char** argv) {
   // ------------------------------
   // Poplar Engine Options
   // ------------------------------
-  poplar::OptionFlags engineOptions;
-  if (radfoam::util::isPoplarEngineOptionsEnabled()) {
-    logger()->info("Poplar auto-reporting is enabled (POPLAR_ENGINE_OPTIONS set)");
+  poplar::OptionFlags engineOptions = {};
+  // if (radfoam::util::isPoplarEngineOptionsEnabled()) {
+  //   logger()->info("Poplar auto-reporting is enabled (POPLAR_ENGINE_OPTIONS set)");
+  //   engineOptions = {{"debug.instrument", "true"}};
+  // } else {
+  //   logger()->info("Poplar auto-reporting is NOT enabled");
+  //   engineOptions = {};
+  // }
+  if (enableDebug) {
+    logger()->info("Enabling Poplar auto-reporting (POPLAR_ENGINE_OPTIONS set)");
+		setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true","autoReport.directory":"./report"})", 1);
     engineOptions = {{"debug.instrument", "true"}};
+    // engineOptions.set("debug.instrument", "true");
+    // engineOptions.set("autoReport.all", "true");
+    // engineOptions.set("autoReport.directory", "./report");
   } else {
+		unsetenv("POPLAR_ENGINE_OPTIONS");
     logger()->info("Poplar auto-reporting is NOT enabled");
-    engineOptions = {};
+    // engineOptions.set("autoReport.all", "false");
+    // engineOptions = {};
   }
-
   // ------------------------------
   // Build and Configure IPU Graph
   // ------------------------------

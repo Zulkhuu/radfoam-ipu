@@ -25,6 +25,16 @@ constexpr std::size_t kTileHeight = 15; // kFullImageHeight / kNumTilesY;
 constexpr std::size_t kTileFramebufferSize = 20 * 15 * 3; // kTileWidth * kTileHeight * 3;
 
 // -----------------------------------------------------------------------------
+// Ray router
+// ----------------------------------------------------------------------------
+constexpr std::size_t kNumL4RouterTiles = 256;  // Total number of L4 router tiles
+constexpr std::size_t kNumL3RouterTiles = 64;  // Total number of L3 router tiles
+constexpr std::size_t kNumL2RouterTiles = 16;  // Total number of L2 router tiles
+constexpr std::size_t kNumL1RouterTiles = 4;  // Total number of L1 router tiles
+
+constexpr unsigned kRaygenTile = 1470;
+
+// -----------------------------------------------------------------------------
 // Sanity checks
 // -----------------------------------------------------------------------------
 static_assert(kNumTilesX  * kNumTilesY == kNumTraceTiles,
@@ -35,3 +45,4 @@ static_assert(kTileWidth  * kNumTilesX == kFullImageWidth,
               "Tile width does not evenly divide full image width");
 static_assert(kTileHeight * kNumTilesY == kFullImageHeight,
               "Tile height does not evenly divide full image height");
+

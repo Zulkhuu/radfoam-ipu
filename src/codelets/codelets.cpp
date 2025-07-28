@@ -54,6 +54,7 @@ public:
   poplar::Output<float> result_float;
   poplar::Output<unsigned short> result_u16;
   
+  [[poplar::constraint("elem(*local_pts)!=elem(*framebuffer)")]]
   bool compute() {
     constexpr int RaySize = sizeof(Ray);
     constexpr int LocalPointSize = sizeof(LocalPoint);
@@ -231,3 +232,91 @@ public:
     return true;
   }
 };
+
+class RayRouter : public poplar::Vertex {
+public:
+  // Incoming rays from parent router
+  poplar::Input<poplar::Vector<uint8_t>> parentRaysIn;
+
+  // Incoming rays from 4 child ray tracers
+  poplar::Input<poplar::Vector<uint8_t>> childRaysIn0;
+  poplar::Input<poplar::Vector<uint8_t>> childRaysIn1;
+  poplar::Input<poplar::Vector<uint8_t>> childRaysIn2;
+  poplar::Input<poplar::Vector<uint8_t>> childRaysIn3;
+
+  // Outgoing rays: 4 child outputs and 1 parent output
+  poplar::Output<poplar::Vector<uint8_t>> parentRaysOut;
+  poplar::Output<poplar::Vector<uint8_t>> childRaysOut0;
+  poplar::Output<poplar::Vector<uint8_t>> childRaysOut1;
+  poplar::Output<poplar::Vector<uint8_t>> childRaysOut2;
+  poplar::Output<poplar::Vector<uint8_t>> childRaysOut3;
+
+  // ID mapping to know which cluster IDs belong to which child
+  poplar::Input<poplar::Vector<unsigned short>> childClusterIds; // 4 IDs
+  poplar::Input<uint8_t> level;
+
+  bool compute() {
+    constexpr int RaySize = sizeof(Ray);
+
+    // Helper lambda: Determine if destination cluster belongs to which child
+    auto findChildForCluster = [&](uint16_t clusterId) -> int {
+      for (int i = 0; i < 4; ++i) {
+        if (childClusterIds[i] == clusterId) return i;
+      }
+      return -1; // Not found → route to parent
+    };
+
+    // 1. Process rays from parent → route to child or keep for parent if unknown
+    {
+      const int numParentRays = parentRaysIn.size() / RaySize;
+      for (int i = 0; i < numParentRays; ++i) {
+        const Ray* ray = reinterpret_cast<const Ray*>(parentRaysIn.data() + i * RaySize);
+        int targetChild = findChildForCluster(ray->next_cluster);
+
+        if (targetChild == 0) {
+          std::memcpy(childRaysOut0.data() + i * RaySize, ray, RaySize);
+        } else if (targetChild == 1) {
+          std::memcpy(childRaysOut1.data() + i * RaySize, ray, RaySize);
+        } else if (targetChild == 2) {
+          std::memcpy(childRaysOut2.data() + i * RaySize, ray, RaySize);
+        } else if (targetChild == 3) {
+          std::memcpy(childRaysOut3.data() + i * RaySize, ray, RaySize);
+        } else {
+          // Not found in children → send upward (likely shouldn't happen here)
+          std::memcpy(parentRaysOut.data() + i * RaySize, ray, RaySize);
+        }
+      }
+    }
+
+    // 2. Process rays from each child → route to sibling or parent
+    auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) {
+      const int numChildRays = childIn.size() / RaySize;
+      for (int i = 0; i < numChildRays; ++i) {
+        const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * RaySize);
+        int targetChild = findChildForCluster(ray->next_cluster);
+
+        if (targetChild == 0) {
+          std::memcpy(childRaysOut0.data() + i * RaySize, ray, RaySize);
+        } else if (targetChild == 1) {
+          std::memcpy(childRaysOut1.data() + i * RaySize, ray, RaySize);
+        } else if (targetChild == 2) {
+          std::memcpy(childRaysOut2.data() + i * RaySize, ray, RaySize);
+        } else if (targetChild == 3) {
+          std::memcpy(childRaysOut3.data() + i * RaySize, ray, RaySize);
+        } else {
+          // Destination not in children → forward upward
+          std::memcpy(parentRaysOut.data() + i * RaySize, ray, RaySize);
+        }
+      }
+    };
+
+    routeChildRays(childRaysIn0);
+    routeChildRays(childRaysIn1);
+    routeChildRays(childRaysIn2);
+    routeChildRays(childRaysIn3);
+
+    return true;
+  }
+};
+
+
