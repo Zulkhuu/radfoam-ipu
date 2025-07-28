@@ -182,7 +182,7 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
   std::vector<std::vector<uint16_t>>      adjacency_;
 	std::vector<std::string>                paths_;
 
-  poplar::Tensor rays_a_, rays_b_;
+  poplar::Tensor rayTracerOutputRays, rayTracerInputRays;
 
   std::vector<ipu_utils::StreamableTensor> local_tensors_;
   std::vector<ipu_utils::StreamableTensor> neighbor_tensors_;
@@ -240,8 +240,8 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
   // ── Allocate global tensors ───────────────────────────────────────────────
   const size_t kBytesPerTile = kNumRays * sizeof(Ray);
   const size_t kTotalBytes   = kBytesPerTile * kNumTraceTiles;
-  rays_a_ = graph.addVariable(poplar::UNSIGNED_CHAR, {kTotalBytes}, "raysA");
-  rays_b_ = graph.addVariable(poplar::UNSIGNED_CHAR, {kTotalBytes}, "raysB");
+  rayTracerOutputRays = graph.addVariable(poplar::UNSIGNED_CHAR, {kTotalBytes}, "raysA");
+  rayTracerInputRays = graph.addVariable(poplar::UNSIGNED_CHAR, {kTotalBytes}, "raysB");
 
 	result_f32_read.buildTensor(graph, poplar::FLOAT, {kNumTraceTiles});
 	result_u16_read.buildTensor(graph, poplar::UNSIGNED_SHORT, {kNumTraceTiles});
@@ -305,17 +305,17 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
     graph.connect(v["neighbor_pts"], in_nbr.get());
     graph.connect(v["adjacency"],    in_adj.get());
 
-    const auto slice_a = rays_a_.slice(tid * kBytesPerTile, (tid + 1) * kBytesPerTile);
-    const auto slice_b = rays_b_.slice(tid * kBytesPerTile, (tid + 1) * kBytesPerTile);
+    const auto output_slice = rayTracerOutputRays.slice(tid * kBytesPerTile, (tid + 1) * kBytesPerTile);
+    const auto input_slice = rayTracerInputRays.slice(tid * kBytesPerTile, (tid + 1) * kBytesPerTile);
 
-    graph.setTileMapping(slice_a, tid);
-    graph.setTileMapping(slice_b, tid);
+    graph.setTileMapping(output_slice, tid);
+    graph.setTileMapping(input_slice, tid);
 
-    zero_seq.add(poplar::program::Copy(zero_const, slice_a));
-    zero_seq.add(poplar::program::Copy(zero_const, slice_b));
+    zero_seq.add(poplar::program::Copy(zero_const, output_slice));
+    zero_seq.add(poplar::program::Copy(zero_const, input_slice));
 
-    graph.connect(v["raysIn"],  slice_b);
-    graph.connect(v["raysOut"], slice_a);
+    graph.connect(v["raysOut"], output_slice);
+    graph.connect(v["raysIn"],  input_slice);
 
     graph.connect(v["result_float"], result_f32_read.get().slice({tid}, {tid + 1}).reshape({}));
     graph.connect(v["result_u16"], result_u16_read.get().slice({tid}, {tid + 1}).reshape({}));
@@ -360,9 +360,9 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 			unsigned from = debug_chains_[i];
 			unsigned to   = debug_chains_[i + 1];
 
-			// Slice raysOut from 'from' tile (rays_a_) and raysIn for 'to' tile (rays_b_)
-			auto raysOut = rays_a_.slice(from * kBytesPerTile, (from + 1) * kBytesPerTile);
-			auto raysIn  = rays_b_.slice(to   * kBytesPerTile, (to   + 1) * kBytesPerTile);
+			// Slice raysOut from 'from' tile (rayTracerOutputRays) and raysIn for 'to' tile (rayTracerInputRays)
+			auto raysOut = rayTracerOutputRays.slice(from * kBytesPerTile, (from + 1) * kBytesPerTile);
+			auto raysIn  = rayTracerInputRays.slice(to   * kBytesPerTile, (to   + 1) * kBytesPerTile);
 
 			// Add copy program
 			chainCopy.add(poplar::program::Copy(raysOut, raysIn));
@@ -375,8 +375,8 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
     auto raygen_cs = graph.addComputeSet("RayGenCS");
     auto v         = graph.addVertex(raygen_cs, "RayGen");
 
-    const auto slice_a = rays_a_.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
-    const auto slice_b = rays_b_.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
+    const auto slice_a = rayTracerOutputRays.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
+    const auto slice_b = rayTracerInputRays.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
     graph.connect(v["raysIn"],  slice_a);
     graph.connect(v["raysOut"], slice_b);
 
