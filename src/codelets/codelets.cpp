@@ -75,8 +75,8 @@ public:
     glm::mat4 invProj = glm::inverse(Proj);
     glm::vec3 rayOrigin = glm::vec3(invView[3]);
 
-    int index = 1;
-    const Ray* ray_in1 = readStructAt<Ray>(raysIn, 1); 
+    int index = 0;
+    const Ray* ray_in1 = readStructAt<Ray>(raysIn, index); 
     Ray* ray_out1 = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*index);
     
     uint16_t local_id = ray_in1->next_local;
@@ -173,6 +173,18 @@ public:
             *result_u16 = nbrPt->cluster_id; 
             *result_float = color.z;
             ray_out1->next_cluster = nbrPt->cluster_id; 
+            if(tile_id == 521) {
+              *result_u16 = ray_in1->y; 
+              *result_float = color.z;
+              ray_out1->next_cluster = 523; 
+            } 
+            if(tile_id == 523) {
+              *result_u16 = ray_in1->y; 
+              *result_float = color.z;
+              ray_out1->next_cluster = 520; 
+            } 
+
+
             ray_out1->next_local = nbrPt->local_id; 
             ray_out1->transmittance = transmittance; 
             ray_out1->x = ray_in1->x;
@@ -198,7 +210,11 @@ public:
 
     // for (unsigned i = 0; i < framebuffer.size(); ++i)
     //   framebuffer[i] = (255 - tile_id/4 + ray_in1->x)%256;
-    
+  
+    for(int i=1; i<kNumRays; i++) {
+      Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*i);
+      ray_->x = 0xFFFF;
+    }
     return true;
   }
 };
@@ -216,7 +232,7 @@ public:
     uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
     uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
-    int index = 1;
+    int index = 0;
     Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*index);
 
     ray_->x = 14;
@@ -229,22 +245,24 @@ public:
     ray_->next_cluster = cluster_id;
     ray_->next_local = local_id;
 
+    for(int i=1; i<kNumRays; i++) {
+      Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*i);
+      ray_->x = 0xFFFF;
+    }
     return true;
   }
 };
 
 class RayRouter : public poplar::Vertex {
 public:
-  // Incoming rays from parent router
+  // Incoming rays
   poplar::Input<poplar::Vector<uint8_t>> parentRaysIn;
-
-  // Incoming rays from 4 child ray tracers
   poplar::Input<poplar::Vector<uint8_t>> childRaysIn0;
   poplar::Input<poplar::Vector<uint8_t>> childRaysIn1;
   poplar::Input<poplar::Vector<uint8_t>> childRaysIn2;
   poplar::Input<poplar::Vector<uint8_t>> childRaysIn3;
 
-  // Outgoing rays: 4 child outputs and 1 parent output
+  // Outgoing rays
   poplar::Output<poplar::Vector<uint8_t>> parentRaysOut;
   poplar::Output<poplar::Vector<uint8_t>> childRaysOut0;
   poplar::Output<poplar::Vector<uint8_t>> childRaysOut1;
@@ -255,68 +273,122 @@ public:
   poplar::Input<poplar::Vector<unsigned short>> childClusterIds; // 4 IDs
   poplar::Input<uint8_t> level;
 
-  bool compute() {
-    constexpr int RaySize = sizeof(Ray);
+  poplar::Output<poplar::Vector<uint8_t>> debugBytes;
 
-    // Helper lambda: Determine if destination cluster belongs to which child
+  bool compute() {
+    const uint8_t lvl = *level;
+    constexpr int RaySize = sizeof(Ray);
+    constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
+    const int kNumRays = parentRaysIn.size() / RaySize;
+
+    // --- Counts ---
+    uint16_t inCountParent = 0;
+    uint16_t inCountC0 = 0, inCountC1 = 0, inCountC2 = 0, inCountC3 = 0;
+    uint16_t outCountParent = 0;
+    uint16_t outCountC0 = 0, outCountC1 = 0, outCountC2 = 0, outCountC3 = 0;
+
+    // Helper: Determine which child a cluster ID belongs to
     auto findChildForCluster = [&](uint16_t clusterId) -> int {
       for (int i = 0; i < 4; ++i) {
-        if (childClusterIds[i] == clusterId) return i;
+        if ((childClusterIds[i] >> lvl) == (clusterId >> lvl))
+            return i;
       }
-      return -1; // Not found → route to parent
+      return -1;
     };
 
-    // 1. Process rays from parent → route to child or keep for parent if unknown
+    // Helper: Route a ray
+    auto routeRay = [&](const Ray* ray) {
+      int targetChild = findChildForCluster(ray->next_cluster);
+      if (targetChild == 0) {
+        if (outCountC0 < kNumRays) {
+          std::memcpy(childRaysOut0.data() + outCountC0 * RaySize, ray, RaySize);
+          outCountC0++;
+        }
+      } else if (targetChild == 1) {
+        if (outCountC1 < kNumRays) {
+          std::memcpy(childRaysOut1.data() + outCountC1 * RaySize, ray, RaySize);
+          outCountC1++;
+        }
+      } else if (targetChild == 2) {
+        if (outCountC2 < kNumRays) {
+          std::memcpy(childRaysOut2.data() + outCountC2 * RaySize, ray, RaySize);
+          outCountC2++;
+        }
+      } else if (targetChild == 3) {
+        if (outCountC3 < kNumRays) {
+          std::memcpy(childRaysOut3.data() + outCountC3 * RaySize, ray, RaySize);
+          outCountC3++;
+        }
+      } else {
+        if (outCountParent < kNumRays) {
+          std::memcpy(parentRaysOut.data() + outCountParent * RaySize, ray, RaySize);
+          outCountParent++;
+        }
+      }
+    };
+
+    // Process parent rays
     {
       const int numParentRays = parentRaysIn.size() / RaySize;
       for (int i = 0; i < numParentRays; ++i) {
         const Ray* ray = reinterpret_cast<const Ray*>(parentRaysIn.data() + i * RaySize);
-        int targetChild = findChildForCluster(ray->next_cluster);
-
-        if (targetChild == 0) {
-          std::memcpy(childRaysOut0.data() + i * RaySize, ray, RaySize);
-        } else if (targetChild == 1) {
-          std::memcpy(childRaysOut1.data() + i * RaySize, ray, RaySize);
-        } else if (targetChild == 2) {
-          std::memcpy(childRaysOut2.data() + i * RaySize, ray, RaySize);
-        } else if (targetChild == 3) {
-          std::memcpy(childRaysOut3.data() + i * RaySize, ray, RaySize);
-        } else {
-          // Not found in children → send upward (likely shouldn't happen here)
-          std::memcpy(parentRaysOut.data() + i * RaySize, ray, RaySize);
-        }
+        if (ray->x == INVALID_RAY_ID) break;
+        inCountParent++;
+        routeRay(ray);
       }
     }
 
-    // 2. Process rays from each child → route to sibling or parent
-    auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) {
+    // New routeChildRays: count + route, return count
+    auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) -> uint16_t {
+      uint16_t count = 0;
       const int numChildRays = childIn.size() / RaySize;
       for (int i = 0; i < numChildRays; ++i) {
         const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * RaySize);
-        int targetChild = findChildForCluster(ray->next_cluster);
-
-        if (targetChild == 0) {
-          std::memcpy(childRaysOut0.data() + i * RaySize, ray, RaySize);
-        } else if (targetChild == 1) {
-          std::memcpy(childRaysOut1.data() + i * RaySize, ray, RaySize);
-        } else if (targetChild == 2) {
-          std::memcpy(childRaysOut2.data() + i * RaySize, ray, RaySize);
-        } else if (targetChild == 3) {
-          std::memcpy(childRaysOut3.data() + i * RaySize, ray, RaySize);
-        } else {
-          // Destination not in children → forward upward
-          std::memcpy(parentRaysOut.data() + i * RaySize, ray, RaySize);
-        }
+        if (ray->x == INVALID_RAY_ID) break;
+        count++;
+        routeRay(ray);
       }
+      return count;
     };
 
-    routeChildRays(childRaysIn0);
-    routeChildRays(childRaysIn1);
-    routeChildRays(childRaysIn2);
-    routeChildRays(childRaysIn3);
+    // Route each child and capture their input counts
+    inCountC0 = routeChildRays(childRaysIn0);
+    inCountC1 = routeChildRays(childRaysIn1);
+    inCountC2 = routeChildRays(childRaysIn2);
+    inCountC3 = routeChildRays(childRaysIn3);
+
+    // Invalidate remaining rays
+    auto invalidateRemaining = [&](poplar::Output<poplar::Vector<uint8_t>>& out, uint16_t count) {
+      uint16_t invalidRay = INVALID_RAY_ID;
+      for (uint16_t i = count; i < kNumRays; i++) {
+        *reinterpret_cast<uint16_t*>(out.data() + i * RaySize) = invalidRay;
+      }
+    };
+    invalidateRemaining(childRaysOut0, outCountC0);
+    invalidateRemaining(childRaysOut1, outCountC1);
+    invalidateRemaining(childRaysOut2, outCountC2);
+    invalidateRemaining(childRaysOut3, outCountC3);
+    invalidateRemaining(parentRaysOut, outCountParent);
+
+    // Fill debugBytes (10 counts = 20 bytes)
+    uint16_t* dbg = reinterpret_cast<uint16_t*>(debugBytes.data());
+    dbg[0] = inCountParent;
+    dbg[1] = inCountC0;
+    dbg[2] = inCountC1;
+    dbg[3] = inCountC2;
+    dbg[4] = inCountC3;
+    dbg[5] = outCountParent;
+    dbg[6] = outCountC0;
+    dbg[7] = outCountC1;
+    dbg[8] = outCountC2;
+    dbg[9] = outCountC3;
+
+    dbg[10] = 0; // spare
+    dbg[11] = 0; // spare
 
     return true;
   }
+
 };
 
 

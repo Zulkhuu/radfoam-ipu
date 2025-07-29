@@ -113,7 +113,7 @@ private:
         HighFive::File f(h5_path, HighFive::File::ReadOnly);
         points_.clear();
 
-        for (size_t tid = 0; tid < kNumTraceTiles; ++tid) {
+        for (size_t tid = 0; tid < kNumRayTracerTiles; ++tid) {
             const auto g = f.getGroup(fmt::format("part{:04}", tid));
             std::vector<LocalPoint> local_pts;
             g.getDataSet("local_pts").read(local_pts);
@@ -167,8 +167,9 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
 
  private:
   // ---- constants -----------------------------------------------------------
-  static constexpr unsigned kRaygenTile = 1024;
-  static constexpr size_t   kNumRays    = 1500;
+  // static constexpr unsigned kRaygenTile = 1024;
+  // static constexpr size_t   kNumRays    = 1500;
+	static constexpr uint16_t routerDebugSize = 24;
 
   // ---- helper --------------------------------------------------------------
   void readAllTiles(poplar::Engine& eng);
@@ -205,6 +206,12 @@ class RadiantFoamIpuBuilder : public ipu_utils::BuilderInterface {
 	std::array<uint8_t, 4> hostCameraCellInfo_ = {0, 0, 0, 0};
 	ipu_utils::StreamableTensor cameraCellInfo_{"camera_cell_info"};
 
+	poplar::Tensor childClusterIdsConst;
+	std::vector<uint16_t> allClusterIds;	
+
+	ipu_utils::StreamableTensor l0routerDebugBytesRead{"router_debug_bytes_read"};
+	std::vector<uint8_t> l0routerDebugBytesHost;
+
 };
 
 // -----------------------------------------------------------------------------
@@ -214,14 +221,14 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
   logger()->info("Building RadiantFoam graph (compute tile {})", tile_to_compute_);
 
   // ── Load HDF5 scene partitions ────────────────────────────────────────────
-  local_pts_.resize(kNumTraceTiles);
-  neighbor_pts_.resize(kNumTraceTiles);
-  adjacency_.resize(kNumTraceTiles);
-	paths_.resize(kNumTraceTiles);
+  local_pts_.resize(kNumRayTracerTiles);
+  neighbor_pts_.resize(kNumRayTracerTiles);
+  adjacency_.resize(kNumRayTracerTiles);
+	paths_.resize(kNumRayTracerTiles);
 
   {
     HighFive::File f(h5_file_, HighFive::File::ReadOnly);
-    for (size_t tid = 0; tid < kNumTraceTiles; ++tid) {
+    for (size_t tid = 0; tid < kNumRayTracerTiles; ++tid) {
       const auto g = f.getGroup(fmt::format("part{:04}", tid));
       g.getDataSet("local_pts").read(local_pts_[tid]);
       g.getDataSet("neighbor_pts").read(neighbor_pts_[tid]);
@@ -239,19 +246,19 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 	popops::addCodelets(graph);
 
   // ── Allocate global tensors ───────────────────────────────────────────────
-  const size_t kBytesPerTile = kNumRays * sizeof(Ray);
-  const size_t kTotalBytes   = kBytesPerTile * kNumTraceTiles;
-  rayTracerOutputRays = graph.addVariable(poplar::UNSIGNED_CHAR, {kTotalBytes}, "raysA");
-  rayTracerInputRays = graph.addVariable(poplar::UNSIGNED_CHAR, {kTotalBytes}, "raysB");
+  const size_t kRayIOBytesPerTile = kNumRays * sizeof(Ray); // total number of bytes for one tile's in or out buffer
+  const size_t kRayTracerRayBytesAllTiles   = kRayIOBytesPerTile * kNumRayTracerTiles; // totoal number of bytes for all raytracer tile's in or out buffer
+  rayTracerOutputRays = graph.addVariable(poplar::UNSIGNED_CHAR, {kRayTracerRayBytesAllTiles}, "rayTracerOutputRays");
+  rayTracerInputRays = graph.addVariable(poplar::UNSIGNED_CHAR, {kRayTracerRayBytesAllTiles}, "rayTracerInputRays");
 
-	result_f32_read.buildTensor(graph, poplar::FLOAT, {kNumTraceTiles});
-	result_u16_read.buildTensor(graph, poplar::UNSIGNED_SHORT, {kNumTraceTiles});
-  fb_read_all.buildTensor(graph, poplar::UNSIGNED_CHAR, {kNumTraceTiles, kTileFramebufferSize});
+	result_f32_read.buildTensor(graph, poplar::FLOAT, {kNumRayTracerTiles});
+	result_u16_read.buildTensor(graph, poplar::UNSIGNED_SHORT, {kNumRayTracerTiles});
+  fb_read_all.buildTensor(graph, poplar::UNSIGNED_CHAR, {kNumRayTracerTiles, kTileFramebufferSize});
 
   // Faster mapping via poputil helpers (instead of manual loop):
   poputil::mapTensorLinearlyWithOffset(graph, result_f32_read.get(), 0);
   poputil::mapTensorLinearlyWithOffset(graph, result_u16_read.get(), 0);
-  poputil::mapTensorLinearlyWithOffset(graph, fb_read_all.get().reshape({kNumTraceTiles, kTileFramebufferSize}), 0);
+  poputil::mapTensorLinearlyWithOffset(graph, fb_read_all.get().reshape({kNumRayTracerTiles, kTileFramebufferSize}), 0);
 
 	// Create master matrices on tile 0
 	poplar::program::Sequence broadcastMatrices;
@@ -264,8 +271,8 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 	broadcastMatrices.add(projMatrix_.buildWrite(graph, true));
 
   // Zero-init rays buffers once per run
-  const auto zero_const = graph.addConstant(poplar::UNSIGNED_CHAR, {kBytesPerTile}, 0);
-  graph.setTileMapping(zero_const, 1024);
+  const auto zero_const = graph.addConstant(poplar::UNSIGNED_CHAR, {kRayIOBytesPerTile}, 0);
+  graph.setTileMapping(zero_const, kRaygenTile);
 
   poplar::program::Sequence zero_seq;
 
@@ -273,7 +280,7 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
   auto trace_cs = graph.addComputeSet("RayTraceCS");
 	
   
-	for (size_t tid = 0; tid < kNumTraceTiles; ++tid) {
+	for (size_t tid = 0; tid < kNumRayTracerTiles; ++tid) {
     // ---- H2D tensors -------------------------------------------------------
     ipu_utils::StreamableTensor in_local(fmt::format("local_{}", tid));
     ipu_utils::StreamableTensor in_nbr(fmt::format("nbr_{}", tid));
@@ -306,8 +313,8 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
     graph.connect(v["neighbor_pts"], in_nbr.get());
     graph.connect(v["adjacency"],    in_adj.get());
 
-    const auto output_slice = rayTracerOutputRays.slice(tid * kBytesPerTile, (tid + 1) * kBytesPerTile);
-    const auto input_slice = rayTracerInputRays.slice(tid * kBytesPerTile, (tid + 1) * kBytesPerTile);
+    const auto output_slice = rayTracerOutputRays.slice(tid * kRayIOBytesPerTile, (tid + 1) * kRayIOBytesPerTile);
+    const auto input_slice = rayTracerInputRays.slice(tid * kRayIOBytesPerTile, (tid + 1) * kRayIOBytesPerTile);
 
     graph.setTileMapping(output_slice, tid);
     graph.setTileMapping(input_slice, tid);
@@ -333,6 +340,7 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
     per_tile_writes_.add(in_local.buildWrite(graph, true));
     per_tile_writes_.add(in_nbr.buildWrite(graph, true));
     per_tile_writes_.add(in_adj.buildWrite(graph, true));
+		// per_tile_writes_.add(program::Copy(tile_const, v2))
 
     local_tensors_.push_back(std::move(in_local));
     neighbor_tensors_.push_back(std::move(in_nbr));
@@ -345,14 +353,14 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 
   // ── RayGen (single tile) ─────────────────────────────────────────────────
 	// Dedicated buffers for RayGen
-	auto raygenInput  = graph.addVariable(poplar::UNSIGNED_CHAR, {kBytesPerTile}, "raygenInput");
-	auto raygenOutput = graph.addVariable(poplar::UNSIGNED_CHAR, {kBytesPerTile}, "raygenOutput");
+	auto raygenInput  = graph.addVariable(poplar::UNSIGNED_CHAR, {kRayIOBytesPerTile}, "raygenInput");
+	auto raygenOutput = graph.addVariable(poplar::UNSIGNED_CHAR, {kRayIOBytesPerTile}, "raygenOutput");
   {
     // auto raygen_cs = graph.addComputeSet("RayGenCS");
     auto v         = graph.addVertex(trace_cs, "RayGen");
 
-    // const auto slice_a = rayTracerOutputRays.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
-    // const auto slice_b = rayTracerInputRays.slice(tile_to_compute_ * kBytesPerTile, (tile_to_compute_ + 1) * kBytesPerTile);
+    // const auto slice_a = rayTracerOutputRays.slice(tile_to_compute_ * kRayIOBytesPerTile, (tile_to_compute_ + 1) * kRayIOBytesPerTile);
+    // const auto slice_b = rayTracerInputRays.slice(tile_to_compute_ * kRayIOBytesPerTile, (tile_to_compute_ + 1) * kRayIOBytesPerTile);
     // graph.connect(v["raysIn"],  slice_a);
     // graph.connect(v["raysOut"], slice_b);
 
@@ -375,8 +383,95 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
     graph.setTileMapping(v, kRaygenTile);
     // getPrograms().add("RayGenCS", poplar::program::Execute(raygen_cs));
   }
+	
+	constexpr uint16_t routerL0_tile_offset = 1024;
+
+	l0routerDebugBytesRead.buildTensor(graph, poplar::UNSIGNED_CHAR, {kNumL0RouterTiles, routerDebugSize});
+	poputil::mapTensorLinearlyWithOffset(graph, l0routerDebugBytesRead.get().reshape({kNumL0RouterTiles, routerDebugSize}), routerL0_tile_offset);
+
+	const size_t kL0RouterPerTileBufferBytes = kRayIOBytesPerTile * 5; //(4 children + Parent)	
+	const size_t kL0RouterTotalBufferBytes = kL0RouterPerTileBufferBytes * kNumL0RouterTiles; 
+	poplar::Tensor L0RouterOutputRays = graph.addVariable(poplar::UNSIGNED_CHAR, {kL0RouterTotalBufferBytes}, "L0RouterOutputRays");
+	poplar::Tensor L0RouterInputRays = graph.addVariable(poplar::UNSIGNED_CHAR, {kL0RouterTotalBufferBytes}, "L0RouterInputRays");
+	
+	constexpr size_t kChildrenPerRouter = 4;
+	allClusterIds.reserve(kNumL0RouterTiles * kChildrenPerRouter);
+	{
+		
+		for(std::size_t router_id = 0; router_id < kNumL0RouterTiles; router_id++) {
+			// constexpr uint16_t router_id = 0;
+			uint16_t routerL0_tid = routerL0_tile_offset + router_id;
+			auto v = graph.addVertex(trace_cs, "RayRouter");
+
+			// Map them to RayGen's tile
+			auto input_slices = L0RouterInputRays.slice(router_id * kL0RouterPerTileBufferBytes, (router_id + 1) * kL0RouterPerTileBufferBytes);
+			auto output_slices = L0RouterOutputRays.slice(router_id * kL0RouterPerTileBufferBytes, (router_id + 1) * kL0RouterPerTileBufferBytes);
+			
+			graph.setTileMapping(input_slices,  routerL0_tid);
+			graph.setTileMapping(output_slices, routerL0_tid);
+
+			size_t baseOffset = router_id * kL0RouterPerTileBufferBytes;
+			auto parentRaysInSlice  = L0RouterInputRays.slice(baseOffset, baseOffset + kRayIOBytesPerTile);
+			auto childRaysIn0Slice  = L0RouterInputRays.slice(baseOffset + 1*kRayIOBytesPerTile, baseOffset + 2*kRayIOBytesPerTile);
+			auto childRaysIn1Slice  = L0RouterInputRays.slice(baseOffset + 2*kRayIOBytesPerTile, baseOffset + 3*kRayIOBytesPerTile);
+			auto childRaysIn2Slice  = L0RouterInputRays.slice(baseOffset + 3*kRayIOBytesPerTile, baseOffset + 4*kRayIOBytesPerTile);
+			auto childRaysIn3Slice  = L0RouterInputRays.slice(baseOffset + 4*kRayIOBytesPerTile, baseOffset + 5*kRayIOBytesPerTile);
+
+			auto parentRaysOutSlice = L0RouterOutputRays.slice(baseOffset, baseOffset + kRayIOBytesPerTile);
+			auto childRaysOut0Slice = L0RouterOutputRays.slice(baseOffset + 1*kRayIOBytesPerTile, baseOffset + 2*kRayIOBytesPerTile);
+			auto childRaysOut1Slice = L0RouterOutputRays.slice(baseOffset + 2*kRayIOBytesPerTile, baseOffset + 3*kRayIOBytesPerTile);
+			auto childRaysOut2Slice = L0RouterOutputRays.slice(baseOffset + 3*kRayIOBytesPerTile, baseOffset + 4*kRayIOBytesPerTile);
+			auto childRaysOut3Slice = L0RouterOutputRays.slice(baseOffset + 4*kRayIOBytesPerTile, baseOffset + 5*kRayIOBytesPerTile);
+
+			graph.connect(v["parentRaysIn"],  parentRaysInSlice);
+			graph.connect(v["childRaysIn0"],  childRaysIn0Slice);
+			graph.connect(v["childRaysIn1"],  childRaysIn1Slice);
+			graph.connect(v["childRaysIn2"],  childRaysIn2Slice);
+			graph.connect(v["childRaysIn3"],  childRaysIn3Slice);
+
+			graph.connect(v["parentRaysOut"], parentRaysOutSlice);
+			graph.connect(v["childRaysOut0"], childRaysOut0Slice);
+			graph.connect(v["childRaysOut1"], childRaysOut1Slice);
+			graph.connect(v["childRaysOut2"], childRaysOut2Slice);
+			graph.connect(v["childRaysOut3"], childRaysOut3Slice);
+
+			for (size_t router = 0; router < kNumL0RouterTiles; ++router) {
+				for (size_t i = 0; i < kChildrenPerRouter; ++i) {
+					allClusterIds.push_back(static_cast<uint16_t>(router * kChildrenPerRouter + i));
+				}
+			}
+
+			size_t baseClusterIdx = router_id * kChildrenPerRouter;
+
+			// Constant tensor for this router (4 IDs)
+			poplar::Tensor childClusterIdsConst = graph.addConstant(
+				poplar::UNSIGNED_SHORT,                          // type
+				{kChildrenPerRouter},                            // shape (4)
+				allClusterIds.data() + baseClusterIdx            // pointer to start of this router’s 4 IDs
+			);
+
+
+			// Map constant to router’s tile
+			graph.setTileMapping(childClusterIdsConst, routerL0_tid);
+			graph.connect(v["childClusterIds"], childClusterIdsConst);
+
+			auto levelConst = graph.addConstant(poplar::UNSIGNED_CHAR, {}, 0); // <-- L0 routers = 0
+			graph.setTileMapping(levelConst, routerL0_tid);
+			graph.connect(v["level"], levelConst);
+
+			auto debugSlice = l0routerDebugBytesRead.get().slice({router_id, 0}, {router_id + 1, routerDebugSize}).reshape({routerDebugSize});
+			graph.connect(v["debugBytes"], debugSlice);
+
+			graph.setTileMapping(v, routerL0_tid);
+			
+		}
+
+		getPrograms().add("read_router_debug_bytes", l0routerDebugBytesRead.buildRead(graph, true));
+
+  }
+
 	// Tiles in order of chaining
-	//debug_chains_ = {521, 525, 527, 539, 707, 711, 729, 731};
+	// debug_chains_ = {521, 525, 527, 539, 707, 711, 729, 731};
 	std::string filepath = "../debugchains.txt";
 	std::ifstream file(filepath);
 	if (!file.is_open()) {
@@ -388,26 +483,75 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
 			debug_chains_.push_back(value);
 	}
 	// Program sequence for chained copies
-	poplar::program::Sequence chainCopy;
-	chainCopy.add(poplar::program::Copy(raygenOutput, rayTracerInputRays.slice(
-        tile_to_compute_ * kBytesPerTile,
-        (tile_to_compute_ + 1) * kBytesPerTile
-    ))
-	);
+	poplar::program::Sequence dataExchange;
+	// dataExchange.add(poplar::program::Copy(raygenOutput, rayTracerInputRays.slice(
+  //       tile_to_compute_ * kRayIOBytesPerTile,
+  //       (tile_to_compute_ + 1) * kRayIOBytesPerTile
+  //   ))
+	// );
 
-	for (size_t i = 0; i + 1 < debug_chains_.size(); ++i) {
-			unsigned from = debug_chains_[i];
-			unsigned to   = debug_chains_[i + 1];
+	// for (size_t i = 0; i + 1 < debug_chains_.size(); ++i) {
+	// 		unsigned from = debug_chains_[i];
+	// 		unsigned to   = debug_chains_[i + 1];
 
-			// Slice raysOut from 'from' tile (rayTracerOutputRays) and raysIn for 'to' tile (rayTracerInputRays)
-			auto raysOut = rayTracerOutputRays.slice(from * kBytesPerTile, (from + 1) * kBytesPerTile);
-			auto raysIn  = rayTracerInputRays.slice(to   * kBytesPerTile, (to   + 1) * kBytesPerTile);
+	// 		// Slice raysOut from 'from' tile (rayTracerOutputRays) and raysIn for 'to' tile (rayTracerInputRays)
+	// 		auto raysOut = rayTracerOutputRays.slice(from * kRayIOBytesPerTile, (from + 1) * kRayIOBytesPerTile);
+	// 		auto raysIn  = rayTracerInputRays.slice(to   * kRayIOBytesPerTile, (to   + 1) * kRayIOBytesPerTile);
 
-			// Add copy program
-			chainCopy.add(poplar::program::Copy(raysOut, raysIn));
+	// 		// Add copy program
+	// 		dataExchange.add(poplar::program::Copy(raysOut, raysIn));
+	// }
+
+	for (uint16_t routerId = 0; routerId < kNumL0RouterTiles; ++routerId) {
+			uint16_t routerTile = routerL0_tile_offset + routerId;
+
+			// Calculate router’s buffer slice
+			size_t routerBaseOffset = routerId * kL0RouterPerTileBufferBytes;
+
+			// Parent portion (0)
+			auto parentOut = L0RouterOutputRays.slice(routerBaseOffset, routerBaseOffset + kRayIOBytesPerTile);
+			auto parentIn  = L0RouterInputRays.slice(routerBaseOffset, routerBaseOffset + kRayIOBytesPerTile);
+
+			std::array<poplar::Tensor, 4> childOutSlices = {
+					L0RouterOutputRays.slice(routerBaseOffset + 1 * kRayIOBytesPerTile, routerBaseOffset + 2 * kRayIOBytesPerTile),
+					L0RouterOutputRays.slice(routerBaseOffset + 2 * kRayIOBytesPerTile, routerBaseOffset + 3 * kRayIOBytesPerTile),
+					L0RouterOutputRays.slice(routerBaseOffset + 3 * kRayIOBytesPerTile, routerBaseOffset + 4 * kRayIOBytesPerTile),
+					L0RouterOutputRays.slice(routerBaseOffset + 4 * kRayIOBytesPerTile, routerBaseOffset + 5 * kRayIOBytesPerTile)
+			};
+
+			std::array<poplar::Tensor, 4> childInSlices = {
+					L0RouterInputRays.slice(routerBaseOffset + 1 * kRayIOBytesPerTile, routerBaseOffset + 2 * kRayIOBytesPerTile),
+					L0RouterInputRays.slice(routerBaseOffset + 2 * kRayIOBytesPerTile, routerBaseOffset + 3 * kRayIOBytesPerTile),
+					L0RouterInputRays.slice(routerBaseOffset + 3 * kRayIOBytesPerTile, routerBaseOffset + 4 * kRayIOBytesPerTile),
+					L0RouterInputRays.slice(routerBaseOffset + 4 * kRayIOBytesPerTile, routerBaseOffset + 5 * kRayIOBytesPerTile)
+			};
+
+			// Router -> RayTracer (child)
+			for (uint16_t childIdx = 0; childIdx < kChildrenPerRouter; ++childIdx) {
+					uint16_t tracerTile = routerId * kChildrenPerRouter + childIdx;
+					auto rayTracerIn = rayTracerInputRays.slice(tracerTile * kRayIOBytesPerTile, (tracerTile + 1) * kRayIOBytesPerTile);
+
+					// Copy router childOut to corresponding ray tracer input
+					dataExchange.add(poplar::program::Copy(childOutSlices[childIdx], rayTracerIn));
+			}
+
+			// RayTracer -> Router (child)
+			for (uint16_t childIdx = 0; childIdx < kChildrenPerRouter; ++childIdx) {
+					uint16_t tracerTile = routerId * kChildrenPerRouter + childIdx;
+					auto rayTracerOut = rayTracerOutputRays.slice(tracerTile * kRayIOBytesPerTile, (tracerTile + 1) * kRayIOBytesPerTile);
+
+					// Copy ray tracer output to router childIn
+					dataExchange.add(poplar::program::Copy(rayTracerOut, childInSlices[childIdx]));
+			}
+
+			// Copy parent rays upward/downward if chaining routers
+			// dataExchange.add(poplar::program::Copy(parentOut, parentIn));
+			if(routerId == 130) {
+				dataExchange.add(poplar::program::Copy(raygenOutput, parentIn));
+			}
 	}
 
-	getPrograms().add("ChainCopyTest", chainCopy);
+	getPrograms().add("DataExchange", dataExchange);
 
 
   // ── Host-device streams & zero-init program ──────────────────────────────
@@ -415,9 +559,9 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph,
   getPrograms().add("write",     per_tile_writes_);
 
   // ── Unified framebuffer read ─────────────────────────────────────────────
-  framebuffer_host_.resize(kTileFramebufferSize * kNumTraceTiles);
-	result_f32_host_.resize(kNumTraceTiles);
-	result_u16_host_.resize(kNumTraceTiles);
+  framebuffer_host_.resize(kTileFramebufferSize * kNumRayTracerTiles);
+	result_f32_host_.resize(kNumRayTracerTiles);
+	result_u16_host_.resize(kNumRayTracerTiles);
 
   getPrograms().add("fb_read_all", fb_read_all.buildRead(graph, true));
 	getPrograms().add("read_result_f32", result_f32_read.buildRead(graph, true));
@@ -445,6 +589,10 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& engine,
     cameraCellInfo_.connectWriteStream(engine, hostCameraCellInfo_.data());
     engine.run(getPrograms().getOrdinals().at("zero_rays"));
     engine.run(getPrograms().getOrdinals().at("write"));
+
+		l0routerDebugBytesHost.resize(kNumL0RouterTiles * routerDebugSize);
+    l0routerDebugBytesRead.connectReadStream(engine, l0routerDebugBytesHost.data());
+
     initialized_ = true;
   }
 
@@ -453,7 +601,8 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& engine,
 	engine.run(getPrograms().getOrdinals().at("write_camera_cell_info"));
   // engine.run(getPrograms().getOrdinals().at("RayGenCS"));
   engine.run(getPrograms().getOrdinals().at("RayTraceCS"));
-  engine.run(getPrograms().getOrdinals().at("ChainCopyTest"));
+  engine.run(getPrograms().getOrdinals().at("DataExchange"));
+	engine.run(getPrograms().getOrdinals().at("read_router_debug_bytes"));
   readAllTiles(engine);
 	execCounterHost++;
 }
@@ -537,16 +686,16 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& engine) {
 static cv::Mat AssembleFullImage(const std::vector<uint8_t>& tiles) {
   cv::Mat img(kFullImageHeight, kFullImageWidth, CV_8UC3);
 
-  for (size_t ty = 0; ty < kNumTilesY; ++ty) {
-    for (size_t tx = 0; tx < kNumTilesX; ++tx) {
-      const size_t idx  = ty * kNumTilesX + tx;
+  for (size_t ty = 0; ty < kNumRayTracerTilesY; ++ty) {
+    for (size_t tx = 0; tx < kNumRayTracerTilesX; ++tx) {
+      const size_t idx  = ty * kNumRayTracerTilesX + tx;
       const uint8_t* src = tiles.data() + idx * kTileFramebufferSize;
 
-      for (size_t y = 0; y < kTileHeight; ++y) {
-        std::memcpy(img.ptr<uint8_t>(ty * kTileHeight + y) +
-                        tx * kTileWidth * 3,
-                    src + y * kTileWidth * 3,
-                    kTileWidth * 3);
+      for (size_t y = 0; y < kTileImageHeight; ++y) {
+        std::memcpy(img.ptr<uint8_t>(ty * kTileImageHeight + y) +
+										tx * kTileImageWidth * 3,
+                    src + y * kTileImageWidth * 3,
+                    kTileImageWidth * 3);
       }
     }
   }
@@ -696,7 +845,8 @@ int main(int argc, char** argv) {
 		// ViewMatrix[2][2] += 2;
 		// ProjectionMatrix[2][2] += 1;
 		i++;
-		if(i==builder.debug_chains_.size()+2) break;
+		// if(i==builder.debug_chains_.size()+2) break;
+		if(i==10) break;
 		glm::mat4 inverseView = glm::inverse(ViewMatrix);
 		glm::vec3 cameraPos = glm::vec3(inverseView[3]);
 		auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
