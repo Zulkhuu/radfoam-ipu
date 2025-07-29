@@ -44,7 +44,9 @@ include_directories(
 
 
 # ───── Main Executable ─────────────────────────────────────────────
-add_executable(main src/main.cpp)
+add_executable(main 
+  src/main.cpp
+  src/RadiantFoamIpuBuilder.cpp  )
 
 # ───── Target Configuration ────────────────────────────────────────
 target_include_directories(main
@@ -74,3 +76,7 @@ target_compile_definitions(main
 )
 
 target_compile_features(main PRIVATE cxx_std_20)
+
+
+# target_compile_options(main PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+# target_link_options(main PRIVATE -fsanitize=address)

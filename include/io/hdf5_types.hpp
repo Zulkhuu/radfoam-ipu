@@ -1,3 +1,5 @@
+#pragma once
+
 #include "geometry/primitives.hpp"
 #include <highfive/H5File.hpp>
 #include <highfive/H5DataType.hpp>
@@ -8,7 +10,7 @@ using radfoam::geometry::GenericPoint;
 
 namespace radfoam::io {
 
-HighFive::CompoundType MakeLocalPointType() {
+inline HighFive::CompoundType MakeLocalPointType() {
   using namespace HighFive;
   return CompoundType{
       {"x", create_datatype<float>(),   offsetof(LocalPoint, x)},
@@ -22,7 +24,7 @@ HighFive::CompoundType MakeLocalPointType() {
       {"adj_end", create_datatype<uint32_t>(), offsetof(LocalPoint, adj_end)}};
 }
 
-HighFive::CompoundType MakeGenericPointType() {
+inline HighFive::CompoundType MakeGenericPointType() {
   using namespace HighFive;
   return CompoundType{
       {"x", create_datatype<float>(),   offsetof(GenericPoint, x)},
