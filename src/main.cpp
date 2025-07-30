@@ -67,6 +67,33 @@ static cv::Mat AssembleFullImage(const std::vector<uint8_t>& tiles) {
   return img;
 }
 
+// Assemble full image from finished rays buffer
+static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRaysHost) {
+    cv::Mat img(kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0));
+
+    const size_t numFinishedRays = finishedRaysHost.size() / sizeof(FinishedRay);
+    const FinishedRay* rays = reinterpret_cast<const FinishedRay*>(finishedRaysHost.data());
+
+    for (size_t i = 0; i < numFinishedRays; ++i) {
+        const FinishedRay& r = rays[i];
+
+        // Skip invalid rays
+        if (r.x == 0xFFFF || r.y == 0xFFFF) continue;
+        if (r.x >= kFullImageWidth || r.y >= kFullImageHeight) continue;
+
+        // OpenCV uses BGR order
+        cv::Vec3b& pixel = img.at<cv::Vec3b>(r.y, r.x);
+        pixel[0] = r.b; // B
+        pixel[1] = r.g; // G
+        pixel[2] = r.r; // R
+				fmt::print("Ray {:3}: (x={}, y={}) RGB=({}, {}, {})\n",
+                       i, r.x, r.y, r.r, r.g, r.b);
+    }
+
+    return img;
+}
+
+
 int main(int argc, char** argv) {
 
 	glm::mat4 ViewMatrix(
@@ -211,7 +238,7 @@ int main(int argc, char** argv) {
 		// ProjectionMatrix[2][2] += 1;
 		i++;
 		// if(i==builder.debug_chains_.size()+2) break;
-		if(i==100) break;
+		if(i==80) break;
 		glm::mat4 inverseView = glm::inverse(ViewMatrix);
 		glm::vec3 cameraPos = glm::vec3(inverseView[3]);
 		auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
@@ -222,7 +249,8 @@ int main(int argc, char** argv) {
 
 		if (enableUI) hostProcessing.waitForCompletion();
 		mgr.execute(builder);
-		*imagePtr = AssembleFullImage(builder.framebuffer_host);
+		// *imagePtr = AssembleFullImage(builder.framebuffer_host);
+		*imagePtr = AssembleFinishedRaysImage(builder.finishedRaysHost_);
 		std::swap(imagePtr, imagePtrBuffered);
 		if (enableUI) hostProcessing.run(uiUpdateFunc);
 
@@ -231,7 +259,8 @@ int main(int argc, char** argv) {
 
 	if (enableUI) hostProcessing.waitForCompletion();
 
-  cv::imwrite("framebuffer_full.png", AssembleFullImage(builder.framebuffer_host));
+  // cv::imwrite("framebuffer_full.png", AssembleFullImage(builder.framebuffer_host));
+  cv::imwrite("framebuffer_full.png", AssembleFinishedRaysImage(builder.finishedRaysHost_));
 
   return 0;
 }

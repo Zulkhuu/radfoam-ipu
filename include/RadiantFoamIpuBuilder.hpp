@@ -63,6 +63,7 @@ public:
     void updateCameraCell(const radfoam::geometry::GenericPoint& cell);
 
     // Host‑visible frame results -------------------------------------------
+    std::vector<uint8_t>  finishedRaysHost_;
     std::vector<uint8_t>  framebuffer_host;   ///< RGB888 for every tile
     std::vector<float>    result_f32_host;    ///< Scratch debug channel
     std::vector<uint16_t> result_u16_host;    ///< Scratch debug channel
@@ -114,6 +115,7 @@ private:
     ipu_utils::StreamableTensor l2routerDebugBytesRead_{"l2_router_debug_bytes_read"};
     ipu_utils::StreamableTensor l3routerDebugBytesRead_{"l3_router_debug_bytes_read"};
     ipu_utils::StreamableTensor raygenDebugBytesRead_{"raygen_debug_bytes_read"};
+    ipu_utils::StreamableTensor finishedRaysRead_{"finished_rays_read"};
 
     // CPU‑side mirrors -------------------------------------------------------
     bool initialised_      = false;
@@ -148,6 +150,7 @@ private:
     poplar::Tensor raygenOutput;
     poplar::Tensor raygenInput;
     poplar::Tensor zero_const;
+    poplar::Tensor zero_constf;
 };
 
 } // namespace ipu

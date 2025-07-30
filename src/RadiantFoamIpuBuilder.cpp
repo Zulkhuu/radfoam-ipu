@@ -96,6 +96,8 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
         fb_read_all_.connectReadStream(eng, framebuffer_host.data());
         result_f32_read_.connectReadStream(eng, result_f32_host.data());
         result_u16_read_.connectReadStream(eng, result_u16_host.data());
+        finishedRaysRead_.connectReadStream(eng, finishedRaysHost_.data());
+
         l0routerDebugBytesHost_.resize(kNumL0RouterTiles * kRouterDebugSize);
         l0routerDebugBytesRead_.connectReadStream(eng, l0routerDebugBytesHost_.data());
         l1routerDebugBytesHost_.resize(kNumL1RouterTiles * kRouterDebugSize);
@@ -117,11 +119,13 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
     }
 
     // Per‑frame updates ------------------------------------------------------
-    eng.run(getPrograms().getOrdinals().at("broadcast_matrices"));
     eng.run(getPrograms().getOrdinals().at("write_exec_count"));
+    eng.run(getPrograms().getOrdinals().at("broadcast_matrices"));
     eng.run(getPrograms().getOrdinals().at("write_camera_cell_info"));
     eng.run(getPrograms().getOrdinals().at("RayTraceCS"));
     eng.run(getPrograms().getOrdinals().at("DataExchange"));
+    eng.run(getPrograms().getOrdinals().at("read_finished_rays"));
+
     readAllTiles(eng);
     exec_counter_++;
 }
@@ -166,12 +170,17 @@ void RadiantFoamIpuBuilder::allocateGlobalTensors(poplar::Graph& g) {
     result_u16_read_.buildTensor(g, poplar::UNSIGNED_SHORT, {kNumRayTracerTiles});
     fb_read_all_.buildTensor(g,  poplar::UNSIGNED_CHAR,
                              {kNumRayTracerTiles, kTileFramebufferSize});
+    
+    finishedRaysRead_.buildTensor(g,  poplar::UNSIGNED_CHAR,
+                             {kNumRayTracerTiles* kNumRays*sizeof(FinishedRay)});
 
     // Map linearly for fast access
     poputil::mapTensorLinearlyWithOffset(g, result_f32_read_.get(), 0);
     poputil::mapTensorLinearlyWithOffset(g, result_u16_read_.get(), 0);
     poputil::mapTensorLinearlyWithOffset(g,
         fb_read_all_.get().reshape({kNumRayTracerTiles, kTileFramebufferSize}), 0);
+    poputil::mapTensorLinearlyWithOffset(g,
+        finishedRaysRead_.get().reshape({kNumRayTracerTiles, kNumRays*sizeof(FinishedRay)}), 0);
 
     // View / projection matrices live on tile 0 and are broadcast each frame
     viewMatrix_.buildTensor(g, poplar::FLOAT, {4,4});
@@ -183,11 +192,15 @@ void RadiantFoamIpuBuilder::allocateGlobalTensors(poplar::Graph& g) {
 
     zero_const = g.addConstant(poplar::UNSIGNED_CHAR, {kRayIOBytesPerTile}, 255);
     g.setTileMapping(zero_const, kRaygenTile);
+
+    zero_constf = g.addConstant(poplar::UNSIGNED_CHAR, {kNumRays * sizeof(FinishedRay)}, 255);
+    g.setTileMapping(zero_constf, kRaygenTile);
     // zero_seq = poplar::program::Sequence();
 }
 
 void RadiantFoamIpuBuilder::createRayTraceVertices(poplar::Graph& g, poplar::ComputeSet& cs) {
     const size_t kRayIOBytesPerTile = kNumRays * sizeof(Ray);
+    const size_t kFinishedRayBytesPerTile = kNumRays * sizeof(FinishedRay);
 
     for (size_t tid = 0; tid < kNumRayTracerTiles; ++tid) {
         // H2D tensors --------------------------------------------------------
@@ -237,6 +250,14 @@ void RadiantFoamIpuBuilder::createRayTraceVertices(poplar::Graph& g, poplar::Com
                             .slice({tid,0},{tid+1,kTileFramebufferSize})
                             .reshape({kTileFramebufferSize});
         g.connect(v["framebuffer"], fb_slice);
+
+        auto finished_slice = finishedRaysRead_.get().slice(
+            tid * kFinishedRayBytesPerTile,
+            (tid + 1) * kFinishedRayBytesPerTile
+        );
+        g.setTileMapping(finished_slice, tid);
+        g.connect(v["finishedRays"], finished_slice);
+        zero_seq.add(poplar::program::Copy(zero_constf, finished_slice));
 
         // Constant tile_id param
         auto tile_const = g.addConstant(poplar::UNSIGNED_SHORT, {}, static_cast<unsigned>(tid));
@@ -768,6 +789,9 @@ void RadiantFoamIpuBuilder::setupHostStreams(poplar::Graph& g) {
     getPrograms().add("fb_read_all", fb_read_all_.buildRead(g,true));
     getPrograms().add("read_result_f32", result_f32_read_.buildRead(g,true));
     getPrograms().add("read_result_u16", result_u16_read_.buildRead(g,true));
+
+    finishedRaysHost_.resize(kNumRayTracerTiles * kNumRays * sizeof(FinishedRay));
+    getPrograms().add("read_finished_rays", finishedRaysRead_.buildRead(g,true));
 
     l0routerDebugBytesHost_.resize(kNumL0RouterTiles * kRouterDebugSize);
     getPrograms().add("read_l0_router_debug_bytes", l0routerDebugBytesRead_.buildRead(g,true));

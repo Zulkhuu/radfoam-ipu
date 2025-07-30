@@ -29,6 +29,12 @@ struct Ray {
 };
 static_assert(sizeof(Ray) == 28, "Ray size mismatch");
 
+struct FinishedRay {
+  uint16_t x, y;
+  uint8_t r, g, b, a;
+  float t;
+};
+static_assert(sizeof(FinishedRay) == 12, "Finished Ray size mismatch");
 // ── TOOD: Half-precision structures ───────────────────────────────────────────────
 
 }  // namespace radfoam::geometry

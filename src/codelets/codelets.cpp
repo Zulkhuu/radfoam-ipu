@@ -48,6 +48,7 @@ public:
 
   poplar::Input<poplar::Vector<uint8_t>> raysIn;
   poplar::Output<poplar::Vector<uint8_t>> raysOut;
+  poplar::Output<poplar::Vector<uint8_t>> finishedRays;
 
   poplar::InOut<poplar::Vector<uint8_t>> framebuffer;
   
@@ -75,8 +76,13 @@ public:
     glm::mat4 invProj = glm::inverse(Proj);
     glm::vec3 rayOrigin = glm::vec3(invView[3]);
     
+    auto clampToU8 = [](float v) -> uint8_t {
+      return static_cast<uint8_t>(std::fmax(0.0f, std::fmin(255.0f, std::round(v * 255.0f))));
+    };
+
     int ray_index = 0;
     int out_ray_cntr = 0;
+    int finished_ray_cntr = 0;
     int cell_cntr = 0;
     *result_u16 = 65535;
     for(; ray_index<kNumRays; ray_index++) {
@@ -84,9 +90,9 @@ public:
       if(ray_in1->x == 0xFFFF)
         break;
 
-      if(ray_in1->transmittance < 0.01f) {
-        break;
-      }
+      // if(ray_in1->transmittance < 0.01f) {
+      //   break;
+      // }
       Ray* ray_out = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*out_ray_cntr);
       
       uint16_t local_id = ray_in1->next_local;
@@ -178,22 +184,30 @@ public:
             // nextIdx == -1: ray has left the entire scene, depth = inf
             if(transmittance < 0.01f) {
               *result_u16 = 65533; 
-              *result_float = color.z;
+              *result_float = color.x;
 
+              FinishedRay* finished_ray = reinterpret_cast<FinishedRay*>(finishedRays.data()+sizeof(FinishedRay)*finished_ray_cntr);
+              finished_ray->x = ray_in1->x;
+              finished_ray->y = ray_in1->y;
+              finished_ray->r = clampToU8(color.x);
+              finished_ray->g = clampToU8(color.y);
+              finished_ray->b = clampToU8(color.z);
+              finished_ray->t = t0;
+              finished_ray_cntr++;
               // Find where framebuffer is
-              int tile_x = ray_in1->x / kTileImageWidth;
-              int tile_y = ray_in1->y / kTileImageHeight;
-              int tile_id = tile_y * kNumRayTracerTilesX + tile_x;
+              // int tile_x = ray_in1->x / kTileImageWidth;
+              // int tile_y = ray_in1->y / kTileImageHeight;
+              // int tile_id = tile_y * kNumRayTracerTilesX + tile_x;
 
-              ray_out->next_cluster = tile_id; //nbrPt->cluster_id; 
-              ray_out->next_local = 0xFFFF; 
-              ray_out->transmittance = transmittance; 
-              ray_out->x = ray_in1->x;
-              ray_out->y = ray_in1->y;
-              ray_out->t = t0;
-              ray_out->r = color.x;
-              ray_out->g = color.y;
-              ray_out->b = color.z;
+              // ray_out->next_cluster = tile_id; //nbrPt->cluster_id; 
+              // ray_out->next_local = 0xFFFF; 
+              // ray_out->transmittance = transmittance; 
+              // ray_out->x = ray_in1->x;
+              // ray_out->y = ray_in1->y;
+              // ray_out->t = t0;
+              // ray_out->r = color.x;
+              // ray_out->g = color.y;
+              // ray_out->b = color.z;
             } else {
               if(nextIdx >= nLocalPts) {
                 // nextIdx >= nLocalPts : ray moves to next cluster/tile
@@ -212,22 +226,31 @@ public:
               } else {
                 if(nextIdx == -1) {
                   *result_u16 = 65534; 
-                  *result_float = color.z;
+                  *result_float = color.x;
 
-                  // Find where framebuffer is
-                  int tile_x = ray_in1->x / kTileImageWidth;
-                  int tile_y = ray_in1->y / kTileImageHeight;
-                  int tile_id = tile_y * kNumRayTracerTilesX + tile_x;
+                  FinishedRay* finished_ray = reinterpret_cast<FinishedRay*>(finishedRays.data()+sizeof(FinishedRay)*finished_ray_cntr);
+                  finished_ray->x = ray_in1->x;
+                  finished_ray->y = ray_in1->y;
+                  finished_ray->r = clampToU8(color.x);
+                  finished_ray->g = clampToU8(color.y);
+                  finished_ray->b = clampToU8(color.z);
+                  finished_ray->t = t0;
+                  finished_ray_cntr++;
 
-                  ray_out->next_cluster = tile_id; //nbrPt->cluster_id; 
-                  ray_out->next_local = 0xFFFF; 
-                  ray_out->transmittance = transmittance; 
-                  ray_out->x = ray_in1->x;
-                  ray_out->y = ray_in1->y;
-                  ray_out->t = t0;
-                  ray_out->r = color.x;
-                  ray_out->g = color.y;
-                  ray_out->b = color.z;
+                  // // Find where framebuffer is
+                  // int tile_x = ray_in1->x / kTileImageWidth;
+                  // int tile_y = ray_in1->y / kTileImageHeight;
+                  // int tile_id = tile_y * kNumRayTracerTilesX + tile_x;
+
+                  // ray_out->next_cluster = tile_id; //nbrPt->cluster_id; 
+                  // ray_out->next_local = 0xFFFF; 
+                  // ray_out->transmittance = transmittance; 
+                  // ray_out->x = ray_in1->x;
+                  // ray_out->y = ray_in1->y;
+                  // ray_out->t = t0;
+                  // ray_out->r = color.x;
+                  // ray_out->g = color.y;
+                  // ray_out->b = color.z;
                 }
               }
             }
