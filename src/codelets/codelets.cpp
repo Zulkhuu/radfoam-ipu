@@ -76,13 +76,18 @@ public:
     glm::vec3 rayOrigin = glm::vec3(invView[3]);
     
     int ray_index = 0;
+    int out_ray_cntr = 0;
     int cell_cntr = 0;
     *result_u16 = 65535;
     for(; ray_index<kNumRays; ray_index++) {
       const Ray* ray_in1 = readStructAt<Ray>(raysIn, ray_index); 
       if(ray_in1->x == 0xFFFF)
         break;
-      Ray* ray_out1 = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*ray_index);
+
+      if(ray_in1->transmittance < 0.01f) {
+        break;
+      }
+      Ray* ray_out = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*out_ray_cntr);
       
       uint16_t local_id = ray_in1->next_local;
       uint16_t cluster_id = ray_in1->next_cluster;
@@ -171,31 +176,69 @@ public:
             // finished ray tracing for this one
             // transmittance < 0.01f: too opaque, light cant pass anymore
             // nextIdx == -1: ray has left the entire scene, depth = inf
-            if(nextIdx >= nLocalPts) {
-              // nextIdx >= nLocalPts : ray moves to next cluster/tile
-              const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, nextIdx-nLocalPts);
-              *result_u16 = nbrPt->cluster_id; 
+            if(transmittance < 0.01f) {
+              *result_u16 = 65533; 
               *result_float = color.z;
-              ray_out1->next_cluster = nbrPt->cluster_id; 
-              ray_out1->next_local = nbrPt->local_id; 
-              ray_out1->transmittance = transmittance; 
-              ray_out1->x = ray_in1->x;
-              ray_out1->y = ray_in1->y;
-              ray_out1->t = t0;
-              ray_out1->r = color.x;
-              ray_out1->g = color.y;
-              ray_out1->b = color.z;
+
+              // Find where framebuffer is
+              int tile_x = ray_in1->x / kTileImageWidth;
+              int tile_y = ray_in1->y / kTileImageHeight;
+              int tile_id = tile_y * kNumRayTracerTilesX + tile_x;
+
+              ray_out->next_cluster = tile_id; //nbrPt->cluster_id; 
+              ray_out->next_local = 0xFFFF; 
+              ray_out->transmittance = transmittance; 
+              ray_out->x = ray_in1->x;
+              ray_out->y = ray_in1->y;
+              ray_out->t = t0;
+              ray_out->r = color.x;
+              ray_out->g = color.y;
+              ray_out->b = color.z;
             } else {
-              if(nextIdx == -1)
-                *result_u16 = 65534; 
+              if(nextIdx >= nLocalPts) {
+                // nextIdx >= nLocalPts : ray moves to next cluster/tile
+                const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, nextIdx-nLocalPts);
+                *result_u16 = nbrPt->cluster_id; 
+                *result_float = color.z;
+                ray_out->next_cluster = nbrPt->cluster_id; 
+                ray_out->next_local = nbrPt->local_id; 
+                ray_out->transmittance = transmittance; 
+                ray_out->x = ray_in1->x;
+                ray_out->y = ray_in1->y;
+                ray_out->t = t0;
+                ray_out->r = color.x;
+                ray_out->g = color.y;
+                ray_out->b = color.z;
+              } else {
+                if(nextIdx == -1) {
+                  *result_u16 = 65534; 
+                  *result_float = color.z;
+
+                  // Find where framebuffer is
+                  int tile_x = ray_in1->x / kTileImageWidth;
+                  int tile_y = ray_in1->y / kTileImageHeight;
+                  int tile_id = tile_y * kNumRayTracerTilesX + tile_x;
+
+                  ray_out->next_cluster = tile_id; //nbrPt->cluster_id; 
+                  ray_out->next_local = 0xFFFF; 
+                  ray_out->transmittance = transmittance; 
+                  ray_out->x = ray_in1->x;
+                  ray_out->y = ray_in1->y;
+                  ray_out->t = t0;
+                  ray_out->r = color.x;
+                  ray_out->g = color.y;
+                  ray_out->b = color.z;
+                }
+              }
             }
+            
             break;
           }
 
           current = nextIdx;
           // cntr++;
       }
-
+      out_ray_cntr++;
       // *result_u16 = nNeighborPts; // y;
       // *result_float = rayDir.x;
 
@@ -204,7 +247,7 @@ public:
     }
     framebuffer[0] = cell_cntr & 0xFF;
     
-    for(int i=ray_index; i<kNumRays; i++) {
+    for(int i=out_ray_cntr; i<kNumRays; i++) {
       Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*i);
       if(ray_->x == 0xFFFF)
         break;
@@ -217,41 +260,130 @@ public:
 
 class RayGen : public poplar::Vertex {
 public:
-  poplar::Input<poplar::Vector<uint8_t>> raysIn;
-  poplar::Output<poplar::Vector<uint8_t>> raysOut;
+  poplar::Input<poplar::Vector<uint8_t>> childRaysIn0;
+  poplar::Input<poplar::Vector<uint8_t>> childRaysIn1;
+  poplar::Input<poplar::Vector<uint8_t>> childRaysIn2;
+  poplar::Input<poplar::Vector<uint8_t>> childRaysIn3;
+
+  poplar::Output<poplar::Vector<uint8_t>> childRaysOut0;
+  poplar::Output<poplar::Vector<uint8_t>> childRaysOut1;
+  poplar::Output<poplar::Vector<uint8_t>> childRaysOut2;
+  poplar::Output<poplar::Vector<uint8_t>> childRaysOut3;
+
   poplar::Input<unsigned> exec_count; 
   poplar::Input<poplar::Vector<uint8_t>> camera_cell_info;
 
+  poplar::Output<poplar::Vector<uint8_t>> debugBytes;
+
   bool compute() {
     constexpr int RaySize = sizeof(Ray);  
+    constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
+    const uint16_t childClusterIds[4] = {0, 256, 512, 768};
+    const int lvl = 4;
+    uint8_t shift = lvl * 2;
+    uint16_t inCountC0 = 0, inCountC1 = 0, inCountC2 = 0, inCountC3 = 0;
+    uint16_t outCountC0 = 0, outCountC1 = 0, outCountC2 = 0, outCountC3 = 0;
 
     uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
     uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
+    // Helper: Determine target child
+    auto findChildForCluster = [&](uint16_t clusterId) -> int {
+      for (int i = 0; i < 4; ++i) {
+        if ((clusterId >> 8) == (childClusterIds[i] >> 8))
+          return i;
+      }
+      return -1;
+    };
+
+    // Helper: Route a ray
+    auto routeRay = [&](const Ray* ray) {
+      int targetChild = findChildForCluster(ray->next_cluster);
+      if (targetChild == 0) {
+        if (outCountC0 < kNumRays) {
+          std::memcpy(childRaysOut0.data() + outCountC0 * RaySize, ray, RaySize);
+          outCountC0++;
+        }
+      } else if (targetChild == 1) {
+        if (outCountC1 < kNumRays) {
+          std::memcpy(childRaysOut1.data() + outCountC1 * RaySize, ray, RaySize);
+          outCountC1++;
+        }
+      } else if (targetChild == 2) {
+        if (outCountC2 < kNumRays) {
+          std::memcpy(childRaysOut2.data() + outCountC2 * RaySize, ray, RaySize);
+          outCountC2++;
+        }
+      } else if (targetChild == 3) {
+        if (outCountC3 < kNumRays) {
+          std::memcpy(childRaysOut3.data() + outCountC3 * RaySize, ray, RaySize);
+          outCountC3++;
+        }
+      } 
+    };
+
+    auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) -> uint16_t {
+      uint16_t count = 0;
+      const int numChildRays = childIn.size() / RaySize;
+      for (int i = 0; i < numChildRays; ++i) {
+        const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * RaySize);
+        if (ray->x == INVALID_RAY_ID) break;
+        count++;
+        routeRay(ray);
+      }
+      return count;
+    };
+
     if(exec_count == 1) {
-      int index = 0;
-      Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*index);
+      Ray genRay{};
+      uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
+      uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
-      ray_->x = 14;
-      ray_->y = 300;
-      ray_->r = 0.0;
-      ray_->g = 0.0;
-      ray_->b = 0.0;
-      ray_->t = 0.0;
-      ray_->transmittance = 1.0f;
-      ray_->next_cluster = cluster_id;
-      ray_->next_local = local_id;
+      genRay.x = 14;
+      genRay.y = 328;
+      genRay.r = 0.0f;
+      genRay.g = 0.0f;
+      genRay.b = 0.0f;
+      genRay.t = 0.0f;
+      genRay.transmittance = 1.0f;
+      genRay.next_cluster = cluster_id;
+      genRay.next_local   = local_id;
 
-      for(int i=1; i<kNumRays; i++) {
-        Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*i);
-        ray_->x = 0xFFFF;
+      routeRay(&genRay);
+
+    } 
+
+    // Route each child and capture their input counts
+    inCountC0 = routeChildRays(childRaysIn0);
+    inCountC1 = routeChildRays(childRaysIn1);
+    inCountC2 = routeChildRays(childRaysIn2);
+    inCountC3 = routeChildRays(childRaysIn3);
+
+    auto invalidateRemaining = [&](poplar::Output<poplar::Vector<uint8_t>>& out, uint16_t count) {
+      uint16_t invalidRay = INVALID_RAY_ID;
+      for (uint16_t i = count; i < kNumRays; ++i) {
+        *reinterpret_cast<uint16_t*>(out.data() + i * RaySize) = invalidRay;
       }
-    } else {
-      for(int i=0; i<kNumRays; i++) {
-        Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*i);
-        ray_->x = 0xFFFF;
-      }
-    }
+    };
+
+    invalidateRemaining(childRaysOut0, outCountC0);
+    invalidateRemaining(childRaysOut1, outCountC1);
+    invalidateRemaining(childRaysOut2, outCountC2);
+    invalidateRemaining(childRaysOut3, outCountC3);
+
+    // --- Debug bytes ---
+    uint16_t* dbg = reinterpret_cast<uint16_t*>(debugBytes.data());
+    dbg[0] = *exec_count;
+    dbg[1] = inCountC0;
+    dbg[2] = inCountC1;
+    dbg[3] = inCountC2;
+    dbg[4] = inCountC3;
+    dbg[5] = 0;
+    dbg[6] = outCountC0;
+    dbg[7] = outCountC1;
+    dbg[8] = outCountC2;
+    dbg[9] = outCountC3;
+
     return true;
   }
 };

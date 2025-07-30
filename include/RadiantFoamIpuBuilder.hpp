@@ -113,6 +113,7 @@ private:
     ipu_utils::StreamableTensor l1routerDebugBytesRead_{"l1_router_debug_bytes_read"};
     ipu_utils::StreamableTensor l2routerDebugBytesRead_{"l2_router_debug_bytes_read"};
     ipu_utils::StreamableTensor l3routerDebugBytesRead_{"l3_router_debug_bytes_read"};
+    ipu_utils::StreamableTensor raygenDebugBytesRead_{"raygen_debug_bytes_read"};
 
     // CPU‑side mirrors -------------------------------------------------------
     bool initialised_      = false;
@@ -124,6 +125,7 @@ private:
     std::vector<uint8_t> l1routerDebugBytesHost_;
     std::vector<uint8_t> l2routerDebugBytesHost_;
     std::vector<uint8_t> l3routerDebugBytesHost_;
+    std::vector<uint8_t> raygenDebugBytesHost_;
 
 
     // Helper program sequences ----------------------------------------------

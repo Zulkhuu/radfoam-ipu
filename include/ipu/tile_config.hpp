@@ -27,7 +27,7 @@ constexpr std::size_t kNumL3RouterTiles = 4;  // Total number of L3 router tiles
 constexpr unsigned kRaygenTile = 1470;
 
 // Ray
-constexpr std::size_t kNumRays = 1500;
+constexpr std::size_t kNumRays = 2000;
 
 // -----------------------------------------------------------------------------
 // Tile dimensions (pixels)

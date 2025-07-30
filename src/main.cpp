@@ -211,7 +211,7 @@ int main(int argc, char** argv) {
 		// ProjectionMatrix[2][2] += 1;
 		i++;
 		// if(i==builder.debug_chains_.size()+2) break;
-		if(i==60) break;
+		if(i==100) break;
 		glm::mat4 inverseView = glm::inverse(ViewMatrix);
 		glm::vec3 cameraPos = glm::vec3(inverseView[3]);
 		auto camera_cell = kdtree.getNearestNeighbor(cameraPos);

@@ -59,11 +59,11 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph, const poplar::Target&) {
     poplar::ComputeSet cs = graph.addComputeSet("RayTraceCS");
 
     createRayTraceVertices(graph, cs);
-    createRayGenVertex(graph, cs);
     createRayRoutersLevel0(graph, cs);
     createRayRoutersLevel1(graph, cs);
     createRayRoutersLevel2(graph, cs);
     createRayRoutersLevel3(graph, cs);
+    createRayGenVertex(graph, cs);
     
     createDataExchangePrograms(graph);
     setupHostStreams(graph);
@@ -104,6 +104,8 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
         l2routerDebugBytesRead_.connectReadStream(eng, l2routerDebugBytesHost_.data());
         l3routerDebugBytesHost_.resize(kNumL3RouterTiles * kRouterDebugSize);
         l3routerDebugBytesRead_.connectReadStream(eng, l3routerDebugBytesHost_.data());
+        raygenDebugBytesHost_.resize(kRouterDebugSize);
+        raygenDebugBytesRead_.connectReadStream(eng, raygenDebugBytesHost_.data());
         viewMatrix_.connectWriteStream(eng, hostViewMatrix_.data());
         projMatrix_.connectWriteStream(eng, hostProjMatrix_.data());
         execCountT_.connectWriteStream(eng, &exec_counter_);
@@ -261,14 +263,32 @@ void RadiantFoamIpuBuilder::createRayTraceVertices(poplar::Graph& g, poplar::Com
 
 void RadiantFoamIpuBuilder::createRayGenVertex(poplar::Graph& g, poplar::ComputeSet& cs) {
     const size_t kRayIOBytesPerTile = kNumRays * sizeof(Ray);
-    raygenInput  = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile}, "raygen_in");
-    raygenOutput = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile}, "raygen_out");
+    raygenInput  = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile*4}, "raygen_in");
+    raygenOutput = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile*4}, "raygen_out");
     g.setTileMapping(raygenInput,  kRaygenTile);
     g.setTileMapping(raygenOutput, kRaygenTile);
 
     auto v = g.addVertex(cs, "RayGen");
-    g.connect(v["raysIn" ], raygenInput);
-    g.connect(v["raysOut"], raygenOutput);
+    auto sliceIn = [&](int idx) {
+        return raygenInput.slice(idx * kRayIOBytesPerTile, (idx + 1) * kRayIOBytesPerTile);
+    };
+    auto sliceOut = [&](int idx) {
+        return raygenOutput.slice(idx * kRayIOBytesPerTile, (idx + 1) * kRayIOBytesPerTile);
+    };
+    
+    for (int i = 0; i < 4; ++i) {
+        // Input slice (L3 routers → RayGen)
+        auto inSlice = sliceIn(i);
+        g.connect(v[fmt::format("childRaysIn{}", i)], inSlice);
+
+        // Output slice (RayGen → L3 routers)
+        auto outSlice = sliceOut(i);
+        g.connect(v[fmt::format("childRaysOut{}", i)], outSlice);
+
+        // Zero-sequence initialization (invalidate buffers)
+        zero_seq.add(poplar::program::Copy(zero_const, inSlice));
+        zero_seq.add(poplar::program::Copy(zero_const, outSlice));
+    }
 
     execCountT_.buildTensor(g, poplar::UNSIGNED_INT, {});
     g.setTileMapping(execCountT_.get(),   kRaygenTile);
@@ -278,8 +298,14 @@ void RadiantFoamIpuBuilder::createRayGenVertex(poplar::Graph& g, poplar::Compute
     g.setTileMapping(cameraCellInfo_.get(),kRaygenTile);
     getPrograms().add("write_camera_cell_info", cameraCellInfo_.buildWrite(g,true));
     
+    
     g.connect(v["exec_count"], execCountT_.get());
     g.connect(v["camera_cell_info"], cameraCellInfo_.get());
+
+    raygenDebugBytesRead_.buildTensor(g, poplar::UNSIGNED_CHAR, {kRouterDebugSize});
+    g.setTileMapping(raygenDebugBytesRead_.get(), kRaygenTile);
+    g.connect(v["debugBytes"], raygenDebugBytesRead_.get());
+
     g.setTileMapping(v, kRaygenTile);
 }
 
@@ -708,12 +734,28 @@ void RadiantFoamIpuBuilder::createDataExchangePrograms(poplar::Graph& g) {
             seq.add(poplar::program::Copy(l3ChildOut(c), l2ParentIn));
         }
     }
-    // Special: RayGen output into router 130 parent input (proof‑of‑concept)
-    {
-        const size_t l3_base = 2 * kRouterPerTileBuffer; 
-        auto parentIn = L3RouterIn.slice(l3_base, l3_base + kRayIOBytesPerTile);
-        seq.add(poplar::program::Copy(raygenOutput, parentIn));
+    // -------------------------------
+    // L3 <-> RayGen (acts as L4 router)
+    // -------------------------------
+
+    auto rayGenChildOut = [&](int i) {
+        return raygenOutput.slice(i * kRayIOBytesPerTile, (i + 1) * kRayIOBytesPerTile);};
+
+    auto rayGenChildIn = [&](int i) {
+        return raygenInput.slice(i * kRayIOBytesPerTile, (i + 1) * kRayIOBytesPerTile);};
+
+    for (uint16_t l3_id = 0; l3_id < kNumL3RouterTiles; ++l3_id) {
+        // Connect RayGen outputs → L3 parent inputs
+        const size_t l3_base = l3_id * kRouterPerTileBuffer;
+
+        auto l3ParentIn = L3RouterIn.slice(l3_base, l3_base + kRayIOBytesPerTile);
+        seq.add(poplar::program::Copy(rayGenChildOut(l3_id), l3ParentIn));
+
+        // Connect L3 parent outputs → RayGen inputs
+        auto l3ParentOut = L3RouterOut.slice(l3_base, l3_base + kRayIOBytesPerTile);
+        seq.add(poplar::program::Copy(l3ParentOut, rayGenChildIn(l3_id)));
     }
+
     getPrograms().add("DataExchange", seq);
 }
 
@@ -735,6 +777,8 @@ void RadiantFoamIpuBuilder::setupHostStreams(poplar::Graph& g) {
     getPrograms().add("read_l2_router_debug_bytes", l2routerDebugBytesRead_.buildRead(g,true));
     l3routerDebugBytesHost_.resize(kNumL3RouterTiles * kRouterDebugSize);
     getPrograms().add("read_l3_router_debug_bytes", l3routerDebugBytesRead_.buildRead(g,true));
+    raygenDebugBytesHost_.resize(kRouterDebugSize);
+    getPrograms().add("read_raygen_router_debug_bytes", raygenDebugBytesRead_.buildRead(g,true));
 }
 
 
@@ -749,6 +793,7 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
     eng.run(getPrograms().getOrdinals().at("read_l1_router_debug_bytes"));
     eng.run(getPrograms().getOrdinals().at("read_l2_router_debug_bytes"));
     eng.run(getPrograms().getOrdinals().at("read_l3_router_debug_bytes"));
+    eng.run(getPrograms().getOrdinals().at("read_raygen_router_debug_bytes"));
 
     RF_LOG("================ Frame {} =================================================", exec_counter_);
     int overall_cntr = 0;
@@ -767,9 +812,9 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
         }
     }
     {
-        auto targetrouters = {2};
+        auto targetrouters = {2, 3};
         for(const auto& targetRouter : targetrouters) {
-            fmt::print("L3 router {}:", targetRouter);
+            fmt::print("L3 router {:4}:", targetRouter);
 
             const uint8_t* base = &l3routerDebugBytesHost_[targetRouter * kRouterDebugSize];
 
@@ -784,9 +829,9 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
         }
     }
     {
-        auto targetrouters = {8};
+        auto targetrouters = {8, 11, 13};
         for(const auto& targetRouter : targetrouters) {
-            fmt::print("L2 router {}:", targetRouter);
+            fmt::print("L2 router {:4}:", targetRouter);
 
             const uint8_t* base = &l2routerDebugBytesHost_[targetRouter * kRouterDebugSize];
 
@@ -801,9 +846,9 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
         }
     }
     {
-        auto targetrouters = {32};
+        auto targetrouters = {32, 33, 45, 53};
         for(const auto& targetRouter : targetrouters) {
-            fmt::print("L1 router {}:", targetRouter);
+            fmt::print("L1 router {:4}:", targetRouter);
 
             const uint8_t* base = &l1routerDebugBytesHost_[targetRouter * kRouterDebugSize];
 
@@ -818,9 +863,9 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
         }
     }
     {
-        auto targetrouters = {130, 131, 134, 176, 177};
+        auto targetrouters = {130, 131, 134, 176, 177, 182, 214};
         for(const auto& targetRouter : targetrouters) {
-            fmt::print("L0 router {}:", targetRouter);
+            fmt::print("L0 router {:4}:", targetRouter);
 
             const uint8_t* base = &l0routerDebugBytesHost_[targetRouter * kRouterDebugSize];
 
