@@ -77,6 +77,8 @@ private:
     void createRayGenVertex(poplar::Graph& g, poplar::ComputeSet& cs);
     void createRayRoutersLevel0(poplar::Graph& g, poplar::ComputeSet& cs);
     void createRayRoutersLevel1(poplar::Graph& g, poplar::ComputeSet& cs);
+    void createRayRoutersLevel2(poplar::Graph& g, poplar::ComputeSet& cs);
+    void createRayRoutersLevel3(poplar::Graph& g, poplar::ComputeSet& cs);
     void createDataExchangePrograms(poplar::Graph& g);
     void setupHostStreams(poplar::Graph& g);
     void readAllTiles(poplar::Engine& engine);
@@ -109,6 +111,8 @@ private:
     ipu_utils::StreamableTensor cameraCellInfo_{"camera_cell_info"};
     ipu_utils::StreamableTensor l0routerDebugBytesRead_{"l0_router_debug_bytes_read"};
     ipu_utils::StreamableTensor l1routerDebugBytesRead_{"l1_router_debug_bytes_read"};
+    ipu_utils::StreamableTensor l2routerDebugBytesRead_{"l2_router_debug_bytes_read"};
+    ipu_utils::StreamableTensor l3routerDebugBytesRead_{"l3_router_debug_bytes_read"};
 
     // CPU‑side mirrors -------------------------------------------------------
     bool initialised_      = false;
@@ -118,6 +122,9 @@ private:
     std::array<uint8_t, 4> hostCameraCellInfo_{{0,0,0,0}};
     std::vector<uint8_t> l0routerDebugBytesHost_;
     std::vector<uint8_t> l1routerDebugBytesHost_;
+    std::vector<uint8_t> l2routerDebugBytesHost_;
+    std::vector<uint8_t> l3routerDebugBytesHost_;
+
 
     // Helper program sequences ----------------------------------------------
     poplar::program::Sequence per_tile_writes_;
@@ -132,6 +139,10 @@ private:
     poplar::Tensor L0RouterIn; 
     poplar::Tensor L1RouterOut;
     poplar::Tensor L1RouterIn; 
+    poplar::Tensor L2RouterOut;
+    poplar::Tensor L2RouterIn; 
+    poplar::Tensor L3RouterOut;
+    poplar::Tensor L3RouterIn; 
     poplar::Tensor raygenOutput;
     poplar::Tensor raygenInput;
     poplar::Tensor zero_const;

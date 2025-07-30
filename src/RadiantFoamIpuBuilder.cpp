@@ -62,6 +62,8 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph, const poplar::Target&) {
     createRayGenVertex(graph, cs);
     createRayRoutersLevel0(graph, cs);
     createRayRoutersLevel1(graph, cs);
+    createRayRoutersLevel2(graph, cs);
+    createRayRoutersLevel3(graph, cs);
     
     createDataExchangePrograms(graph);
     setupHostStreams(graph);
@@ -98,6 +100,10 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
         l0routerDebugBytesRead_.connectReadStream(eng, l0routerDebugBytesHost_.data());
         l1routerDebugBytesHost_.resize(kNumL1RouterTiles * kRouterDebugSize);
         l1routerDebugBytesRead_.connectReadStream(eng, l1routerDebugBytesHost_.data());
+        l2routerDebugBytesHost_.resize(kNumL2RouterTiles * kRouterDebugSize);
+        l2routerDebugBytesRead_.connectReadStream(eng, l2routerDebugBytesHost_.data());
+        l3routerDebugBytesHost_.resize(kNumL3RouterTiles * kRouterDebugSize);
+        l3routerDebugBytesRead_.connectReadStream(eng, l3routerDebugBytesHost_.data());
         viewMatrix_.connectWriteStream(eng, hostViewMatrix_.data());
         projMatrix_.connectWriteStream(eng, hostProjMatrix_.data());
         execCountT_.connectWriteStream(eng, &exec_counter_);
@@ -428,6 +434,169 @@ void RadiantFoamIpuBuilder::createRayRoutersLevel1(poplar::Graph& g, poplar::Com
     }
 }
 
+void RadiantFoamIpuBuilder::createRayRoutersLevel2(poplar::Graph& g, poplar::ComputeSet& cs) {
+    constexpr uint16_t router_tile_offset =
+        kNumRayTracerTiles + kNumL0RouterTiles + kNumL1RouterTiles;
+    constexpr size_t kChildrenPerRouter = 4;
+    constexpr size_t kRayIOBytesPerTile = kNumRays * sizeof(Ray);
+
+    const size_t kRouterPerTileBuffer = kRayIOBytesPerTile * 5; // parent + 4 children
+    const size_t kTotalBuffer = kRouterPerTileBuffer * kNumL2RouterTiles;
+
+    // Allocate IO tensors
+    L2RouterOut = g.addVariable(poplar::UNSIGNED_CHAR, {kTotalBuffer}, "l2_router_out");
+    L2RouterIn  = g.addVariable(poplar::UNSIGNED_CHAR, {kTotalBuffer}, "l2_router_in");
+
+    // Debug bytes
+    l2routerDebugBytesRead_.buildTensor(g, poplar::UNSIGNED_CHAR, {kNumL2RouterTiles, kRouterDebugSize});
+    poputil::mapTensorLinearlyWithOffset(g,
+        l2routerDebugBytesRead_.get().reshape({kNumL2RouterTiles, kRouterDebugSize}),
+        router_tile_offset
+    );
+
+    // Child cluster IDs: spacing by 64 (since L2 handles 64 clusters)
+    std::vector<uint16_t> clusterIds;
+    clusterIds.reserve(kNumL2RouterTiles * kChildrenPerRouter);
+    for (size_t r = 0; r < kNumL2RouterTiles; ++r) {
+        for (size_t i = 0; i < kChildrenPerRouter; ++i) {
+            clusterIds.push_back(static_cast<uint16_t>((r * 64) + i * 16));
+        }
+    }
+
+    for (size_t router_id = 0; router_id < kNumL2RouterTiles; ++router_id) {
+        const uint16_t tile = router_tile_offset + router_id;
+        auto v = g.addVertex(cs, "RayRouter");
+
+        const size_t base = router_id * kRouterPerTileBuffer;
+        auto sliceIn  = [&](size_t idx){
+            return L2RouterIn.slice (base+idx*kRayIOBytesPerTile, base+(idx+1)*kRayIOBytesPerTile);};
+        auto sliceOut = [&](size_t idx){
+            return L2RouterOut.slice(base+idx*kRayIOBytesPerTile, base+(idx+1)*kRayIOBytesPerTile);};
+
+        // Parent IO
+        auto parentIn  = sliceIn(0);
+        auto parentOut = sliceOut(0);
+        g.setTileMapping(parentIn, tile);
+        g.setTileMapping(parentOut, tile);
+        g.connect(v["parentRaysIn"], parentIn);
+        g.connect(v["parentRaysOut"], parentOut);
+        zero_seq.add(poplar::program::Copy(zero_const, parentIn));
+        zero_seq.add(poplar::program::Copy(zero_const, parentOut));
+
+        // Child IO
+        for (int i = 0; i < 4; ++i) {
+            auto in  = sliceIn(i+1);
+            auto out = sliceOut(i+1);
+            g.setTileMapping(in, tile);
+            g.setTileMapping(out, tile);
+            g.connect(v[fmt::format("childRaysIn{}", i)], in);
+            g.connect(v[fmt::format("childRaysOut{}", i)], out);
+            zero_seq.add(poplar::program::Copy(zero_const, in));
+            zero_seq.add(poplar::program::Copy(zero_const, out));
+        }
+
+        // Child cluster IDs
+        poplar::Tensor idsConst = g.addConstant(poplar::UNSIGNED_SHORT, {4},
+            clusterIds.data() + router_id * 4);
+        g.setTileMapping(idsConst, tile);
+        g.connect(v["childClusterIds"], idsConst);
+
+        // Level constant = 2
+        auto levelConst = g.addConstant(poplar::UNSIGNED_CHAR, {}, 2);
+        g.setTileMapping(levelConst, tile);
+        g.connect(v["level"], levelConst);
+
+        auto dbgSlice = l2routerDebugBytesRead_.get()
+                         .slice({router_id,0},{router_id+1,kRouterDebugSize})
+                         .reshape({kRouterDebugSize});
+        g.connect(v["debugBytes"], dbgSlice);
+
+        g.setTileMapping(v, tile);
+    }
+}
+
+void RadiantFoamIpuBuilder::createRayRoutersLevel3(poplar::Graph& g, poplar::ComputeSet& cs) {
+    constexpr uint16_t L3RouterTileOffset =
+        kNumRayTracerTiles + kNumL0RouterTiles + kNumL1RouterTiles + kNumL2RouterTiles;
+    constexpr size_t kChildrenPerRouter = 4;
+    constexpr size_t kRayIOBytesPerTile = kNumRays * sizeof(Ray);
+
+    const size_t kRouterPerTileBuffer = kRayIOBytesPerTile * 5; // parent + 4 children
+    const size_t kTotalBuffer = kRouterPerTileBuffer * kNumL3RouterTiles;
+
+    L3RouterOut = g.addVariable(poplar::UNSIGNED_CHAR, {kTotalBuffer}, "l3_router_out");
+    L3RouterIn  = g.addVariable(poplar::UNSIGNED_CHAR, {kTotalBuffer}, "l3_router_in");
+
+    l3routerDebugBytesRead_.buildTensor(g, poplar::UNSIGNED_CHAR, {kNumL3RouterTiles, kRouterDebugSize});
+    poputil::mapTensorLinearlyWithOffset(
+        g,
+        l3routerDebugBytesRead_.get().reshape({kNumL3RouterTiles, kRouterDebugSize}),
+        L3RouterTileOffset
+    );
+
+    // Generate cluster IDs (increment by 64 per L3 router, as each step quadruples)
+    std::vector<uint16_t> clusterIds;
+    clusterIds.reserve(kNumL3RouterTiles * kChildrenPerRouter);
+    for (size_t r = 0; r < kNumL3RouterTiles; ++r) {
+        for (size_t i = 0; i < kChildrenPerRouter; ++i) {
+            clusterIds.push_back(static_cast<uint16_t>((r * 256) + i * 64));
+        }
+    }
+
+    for (size_t router_id = 0; router_id < kNumL3RouterTiles; ++router_id) {
+        const uint16_t tile = L3RouterTileOffset + router_id;
+        auto v = g.addVertex(cs, "RayRouter");
+
+        // IO buffer slicing
+        const size_t base = router_id * kRouterPerTileBuffer;
+        auto sliceIn  = [&](size_t idx){ 
+            return L3RouterIn.slice(base + idx*kRayIOBytesPerTile, base + (idx+1)*kRayIOBytesPerTile); };
+        auto sliceOut = [&](size_t idx){ 
+            return L3RouterOut.slice(base + idx*kRayIOBytesPerTile, base + (idx+1)*kRayIOBytesPerTile); };
+
+        // Parent IO
+        auto parentIn = sliceIn(0);
+        auto parentOut = sliceOut(0);
+        g.setTileMapping(parentIn, tile);
+        g.setTileMapping(parentOut, tile);
+        g.connect(v["parentRaysIn"], parentIn);
+        g.connect(v["parentRaysOut"], parentOut);
+        zero_seq.add(poplar::program::Copy(zero_const, parentIn));
+        zero_seq.add(poplar::program::Copy(zero_const, parentOut));
+
+        // Child IO
+        for (int i = 0; i < 4; ++i) {
+            auto in = sliceIn(i+1);
+            auto out = sliceOut(i+1);
+            g.setTileMapping(in, tile);
+            g.setTileMapping(out, tile);
+            g.connect(v[fmt::format("childRaysIn{}", i)], in);
+            g.connect(v[fmt::format("childRaysOut{}", i)], out);
+            zero_seq.add(poplar::program::Copy(zero_const, in));
+            zero_seq.add(poplar::program::Copy(zero_const, out));
+        }
+
+        // Child cluster IDs
+        poplar::Tensor idsConst = g.addConstant(poplar::UNSIGNED_SHORT, {4},
+            clusterIds.data() + router_id * 4);
+        g.setTileMapping(idsConst, tile);
+        g.connect(v["childClusterIds"], idsConst);
+
+        // Level constant = 3
+        auto levelConst = g.addConstant(poplar::UNSIGNED_CHAR, {}, 3);
+        g.setTileMapping(levelConst, tile);
+        g.connect(v["level"], levelConst);
+
+        // Debug slice
+        auto dbgSlice = l3routerDebugBytesRead_.get()
+            .slice({router_id, 0}, {router_id+1, kRouterDebugSize})
+            .reshape({kRouterDebugSize});
+        g.connect(v["debugBytes"], dbgSlice);
+
+        g.setTileMapping(v, tile);
+    }
+}
+
 void RadiantFoamIpuBuilder::createDataExchangePrograms(poplar::Graph& g) {
     constexpr uint16_t router_tile_offset = 1024;
     constexpr size_t   kChildrenPerRouter = 4;
@@ -457,39 +626,93 @@ void RadiantFoamIpuBuilder::createDataExchangePrograms(poplar::Graph& g) {
             seq.add(poplar::program::Copy(rtOut, childIn(c)));
         }
 
-        // -------------------------------
-        // L0 <-> L1 (new logic)
-        // -------------------------------
-        for (uint16_t l1_id = 0; l1_id < kNumL1RouterTiles; ++l1_id) {
-            // Each L1 router handles 4 L0 routers
-            uint16_t firstL0 = l1_id * 4; // starting L0 router index for this L1
+    }
+    // -------------------------------
+    // L0 <-> L1
+    // -------------------------------
+    for (uint16_t l1_id = 0; l1_id < kNumL1RouterTiles; ++l1_id) {
+        // Each L1 router handles 4 L0 routers
+        uint16_t firstL0 = l1_id * 4; // starting L0 router index for this L1
 
-            // Slices for L1 parent IO
+        // Slices for L1 parent IO
+        const size_t l1_base = l1_id * kRouterPerTileBuffer;
+        auto l1ChildIn  = [&](int i){return L1RouterIn.slice (l1_base+(i+1)*kRayIOBytesPerTile,
+                                                            l1_base+(i+2)*kRayIOBytesPerTile);};
+        auto l1ChildOut = [&](int i){return L1RouterOut.slice(l1_base+(i+1)*kRayIOBytesPerTile,
+                                                            l1_base+(i+2)*kRayIOBytesPerTile);};
+
+        for (int c = 0; c < 4; ++c) {
+            uint16_t l0_id = firstL0 + c;
+            const size_t l0_base = l0_id * kRouterPerTileBuffer;
+
+            // L0 parentOut → L1 childIn
+            auto l0ParentOut = L0RouterOut.slice(l0_base, l0_base + kRayIOBytesPerTile);
+            seq.add(poplar::program::Copy(l0ParentOut, l1ChildIn(c)));
+
+            // L1 childOut → L0 parentIn
+            auto l0ParentIn = L0RouterIn.slice(l0_base, l0_base + kRayIOBytesPerTile);
+            seq.add(poplar::program::Copy(l1ChildOut(c), l0ParentIn));
+        }
+    }
+    // -------------------------------
+    // L1 <-> L2 
+    // -------------------------------
+    for (uint16_t l2_id = 0; l2_id < kNumL2RouterTiles; ++l2_id) {
+        uint16_t firstL1 = l2_id * 4; // Each L2 manages 4 L1 routers
+
+        // Base index for this L2 router buffers
+        const size_t l2_base = l2_id * kRouterPerTileBuffer;
+
+        auto l2ChildIn  = [&](int i){
+            return L2RouterIn.slice(l2_base+(i+1)*kRayIOBytesPerTile,
+                                    l2_base+(i+2)*kRayIOBytesPerTile);
+        };
+        auto l2ChildOut = [&](int i){
+            return L2RouterOut.slice(l2_base+(i+1)*kRayIOBytesPerTile,
+                                    l2_base+(i+2)*kRayIOBytesPerTile);
+        };
+
+        for (int c = 0; c < 4; ++c) {
+            uint16_t l1_id = firstL1 + c;
             const size_t l1_base = l1_id * kRouterPerTileBuffer;
-            auto l1ChildIn  = [&](int i){return L1RouterIn.slice (l1_base+(i+1)*kRayIOBytesPerTile,
-                                                                l1_base+(i+2)*kRayIOBytesPerTile);};
-            auto l1ChildOut = [&](int i){return L1RouterOut.slice(l1_base+(i+1)*kRayIOBytesPerTile,
-                                                                l1_base+(i+2)*kRayIOBytesPerTile);};
 
-            for (int c = 0; c < 4; ++c) {
-                uint16_t l0_id = firstL0 + c;
-                const size_t l0_base = l0_id * kRouterPerTileBuffer;
+            // L1 parentOut → L2 childIn
+            auto l1ParentOut = L1RouterOut.slice(l1_base, l1_base + kRayIOBytesPerTile);
+            seq.add(poplar::program::Copy(l1ParentOut, l2ChildIn(c)));
 
-                // L0 parentOut → L1 childIn
-                auto l0ParentOut = L0RouterOut.slice(l0_base, l0_base + kRayIOBytesPerTile);
-                seq.add(poplar::program::Copy(l0ParentOut, l1ChildIn(c)));
-
-                // L1 childOut → L0 parentIn
-                auto l0ParentIn = L0RouterIn.slice(l0_base, l0_base + kRayIOBytesPerTile);
-                seq.add(poplar::program::Copy(l1ChildOut(c), l0ParentIn));
-            }
+            // L2 childOut → L1 parentIn
+            auto l1ParentIn = L1RouterIn.slice(l1_base, l1_base + kRayIOBytesPerTile);
+            seq.add(poplar::program::Copy(l2ChildOut(c), l1ParentIn));
         }
+    }
+    // L2 <-> L3 exchange
+    for (uint16_t l3_id = 0; l3_id < kNumL3RouterTiles; ++l3_id) {
+        uint16_t firstL2 = l3_id * 4;
+        const size_t l3_base = l3_id * kRouterPerTileBuffer;
 
-        // Special: RayGen output into router 130 parent input (proof‑of‑concept)
-        if (routerId == 32) {
-            auto parentIn  = L1RouterIn.slice(base, base + kRayIOBytesPerTile);
-            seq.add(poplar::program::Copy(raygenOutput, parentIn));
+        auto l3ChildIn = [&](int i){ return L3RouterIn.slice(l3_base + (i+1)*kRayIOBytesPerTile,
+                                                            l3_base + (i+2)*kRayIOBytesPerTile); };
+        auto l3ChildOut = [&](int i){ return L3RouterOut.slice(l3_base + (i+1)*kRayIOBytesPerTile,
+                                                            l3_base + (i+2)*kRayIOBytesPerTile); };
+
+        for (int c = 0; c < 4; ++c) {
+            uint16_t l2_id = firstL2 + c;
+            const size_t l2_base = l2_id * kRouterPerTileBuffer;
+
+            // L2 parentOut → L3 childIn
+            auto l2ParentOut = L2RouterOut.slice(l2_base, l2_base + kRayIOBytesPerTile);
+            seq.add(poplar::program::Copy(l2ParentOut, l3ChildIn(c)));
+
+            // L3 childOut → L2 parentIn
+            auto l2ParentIn = L2RouterIn.slice(l2_base, l2_base + kRayIOBytesPerTile);
+            seq.add(poplar::program::Copy(l3ChildOut(c), l2ParentIn));
         }
+    }
+    // Special: RayGen output into router 130 parent input (proof‑of‑concept)
+    {
+        const size_t l3_base = 2 * kRouterPerTileBuffer; 
+        auto parentIn = L3RouterIn.slice(l3_base, l3_base + kRayIOBytesPerTile);
+        seq.add(poplar::program::Copy(raygenOutput, parentIn));
     }
     getPrograms().add("DataExchange", seq);
 }
@@ -508,6 +731,10 @@ void RadiantFoamIpuBuilder::setupHostStreams(poplar::Graph& g) {
     getPrograms().add("read_l0_router_debug_bytes", l0routerDebugBytesRead_.buildRead(g,true));
     l1routerDebugBytesHost_.resize(kNumL1RouterTiles * kRouterDebugSize);
     getPrograms().add("read_l1_router_debug_bytes", l1routerDebugBytesRead_.buildRead(g,true));
+    l2routerDebugBytesHost_.resize(kNumL2RouterTiles * kRouterDebugSize);
+    getPrograms().add("read_l2_router_debug_bytes", l2routerDebugBytesRead_.buildRead(g,true));
+    l3routerDebugBytesHost_.resize(kNumL3RouterTiles * kRouterDebugSize);
+    getPrograms().add("read_l3_router_debug_bytes", l3routerDebugBytesRead_.buildRead(g,true));
 }
 
 
@@ -520,6 +747,8 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
     eng.run(getPrograms().getOrdinals().at("read_result_u16"));
     eng.run(getPrograms().getOrdinals().at("read_l0_router_debug_bytes"));
     eng.run(getPrograms().getOrdinals().at("read_l1_router_debug_bytes"));
+    eng.run(getPrograms().getOrdinals().at("read_l2_router_debug_bytes"));
+    eng.run(getPrograms().getOrdinals().at("read_l3_router_debug_bytes"));
 
     RF_LOG("================ Frame {} =================================================", exec_counter_);
     int overall_cntr = 0;
@@ -538,22 +767,58 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
         }
     }
     {
-        const int targetRouter = 32;
-            fmt::print("L1 router {}:", targetRouter);
+        auto targetrouters = {2};
+        for(const auto& targetRouter : targetrouters) {
+            fmt::print("L3 router {}:", targetRouter);
 
-        const uint8_t* base = &l1routerDebugBytesHost_[targetRouter * kRouterDebugSize];
+            const uint8_t* base = &l3routerDebugBytesHost_[targetRouter * kRouterDebugSize];
 
-        for (size_t i = 0; i < kRouterDebugSize; i += 2) {
-            uint16_t val = static_cast<uint16_t>(base[i]) |
-                        (static_cast<uint16_t>(base[i + 1]) << 8);
+            for (size_t i = 0; i < kRouterDebugSize; i += 2) {
+                uint16_t val = static_cast<uint16_t>(base[i]) |
+                            (static_cast<uint16_t>(base[i + 1]) << 8);
 
-            fmt::print("{:5} ", val);
-            if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
+                fmt::print("{:5} ", val);
+                if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
+            }
+            fmt::print("\n");
         }
-        fmt::print("\n");
     }
     {
-        auto targetrouters = {130, 131};
+        auto targetrouters = {8};
+        for(const auto& targetRouter : targetrouters) {
+            fmt::print("L2 router {}:", targetRouter);
+
+            const uint8_t* base = &l2routerDebugBytesHost_[targetRouter * kRouterDebugSize];
+
+            for (size_t i = 0; i < kRouterDebugSize; i += 2) {
+                uint16_t val = static_cast<uint16_t>(base[i]) |
+                            (static_cast<uint16_t>(base[i + 1]) << 8);
+
+                fmt::print("{:5} ", val);
+                if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
+            }
+            fmt::print("\n");
+        }
+    }
+    {
+        auto targetrouters = {32};
+        for(const auto& targetRouter : targetrouters) {
+            fmt::print("L1 router {}:", targetRouter);
+
+            const uint8_t* base = &l1routerDebugBytesHost_[targetRouter * kRouterDebugSize];
+
+            for (size_t i = 0; i < kRouterDebugSize; i += 2) {
+                uint16_t val = static_cast<uint16_t>(base[i]) |
+                            (static_cast<uint16_t>(base[i + 1]) << 8);
+
+                fmt::print("{:5} ", val);
+                if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
+            }
+            fmt::print("\n");
+        }
+    }
+    {
+        auto targetrouters = {130, 131, 134, 176, 177};
         for(const auto& targetRouter : targetrouters) {
             fmt::print("L0 router {}:", targetRouter);
 
