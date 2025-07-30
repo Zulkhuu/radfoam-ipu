@@ -76,6 +76,7 @@ private:
     void createRayTraceVertices(poplar::Graph& g, poplar::ComputeSet& cs);
     void createRayGenVertex(poplar::Graph& g, poplar::ComputeSet& cs);
     void createRayRoutersLevel0(poplar::Graph& g, poplar::ComputeSet& cs);
+    void createRayRoutersLevel1(poplar::Graph& g, poplar::ComputeSet& cs);
     void createDataExchangePrograms(poplar::Graph& g);
     void setupHostStreams(poplar::Graph& g);
     void readAllTiles(poplar::Engine& engine);
@@ -106,7 +107,8 @@ private:
     ipu_utils::StreamableTensor viewMatrix_{"view_matrix"};
     ipu_utils::StreamableTensor projMatrix_{"proj_matrix"};
     ipu_utils::StreamableTensor cameraCellInfo_{"camera_cell_info"};
-    ipu_utils::StreamableTensor l0routerDebugBytesRead_{"router_debug_bytes_read"};
+    ipu_utils::StreamableTensor l0routerDebugBytesRead_{"l0_router_debug_bytes_read"};
+    ipu_utils::StreamableTensor l1routerDebugBytesRead_{"l1_router_debug_bytes_read"};
 
     // CPU‑side mirrors -------------------------------------------------------
     bool initialised_      = false;
@@ -115,19 +117,24 @@ private:
     std::vector<float> hostProjMatrix_;
     std::array<uint8_t, 4> hostCameraCellInfo_{{0,0,0,0}};
     std::vector<uint8_t> l0routerDebugBytesHost_;
+    std::vector<uint8_t> l1routerDebugBytesHost_;
 
     // Helper program sequences ----------------------------------------------
     poplar::program::Sequence per_tile_writes_;
     poplar::program::Sequence broadcastMatrices_;
+    poplar::program::Sequence zero_seq;
 
     // Router bookkeeping -----------------------------------------------------
     static constexpr uint16_t kRouterDebugSize = 24;
-    std::vector<uint16_t> allClusterIds_;
+    // std::vector<uint16_t> allClusterIds_;
 
     poplar::Tensor L0RouterOut;
     poplar::Tensor L0RouterIn; 
+    poplar::Tensor L1RouterOut;
+    poplar::Tensor L1RouterIn; 
     poplar::Tensor raygenOutput;
     poplar::Tensor raygenInput;
+    poplar::Tensor zero_const;
 };
 
 } // namespace ipu

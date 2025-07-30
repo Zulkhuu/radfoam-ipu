@@ -59,7 +59,7 @@ public:
     constexpr int RaySize = sizeof(Ray);
     constexpr int LocalPointSize = sizeof(LocalPoint);
     constexpr int GenericPointSize = sizeof(GenericPoint); 
-    glm::mat4 invView2 = glm::inverse(View2);
+    // glm::mat4 invView2 = glm::inverse(View2);
     // glm::mat4 invProj2 = glm::inverse(Proj2);
     // glm::vec3 rayOrigin = glm::vec3(invView2[3]);
     const uint16_t nLocalPts = local_pts.size() / LocalPointSize;
@@ -74,146 +74,142 @@ public:
     glm::mat4 invView = glm::inverse(View);
     glm::mat4 invProj = glm::inverse(Proj);
     glm::vec3 rayOrigin = glm::vec3(invView[3]);
-
-    int index = 0;
-    const Ray* ray_in1 = readStructAt<Ray>(raysIn, index); 
-    Ray* ray_out1 = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*index);
     
-    uint16_t local_id = ray_in1->next_local;
-    uint16_t cluster_id = ray_in1->next_cluster;
-    
-    const uint16_t& x = ray_in1->x;
-    const uint16_t& y = ray_in1->y;
-
-    float ndcX = (2.0f * x) / kFullImageWidth - 1.0f;
-    float ndcY = 1.0f - (2.0f * y) / kFullImageHeight;
-    glm::vec4 clipRay(ndcX, ndcY, -1.0f, 1.0f);
-    glm::vec4 eyeRay = invProj * clipRay;
-    eyeRay.z = -1.0f;
-    eyeRay.w = 0.0f;
-    glm::vec3 rayDir = glm::normalize(glm::vec3(invView * eyeRay));
-    
-    glm::vec3 color(ray_in1->r, ray_in1->g, ray_in1->b);
-    float transmittance = ray_in1->transmittance;
-    float t0 = ray_in1->t;
-    int current = local_id;
-
+    int ray_index = 0;
+    int cell_cntr = 0;
     *result_u16 = 65535;
-    int cntr = 1;
-    while (true) {
-        const LocalPoint* cur_cell = readStructAt<LocalPoint>(local_pts, current); 
-        glm::vec3 currentPos(cur_cell->x, cur_cell->y, cur_cell->z);
+    for(; ray_index<kNumRays; ray_index++) {
+      const Ray* ray_in1 = readStructAt<Ray>(raysIn, ray_index); 
+      if(ray_in1->x == 0xFFFF)
+        break;
+      Ray* ray_out1 = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*ray_index);
+      
+      uint16_t local_id = ray_in1->next_local;
+      uint16_t cluster_id = ray_in1->next_cluster;
+      
+      const uint16_t& x = ray_in1->x;
+      const uint16_t& y = ray_in1->y;
 
-        uint16_t end = cur_cell->adj_end;
-        uint16_t start;
-        if(current == 0) {
-          start = 0;
-        } else {
-          const LocalPoint* prev = readStructAt<LocalPoint>(local_pts, current-1); 
-          start = prev->adj_end;
-        }
+      float ndcX = (2.0f * x) / kFullImageWidth - 1.0f;
+      float ndcY = 1.0f - (2.0f * y) / kFullImageHeight;
+      glm::vec4 clipRay(ndcX, ndcY, -1.0f, 1.0f);
+      glm::vec4 eyeRay = invProj * clipRay;
+      eyeRay.z = -1.0f;
+      eyeRay.w = 0.0f;
+      glm::vec3 rayDir = glm::normalize(glm::vec3(invView * eyeRay));
+      
+      glm::vec3 color(ray_in1->r, ray_in1->g, ray_in1->b);
+      float transmittance = ray_in1->transmittance;
+      float t0 = ray_in1->t;
+      int current = local_id;
 
-        framebuffer[2 * cntr]     = static_cast<uint8_t>((current >> 8) & 0xFF);
-        framebuffer[2 * cntr + 1] = static_cast<uint8_t>(current & 0xFF);
+      // int cntr = 1;
+      while (true) {
+          const LocalPoint* cur_cell = readStructAt<LocalPoint>(local_pts, current); 
+          glm::vec3 currentPos(cur_cell->x, cur_cell->y, cur_cell->z);
 
-        float closestT = std::numeric_limits<float>::max();
-        int nextIdx = -1;
-
-        for (uint16_t j = start; j < end; ++j) {
-          uint16_t neighborIdx = adjacency[j];
-          glm::vec3 nbrPos;
-          if (neighborIdx < nLocalPts) {
-            // neighbor is a local point in the cluster     
-            const LocalPoint* nbrPt = readStructAt<LocalPoint>(local_pts, neighborIdx);
-            nbrPos.x = nbrPt->x;
-            nbrPos.y = nbrPt->y;
-            nbrPos.z = nbrPt->z;
+          uint16_t end = cur_cell->adj_end;
+          uint16_t start;
+          if(current == 0) {
+            start = 0;
           } else {
-            // neighbor is a point from neighboring cluster
-            const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, neighborIdx-nLocalPts);
-            nbrPos.x = nbrPt->x;
-            nbrPos.y = nbrPt->y;
-            nbrPos.z = nbrPt->z;
+            const LocalPoint* prev = readStructAt<LocalPoint>(local_pts, current-1); 
+            start = prev->adj_end;
           }
+          cell_cntr++;
+          framebuffer[2 * cell_cntr]     = static_cast<uint8_t>((current >> 8) & 0xFF);
+          framebuffer[2 * cell_cntr + 1] = static_cast<uint8_t>(current & 0xFF);
 
-          glm::vec3 offset = nbrPos - currentPos;
-          glm::vec3 faceNormal = offset;
-          glm::vec3 faceOrigin = currentPos + 0.5f * offset;
+          float closestT = std::numeric_limits<float>::max();
+          int nextIdx = -1;
 
-          float dotND = glm::dot(faceNormal, rayDir);
-          if (dotND <= 0.0f) continue;
+          for (uint16_t j = start; j < end; ++j) {
+            uint16_t neighborIdx = adjacency[j];
+            glm::vec3 nbrPos;
+            if (neighborIdx < nLocalPts) {
+              // neighbor is a local point in the cluster     
+              const LocalPoint* nbrPt = readStructAt<LocalPoint>(local_pts, neighborIdx);
+              nbrPos.x = nbrPt->x;
+              nbrPos.y = nbrPt->y;
+              nbrPos.z = nbrPt->z;
+            } else {
+              // neighbor is a point from neighboring cluster
+              const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, neighborIdx-nLocalPts);
+              nbrPos.x = nbrPt->x;
+              nbrPos.y = nbrPt->y;
+              nbrPos.z = nbrPt->z;
+            }
 
-          float t = glm::dot(faceOrigin - rayOrigin, faceNormal) / dotND;
+            glm::vec3 offset = nbrPos - currentPos;
+            glm::vec3 faceNormal = offset;
+            glm::vec3 faceOrigin = currentPos + 0.5f * offset;
 
-          if (t > 0 && t < closestT) {
-              closestT = t;
-              nextIdx = neighborIdx;
-          }
-        }       
-        
-        float delta = closestT - t0;
-        float alpha = 1.0f - expf(-cur_cell->density * delta);
-        // glm::vec3 pointColor = glm::vec3(cur_cell->r, cur_cell->g, cur_cell->b) / 255.0f;
+            float dotND = glm::dot(faceNormal, rayDir);
+            if (dotND <= 0.0f) continue;
 
-        color.x += transmittance * alpha * (cur_cell->r/255.0f);
-        color.y += transmittance * alpha * (cur_cell->g/255.0f);
-        color.z += transmittance * alpha * (cur_cell->b/255.0f);
+            float t = glm::dot(faceOrigin - rayOrigin, faceNormal) / dotND;
 
-        transmittance *= (1.0f - alpha);
+            if (t > 0 && t < closestT) {
+                closestT = t;
+                nextIdx = neighborIdx;
+            }
+          }       
+          
+          float delta = closestT - t0;
+          float alpha = 1.0f - expf(-cur_cell->density * delta);
+          // glm::vec3 pointColor = glm::vec3(cur_cell->r, cur_cell->g, cur_cell->b) / 255.0f;
 
-        t0 = __builtin_fmaxf(t0, closestT);
+          color.x += transmittance * alpha * (cur_cell->r/255.0f);
+          color.y += transmittance * alpha * (cur_cell->g/255.0f);
+          color.z += transmittance * alpha * (cur_cell->b/255.0f);
 
-        if (transmittance < 0.01f || nextIdx == -1 || nextIdx >= nLocalPts) {
-          // finished ray tracing for this one
-          // transmittance < 0.01f: too opaque, light cant pass anymore
-          // nextIdx == -1: ray has left the entire scene, depth = inf
-          if(nextIdx >= nLocalPts) {
-            // nextIdx >= nLocalPts : ray moves to next cluster/tile
-            const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, nextIdx-nLocalPts);
-            *result_u16 = nbrPt->cluster_id; 
-            *result_float = color.z;
-            ray_out1->next_cluster = nbrPt->cluster_id; 
-            if(tile_id == 521) {
-              *result_u16 = ray_in1->y; 
+          transmittance *= (1.0f - alpha);
+
+          t0 = __builtin_fmaxf(t0, closestT);
+
+          if (transmittance < 0.01f || nextIdx == -1 || nextIdx >= nLocalPts) {
+            // finished ray tracing for this one
+            // transmittance < 0.01f: too opaque, light cant pass anymore
+            // nextIdx == -1: ray has left the entire scene, depth = inf
+            if(nextIdx >= nLocalPts) {
+              // nextIdx >= nLocalPts : ray moves to next cluster/tile
+              const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, nextIdx-nLocalPts);
+              *result_u16 = nbrPt->cluster_id; 
               *result_float = color.z;
-              ray_out1->next_cluster = 523; 
-            } 
-            if(tile_id == 523) {
-              *result_u16 = ray_in1->y; 
-              *result_float = color.z;
-              ray_out1->next_cluster = 520; 
-            } 
-
-
-            ray_out1->next_local = nbrPt->local_id; 
-            ray_out1->transmittance = transmittance; 
-            ray_out1->x = ray_in1->x;
-            ray_out1->y = ray_in1->y;
-            ray_out1->t = t0;
-            ray_out1->r = color.x;
-            ray_out1->g = color.y;
-            ray_out1->b = color.z;
-          } else {
-            if(nextIdx == -1)
-              *result_u16 = 65534; 
+              ray_out1->next_cluster = nbrPt->cluster_id; 
+              ray_out1->next_local = nbrPt->local_id; 
+              ray_out1->transmittance = transmittance; 
+              ray_out1->x = ray_in1->x;
+              ray_out1->y = ray_in1->y;
+              ray_out1->t = t0;
+              ray_out1->r = color.x;
+              ray_out1->g = color.y;
+              ray_out1->b = color.z;
+            } else {
+              if(nextIdx == -1)
+                *result_u16 = 65534; 
+            }
+            break;
           }
-          break;
-        }
 
-        current = nextIdx;
-        cntr++;
+          current = nextIdx;
+          // cntr++;
+      }
+
+      // *result_u16 = nNeighborPts; // y;
+      // *result_float = rayDir.x;
+
+      // for (unsigned i = 0; i < framebuffer.size(); ++i)
+      //   framebuffer[i] = (255 - tile_id/4 + ray_in1->x)%256;
     }
-    framebuffer[0] = cntr & 0xFF;
-
-    // *result_u16 = nNeighborPts; // y;
-    // *result_float = rayDir.x;
-
-    // for (unsigned i = 0; i < framebuffer.size(); ++i)
-    //   framebuffer[i] = (255 - tile_id/4 + ray_in1->x)%256;
-  
-    for(int i=1; i<kNumRays; i++) {
+    framebuffer[0] = cell_cntr & 0xFF;
+    
+    for(int i=ray_index; i<kNumRays; i++) {
       Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*i);
-      ray_->x = 0xFFFF;
+      if(ray_->x == 0xFFFF)
+        break;
+      else
+        ray_->x = 0xFFFF;
     }
     return true;
   }
@@ -232,22 +228,29 @@ public:
     uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
     uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
-    int index = 0;
-    Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*index);
+    if(exec_count == 1) {
+      int index = 0;
+      Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*index);
 
-    ray_->x = 14;
-    ray_->y = 300;
-    ray_->r = 0.0;
-    ray_->g = 0.0;
-    ray_->b = 0.0;
-    ray_->t = 0.0;
-    ray_->transmittance = 1.0f;
-    ray_->next_cluster = cluster_id;
-    ray_->next_local = local_id;
+      ray_->x = 14;
+      ray_->y = 300;
+      ray_->r = 0.0;
+      ray_->g = 0.0;
+      ray_->b = 0.0;
+      ray_->t = 0.0;
+      ray_->transmittance = 1.0f;
+      ray_->next_cluster = cluster_id;
+      ray_->next_local = local_id;
 
-    for(int i=1; i<kNumRays; i++) {
-      Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*i);
-      ray_->x = 0xFFFF;
+      for(int i=1; i<kNumRays; i++) {
+        Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*i);
+        ray_->x = 0xFFFF;
+      }
+    } else {
+      for(int i=0; i<kNumRays; i++) {
+        Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*i);
+        ray_->x = 0xFFFF;
+      }
     }
     return true;
   }
@@ -277,6 +280,7 @@ public:
 
   bool compute() {
     const uint8_t lvl = *level;
+    uint8_t shift = lvl * 2;
     constexpr int RaySize = sizeof(Ray);
     constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
     const int kNumRays = parentRaysIn.size() / RaySize;
@@ -290,7 +294,7 @@ public:
     // Helper: Determine which child a cluster ID belongs to
     auto findChildForCluster = [&](uint16_t clusterId) -> int {
       for (int i = 0; i < 4; ++i) {
-        if ((childClusterIds[i] >> lvl) == (clusterId >> lvl))
+        if ((childClusterIds[i] >> shift) == (clusterId >> shift))
             return i;
       }
       return -1;
