@@ -7,19 +7,19 @@
 
 using namespace radfoam::geometry;
 
-static const glm::mat4 View2(
-    glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),
-    glm::vec4( 0.484514f, -0.874620f, -0.016920f, 0.000000f),
-    glm::vec4(-0.874087f, -0.484810f,  0.030524f, 0.000000f),
-    glm::vec4(-0.000000f, -0.000000f, -6.700000f, 1.000000f)
-);
+// static const glm::mat4 View2(
+//     glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),
+//     glm::vec4( 0.484514f, -0.874620f, -0.016920f, 0.000000f),
+//     glm::vec4(-0.874087f, -0.484810f,  0.030524f, 0.000000f),
+//     glm::vec4(-0.000000f, -0.000000f, -6.700000f, 1.000000f)
+// );
 
-static const glm::mat4 Proj2(
-    glm::vec4(1.299038f, 0.000000f,  0.000000f,  0.000000f),
-    glm::vec4(0.000000f, 1.732051f,  0.000000f,  0.000000f),
-    glm::vec4(0.000000f, 0.000000f, -1.002002f, -1.000000f),
-    glm::vec4(0.000000f, 0.000000f, -0.200200f,  0.000000f)
-);
+// static const glm::mat4 Proj2(
+//     glm::vec4(1.299038f, 0.000000f,  0.000000f,  0.000000f),
+//     glm::vec4(0.000000f, 1.732051f,  0.000000f,  0.000000f),
+//     glm::vec4(0.000000f, 0.000000f, -1.002002f, -1.000000f),
+//     glm::vec4(0.000000f, 0.000000f, -0.200200f,  0.000000f)
+// );
 
 // inline __attribute__((always_inline))
 // const LocalPoint* readLocalPointAt(const poplar::Input<poplar::Vector<uint8_t>>& buffer, std::size_t index) {
@@ -70,11 +70,17 @@ public:
     const LocalPoint* local_pt = readStructAt<LocalPoint>(local_pts, 0);  
     const GenericPoint* nbr_pt = readStructAt<GenericPoint>(neighbor_pts, 2);  
 
-    glm::mat4 View = glm::transpose(glm::make_mat4(view_matrix.data()));
-    glm::mat4 Proj = glm::transpose(glm::make_mat4(projection_matrix.data()));
-    glm::mat4 invView = glm::inverse(View);
-    glm::mat4 invProj = glm::inverse(Proj);
+    // glm::mat4 View = glm::transpose(glm::make_mat4(view_matrix.data()));
+    // glm::mat4 Proj = glm::transpose(glm::make_mat4(projection_matrix.data()));
+    // // glm::mat4 View = glm::make_mat4(view_matrix.data());
+    // // glm::mat4 Proj = glm::make_mat4(projection_matrix.data());
+    // glm::mat4 invView = glm::inverse(View);
+    // glm::mat4 invProj = glm::inverse(Proj);
+
+    glm::mat4 invView = glm::make_mat4(view_matrix.data());
+    glm::mat4 invProj = glm::make_mat4(projection_matrix.data());
     glm::vec3 rayOrigin = glm::vec3(invView[3]);
+
     
     auto clampToU8 = [](float v) -> uint8_t {
       return static_cast<uint8_t>(std::fmax(0.0f, std::fmin(255.0f, std::round(v * 255.0f))));
@@ -101,8 +107,8 @@ public:
       const uint16_t& x = ray_in1->x;
       const uint16_t& y = ray_in1->y;
 
-      float ndcX = (2.0f * x) / kFullImageWidth - 1.0f;
-      float ndcY = 1.0f - (2.0f * y) / kFullImageHeight;
+      float ndcX = (2.0f * x) / 640.0 - 1.0f;
+      float ndcY = 1.0f - (2.0f * y) / 480.0;
       glm::vec4 clipRay(ndcX, ndcY, -1.0f, 1.0f);
       glm::vec4 eyeRay = invProj * clipRay;
       eyeRay.z = -1.0f;
@@ -115,6 +121,7 @@ public:
       int current = local_id;
 
       // int cntr = 1;
+      int steps = 0;
       while (true) {
           const LocalPoint* cur_cell = readStructAt<LocalPoint>(local_pts, current); 
           glm::vec3 currentPos(cur_cell->x, cur_cell->y, cur_cell->z);
@@ -127,9 +134,9 @@ public:
             const LocalPoint* prev = readStructAt<LocalPoint>(local_pts, current-1); 
             start = prev->adj_end;
           }
-          cell_cntr++;
-          framebuffer[2 * cell_cntr]     = static_cast<uint8_t>((current >> 8) & 0xFF);
-          framebuffer[2 * cell_cntr + 1] = static_cast<uint8_t>(current & 0xFF);
+          // cell_cntr++;
+          // framebuffer[2 * cell_cntr]     = static_cast<uint8_t>((current >> 8) & 0xFF);
+          // framebuffer[2 * cell_cntr + 1] = static_cast<uint8_t>(current & 0xFF);
 
           float closestT = std::numeric_limits<float>::max();
           int nextIdx = -1;
@@ -165,7 +172,10 @@ public:
                 nextIdx = neighborIdx;
             }
           }       
-          
+          if (closestT <= t0 + 1e-5 || steps > 50) {
+            // No forward progress → terminate
+            nextIdx = -1;
+          }
           float delta = closestT - t0;
           float alpha = 1.0f - expf(-cur_cell->density * delta);
           // glm::vec3 pointColor = glm::vec3(cur_cell->r, cur_cell->g, cur_cell->b) / 255.0f;
@@ -213,7 +223,7 @@ public:
                 // nextIdx >= nLocalPts : ray moves to next cluster/tile
                 const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, nextIdx-nLocalPts);
                 *result_u16 = nbrPt->cluster_id; 
-                *result_float = color.z;
+                *result_float = color.x;
                 ray_out->next_cluster = nbrPt->cluster_id; 
                 ray_out->next_local = nbrPt->local_id; 
                 ray_out->transmittance = transmittance; 
@@ -257,7 +267,7 @@ public:
             
             break;
           }
-
+          steps++;
           current = nextIdx;
           // cntr++;
       }
@@ -272,6 +282,14 @@ public:
     
     for(int i=out_ray_cntr; i<kNumRays; i++) {
       Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*i);
+      if(ray_->x == 0xFFFF)
+        break;
+      else
+        ray_->x = 0xFFFF;
+    }
+
+    for(int i=finished_ray_cntr; i<kNumRays; i++) {
+      FinishedRay* ray_ = reinterpret_cast<FinishedRay*>(finishedRays.data()+sizeof(FinishedRay)*i);
       if(ray_->x == 0xFFFF)
         break;
       else
@@ -357,22 +375,40 @@ public:
       return count;
     };
 
-    if(exec_count == 1) {
-      Ray genRay{};
-      uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
-      uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
+    if(exec_count == 0) {
+      // Ray genRay{};
+      // uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
+      // uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
-      genRay.x = 14;
-      genRay.y = 328;
-      genRay.r = 0.0f;
-      genRay.g = 0.0f;
-      genRay.b = 0.0f;
-      genRay.t = 0.0f;
-      genRay.transmittance = 1.0f;
-      genRay.next_cluster = cluster_id;
-      genRay.next_local   = local_id;
+      // genRay.x = 4;
+      // genRay.y = 161;
+      // genRay.r = 0.0f;
+      // genRay.g = 0.0f;
+      // genRay.b = 0.0f;
+      // genRay.t = 0.0f;
+      // genRay.transmittance = 1.0f;
+      // genRay.next_cluster = cluster_id;
+      // genRay.next_local   = local_id;
+      // routeRay(&genRay);
+      for(uint16_t x=0; x<40; x++) {
+        for(uint16_t y=0; y<50; y++) {
+          Ray genRay{};
+          uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
+          uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
-      routeRay(&genRay);
+          genRay.x = x+100;
+          genRay.y = y+200; //(y+(exec_count/20)*3)%480;
+          genRay.r = 0.0f;
+          genRay.g = 0.0f;
+          genRay.b = 0.0f;
+          genRay.t = 0.0f;
+          genRay.transmittance = 1.0f;
+          genRay.next_cluster = cluster_id;
+          genRay.next_local   = local_id;
+
+          routeRay(&genRay);
+        }
+      }
 
     } 
 

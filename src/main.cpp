@@ -67,9 +67,10 @@ static cv::Mat AssembleFullImage(const std::vector<uint8_t>& tiles) {
   return img;
 }
 
-// Assemble full image from finished rays buffer
+// Assemble full image from finished rays buffer, persistent between frames
 static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRaysHost) {
-    cv::Mat img(kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0));
+    static cv::Mat img(kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0)); 
+    // Retains previous content across calls
 
     const size_t numFinishedRays = finishedRaysHost.size() / sizeof(FinishedRay);
     const FinishedRay* rays = reinterpret_cast<const FinishedRay*>(finishedRaysHost.data());
@@ -81,35 +82,51 @@ static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRay
         if (r.x == 0xFFFF || r.y == 0xFFFF) continue;
         if (r.x >= kFullImageWidth || r.y >= kFullImageHeight) continue;
 
-        // OpenCV uses BGR order
+        // Update pixel color in persistent image
         cv::Vec3b& pixel = img.at<cv::Vec3b>(r.y, r.x);
         pixel[0] = r.b; // B
         pixel[1] = r.g; // G
         pixel[2] = r.r; // R
-				fmt::print("Ray {:3}: (x={}, y={}) RGB=({}, {}, {})\n",
-                       i, r.x, r.y, r.r, r.g, r.b);
+				// fmt::print("Ray {:3}: (x={}, y={}) RGB=({}, {}, {})\n",
+        //                i, r.x, r.y, r.r, r.g, r.b);
     }
 
-    return img;
+    return img; // Returns reference (copy-on-write in OpenCV)
 }
+
 
 
 int main(int argc, char** argv) {
 
+	// glm::mat4 ViewMatrix(
+  //   glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),
+  //   glm::vec4( 0.484514f, -0.874620f, -0.016920f, 0.000000f),
+  //   glm::vec4(-0.874087f, -0.484810f,  0.030524f, 0.000000f),
+  //   glm::vec4(-0.000000f, -0.000000f, -6.700000f, 1.000000f)
+	// );
+
+	// glm::mat4 ProjectionMatrix(
+  //   glm::vec4(1.299038f, 0.000000f,  0.000000f,  0.000000f),
+  //   glm::vec4(0.000000f, 1.732051f,  0.000000f,  0.000000f),
+  //   glm::vec4(0.000000f, 0.000000f, -1.002002f, -1.000000f),
+  //   glm::vec4(0.000000f, 0.000000f, -0.200200f,  0.000000f)
+	// );
 	glm::mat4 ViewMatrix(
-    glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),
-    glm::vec4( 0.484514f, -0.874620f, -0.016920f, 0.000000f),
-    glm::vec4(-0.874087f, -0.484810f,  0.030524f, 0.000000f),
-    glm::vec4(-0.000000f, -0.000000f, -6.700000f, 1.000000f)
+    glm::vec4(-0.034899458f,  0.000000000f, -0.999390781f, 0.000000000f),
+    glm::vec4( 0.484514207f, -0.874619782f, -0.016919592f, 0.000000000f),
+    glm::vec4(-0.874086976f, -0.484809548f,  0.030523760f, 0.000000000f),
+    glm::vec4(-0.000000000f, -0.000000000f, -6.699999809f, 1.000000000f)
 	);
 
 	glm::mat4 ProjectionMatrix(
-    glm::vec4(1.299038f, 0.000000f,  0.000000f,  0.000000f),
-    glm::vec4(0.000000f, 1.732051f,  0.000000f,  0.000000f),
-    glm::vec4(0.000000f, 0.000000f, -1.002002f, -1.000000f),
-    glm::vec4(0.000000f, 0.000000f, -0.200200f,  0.000000f)
+		glm::vec4(1.299038053f, 0.000000000f,  0.000000000f,  0.000000000f),
+		glm::vec4(0.000000000f, 1.732050657f,  0.000000000f,  0.000000000f),
+		glm::vec4(0.000000000f, 0.000000000f, -1.002002001f, -1.000000000f),
+		glm::vec4(0.000000000f, 0.000000000f, -0.200200200f,  0.000000000f)
 	);
 
+	fmt::print("Ray size: {}, kNumRays: {}, buffer size: {}\n",
+       sizeof(Ray), kNumRays, kNumRays * sizeof(Ray));
   // ------------------------------
   // Profiling Trace Setup (PVTI)
   // ------------------------------
@@ -238,13 +255,14 @@ int main(int argc, char** argv) {
 		// ProjectionMatrix[2][2] += 1;
 		i++;
 		// if(i==builder.debug_chains_.size()+2) break;
-		if(i==80) break;
+		if(i==tileToDebug) break;
 		glm::mat4 inverseView = glm::inverse(ViewMatrix);
+		glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
 		glm::vec3 cameraPos = glm::vec3(inverseView[3]);
 		auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
 
-		builder.updateViewMatrix(ViewMatrix);
-		builder.updateProjectionMatrix(ProjectionMatrix);
+		builder.updateViewMatrix(inverseView);
+		builder.updateProjectionMatrix(inverseProj);
 		builder.updateCameraCell(camera_cell);
 
 		if (enableUI) hostProcessing.waitForCompletion();

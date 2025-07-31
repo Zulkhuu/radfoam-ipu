@@ -25,7 +25,7 @@ RadiantFoamIpuBuilder::RadiantFoamIpuBuilder(std::string h5_scene_file, int debu
 // ----------------------------------------------------------------------------
 void RadiantFoamIpuBuilder::updateViewMatrix(const glm::mat4& m) {
     glm::mat4 transposed = glm::transpose(m); // Poplar expects row‑major
-    const float* ptr = glm::value_ptr(transposed);
+    const float* ptr = glm::value_ptr(m);
     for (size_t i = 0; i < 16; ++i) {
         hostViewMatrix_[i] = ptr[i];
     }
@@ -33,7 +33,7 @@ void RadiantFoamIpuBuilder::updateViewMatrix(const glm::mat4& m) {
 
 void RadiantFoamIpuBuilder::updateProjectionMatrix(const glm::mat4& m) {
     glm::mat4 transposed = glm::transpose(m);
-    const float* ptr = glm::value_ptr(transposed);
+    const float* ptr = glm::value_ptr(m);
     for (size_t i = 0; i < 16; ++i) {
         hostProjMatrix_[i] = ptr[i];
     }
@@ -126,7 +126,7 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
     eng.run(getPrograms().getOrdinals().at("DataExchange"));
     eng.run(getPrograms().getOrdinals().at("read_finished_rays"));
 
-    readAllTiles(eng);
+    // readAllTiles(eng);
     exec_counter_++;
 }
 
@@ -821,18 +821,31 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
 
     RF_LOG("================ Frame {} =================================================", exec_counter_);
     int overall_cntr = 0;
-    for (int tid : debug_chains) {
-        RF_LOG("Tile {} result f32: {:.6f}, u16: {}", tid, result_f32_host[tid], result_u16_host[tid]);
+    for (int tid = 0; tid < 1024; ++tid) {
         const size_t offset = static_cast<size_t>(tid) * kTileFramebufferSize;
         uint8_t cnt = framebuffer_host[offset];
-        for (uint8_t i = 1; i <= cnt; ++i) {
-            uint16_t pt_idx = (framebuffer_host[offset+i*2] <<8) | framebuffer_host[offset+i*2+1];
-            if (pt_idx < local_pts_[tid].size()) {
-                const auto& pt = local_pts_[tid][pt_idx];
-                fmt::print("[{}] {}: {:4} → ({:8.6f}, {:8.6f}, {:8.6f})\n",
-                           overall_cntr, i, pt_idx, pt.x, pt.y, pt.z);
+
+        if (cnt > 0) {
+            // Print summary for this tile
+            RF_LOG("Tile {} result f32: {:.9f}, u16: {}", tid,
+                result_f32_host[tid], result_u16_host[tid]);
+
+            // Iterate through points written in framebuffer
+            for (uint8_t i = 1; i <= cnt; ++i) {
+                uint16_t pt_idx = (framebuffer_host[offset + i * 2] << 8) |
+                                framebuffer_host[offset + i * 2 + 1];
+
+                if (pt_idx < local_pts_[tid].size()) {
+                    const auto &pt = local_pts_[tid][pt_idx];
+                    fmt::print("[{}] {}: {:4} → ({:8.6f}, {:8.6f}, {:8.6f})\n",
+                            overall_cntr, i, pt_idx, pt.x, pt.y, pt.z);
+                } else {
+                    fmt::print("[{}] {}: {:4} → (INVALID INDEX)\n",
+                            overall_cntr, i, pt_idx);
+                }
+
+                ++overall_cntr;
             }
-            ++overall_cntr;
         }
     }
     {
