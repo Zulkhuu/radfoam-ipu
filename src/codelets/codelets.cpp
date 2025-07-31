@@ -36,8 +36,14 @@ const T* readStructAt(const poplar::Input<poplar::Vector<uint8_t>>& buffer, std:
     return reinterpret_cast<const T*>(base);
 }
 
+inline __attribute__((always_inline))
+uint8_t clampToU8(float v) {
+    return static_cast<uint8_t>(std::fmax(0.0f, std::fmin(255.0f, std::round(v * 255.0f))));
+}
+
 class RayTrace : public poplar::Vertex {
 public:
+  // Inputs
   poplar::Input<poplar::Vector<float>> view_matrix;
   poplar::Input<poplar::Vector<float>> projection_matrix;
 
@@ -47,257 +53,217 @@ public:
   poplar::Input<unsigned short> tile_id;
 
   poplar::Input<poplar::Vector<uint8_t>> raysIn;
+
+  // Outputs
   poplar::Output<poplar::Vector<uint8_t>> raysOut;
   poplar::Output<poplar::Vector<uint8_t>> finishedRays;
 
+  // Framebuffer (inout for debug / tracing)
   poplar::InOut<poplar::Vector<uint8_t>> framebuffer;
-  
+
   poplar::Output<float> result_float;
   poplar::Output<unsigned short> result_u16;
-  
+
   [[poplar::constraint("elem(*local_pts)!=elem(*framebuffer)")]]
   bool compute() {
     constexpr int RaySize = sizeof(Ray);
     constexpr int LocalPointSize = sizeof(LocalPoint);
     constexpr int GenericPointSize = sizeof(GenericPoint); 
-    // glm::mat4 invView2 = glm::inverse(View2);
-    // glm::mat4 invProj2 = glm::inverse(Proj2);
-    // glm::vec3 rayOrigin = glm::vec3(invView2[3]);
+
     const uint16_t nLocalPts = local_pts.size() / LocalPointSize;
     const uint16_t nNeighborPts = neighbor_pts.size() / GenericPointSize;
-    const uint16_t nTotalPts = nLocalPts + nNeighborPts;
 
-    const LocalPoint* local_pt = readStructAt<LocalPoint>(local_pts, 0);  
-    const GenericPoint* nbr_pt = readStructAt<GenericPoint>(neighbor_pts, 2);  
-
-    // glm::mat4 View = glm::transpose(glm::make_mat4(view_matrix.data()));
-    // glm::mat4 Proj = glm::transpose(glm::make_mat4(projection_matrix.data()));
-    // // glm::mat4 View = glm::make_mat4(view_matrix.data());
-    // // glm::mat4 Proj = glm::make_mat4(projection_matrix.data());
-    // glm::mat4 invView = glm::inverse(View);
-    // glm::mat4 invProj = glm::inverse(Proj);
-
+    // Prepare matrices and ray origin
     glm::mat4 invView = glm::make_mat4(view_matrix.data());
     glm::mat4 invProj = glm::make_mat4(projection_matrix.data());
     glm::vec3 rayOrigin = glm::vec3(invView[3]);
 
-    
-    auto clampToU8 = [](float v) -> uint8_t {
-      return static_cast<uint8_t>(std::fmax(0.0f, std::fmin(255.0f, std::round(v * 255.0f))));
-    };
-
-    int ray_index = 0;
-    int out_ray_cntr = 0;
-    int finished_ray_cntr = 0;
-    int cell_cntr = 0;
-    *result_u16 = 65535;
-    for(; ray_index<kNumRays; ray_index++) {
-      const Ray* ray_in1 = readStructAt<Ray>(raysIn, ray_index); 
-      if(ray_in1->x == 0xFFFF)
-        break;
-
-      // if(ray_in1->transmittance < 0.01f) {
-      //   break;
-      // }
-      Ray* ray_out = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*out_ray_cntr);
-      
-      uint16_t local_id = ray_in1->next_local;
-      uint16_t cluster_id = ray_in1->next_cluster;
-      
-      const uint16_t& x = ray_in1->x;
-      const uint16_t& y = ray_in1->y;
-
-      float ndcX = (2.0f * x) / 640.0 - 1.0f;
-      float ndcY = 1.0f - (2.0f * y) / 480.0;
+    auto computeRayDir = [&](uint16_t x, uint16_t y) __attribute__((always_inline)) -> glm::vec3 {
+      float ndcX = (2.0f * x) / 640.0f - 1.0f;
+      float ndcY = 1.0f - (2.0f * y) / 480.0f;
       glm::vec4 clipRay(ndcX, ndcY, -1.0f, 1.0f);
       glm::vec4 eyeRay = invProj * clipRay;
       eyeRay.z = -1.0f;
       eyeRay.w = 0.0f;
-      glm::vec3 rayDir = glm::normalize(glm::vec3(invView * eyeRay));
-      
-      glm::vec3 color(ray_in1->r, ray_in1->g, ray_in1->b);
-      float transmittance = ray_in1->transmittance;
-      float t0 = ray_in1->t;
-      int current = local_id;
+      return glm::normalize(glm::vec3(invView * eyeRay));
+    };
 
-      // int cntr = 1;
+    int out_ray_cntr = 0;
+    int finished_ray_cntr = 0;
+    int cell_cntr = 0;
+    bool debug = false;
+
+    *result_u16 = 65535;
+
+    // Loop over input rays
+    for (int ray_index = 0; ray_index < kNumRays; ++ray_index) {
+      const Ray* ray_in = readStructAt<Ray>(raysIn, ray_index);
+      if (ray_in->x == 0xFFFF) break; // End of rays
+
+      // Compute ray direction in world space
+      glm::vec3 rayDir = computeRayDir(ray_in->x, ray_in->y);
+
+      // Initialize accumulation
+      glm::vec3 color(ray_in->r, ray_in->g, ray_in->b);
+      float transmittance = ray_in->transmittance;
+      float t0 = ray_in->t;
+
+      int current = ray_in->next_local;
       int steps = 0;
-      while (true) {
-          const LocalPoint* cur_cell = readStructAt<LocalPoint>(local_pts, current); 
-          glm::vec3 currentPos(cur_cell->x, cur_cell->y, cur_cell->z);
+      bool finished = false;
 
-          uint16_t end = cur_cell->adj_end;
-          uint16_t start;
-          if(current == 0) {
-            start = 0;
+      while (!finished) {
+        // Access current cell
+        const LocalPoint* cur_cell = readStructAt<LocalPoint>(local_pts, current);
+        glm::vec3 currentPos(cur_cell->x, cur_cell->y, cur_cell->z);
+
+        // Determine adjacency range
+        uint16_t start = (current == 0) ? 0 : readStructAt<LocalPoint>(local_pts, current - 1)->adj_end;
+        uint16_t end   = cur_cell->adj_end;
+
+        if(debug) {
+          cell_cntr++;
+          framebuffer[2 * cell_cntr]     = static_cast<uint8_t>((current >> 8) & 0xFF);
+          framebuffer[2 * cell_cntr + 1] = static_cast<uint8_t>(current & 0xFF);
+        }
+
+        // Traverse neighbors
+        float closestT = std::numeric_limits<float>::max();
+        int nextIdx = -1;
+
+        for (uint16_t j = start; j < end; ++j) {
+          uint16_t neighborIdx = adjacency[j];
+          glm::vec3 nbrPos;
+
+          if (neighborIdx < nLocalPts) {
+            const LocalPoint* nbrPt = readStructAt<LocalPoint>(local_pts, neighborIdx);
+            nbrPos.x = nbrPt->x;
+            nbrPos.y = nbrPt->y;
+            nbrPos.z = nbrPt->z;
           } else {
-            const LocalPoint* prev = readStructAt<LocalPoint>(local_pts, current-1); 
-            start = prev->adj_end;
+            const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, neighborIdx - nLocalPts);
+            nbrPos.x = nbrPt->x;
+            nbrPos.y = nbrPt->y;
+            nbrPos.z = nbrPt->z;
           }
-          // cell_cntr++;
-          // framebuffer[2 * cell_cntr]     = static_cast<uint8_t>((current >> 8) & 0xFF);
-          // framebuffer[2 * cell_cntr + 1] = static_cast<uint8_t>(current & 0xFF);
 
-          float closestT = std::numeric_limits<float>::max();
-          int nextIdx = -1;
+          glm::vec3 offset = nbrPos - currentPos;
+          glm::vec3 faceNormal = offset;
+          glm::vec3 faceOrigin = currentPos + 0.5f * offset;
 
-          for (uint16_t j = start; j < end; ++j) {
-            uint16_t neighborIdx = adjacency[j];
-            glm::vec3 nbrPos;
-            if (neighborIdx < nLocalPts) {
-              // neighbor is a local point in the cluster     
-              const LocalPoint* nbrPt = readStructAt<LocalPoint>(local_pts, neighborIdx);
-              nbrPos.x = nbrPt->x;
-              nbrPos.y = nbrPt->y;
-              nbrPos.z = nbrPt->z;
-            } else {
-              // neighbor is a point from neighboring cluster
-              const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, neighborIdx-nLocalPts);
-              nbrPos.x = nbrPt->x;
-              nbrPos.y = nbrPt->y;
-              nbrPos.z = nbrPt->z;
-            }
+          float dotND = glm::dot(faceNormal, rayDir);
+          if (dotND <= 0.0f) continue;
 
-            glm::vec3 offset = nbrPos - currentPos;
-            glm::vec3 faceNormal = offset;
-            glm::vec3 faceOrigin = currentPos + 0.5f * offset;
-
-            float dotND = glm::dot(faceNormal, rayDir);
-            if (dotND <= 0.0f) continue;
-
-            float t = glm::dot(faceOrigin - rayOrigin, faceNormal) / dotND;
-
-            if (t > 0 && t < closestT) {
-                closestT = t;
-                nextIdx = neighborIdx;
-            }
-          }       
-          if (closestT <= t0 + 1e-5 || steps > 50) {
-            // No forward progress → terminate
-            nextIdx = -1;
+          float t = glm::dot(faceOrigin - rayOrigin, faceNormal) / dotND;
+          if (t > 0 && t < closestT) {
+            closestT = t;
+            nextIdx = neighborIdx;
           }
-          float delta = closestT - t0;
-          float alpha = 1.0f - expf(-cur_cell->density * delta);
-          // glm::vec3 pointColor = glm::vec3(cur_cell->r, cur_cell->g, cur_cell->b) / 255.0f;
+        }
 
-          color.x += transmittance * alpha * (cur_cell->r/255.0f);
-          color.y += transmittance * alpha * (cur_cell->g/255.0f);
-          color.z += transmittance * alpha * (cur_cell->b/255.0f);
+        // Guard for stuck rays
+        if (closestT <= t0 + 1e-5f || steps > 50) {
+          nextIdx = -1;
+        }
 
-          transmittance *= (1.0f - alpha);
+        // Accumulate color
+        float delta = closestT - t0;
+        float alpha = 1.0f - expf(-cur_cell->density * delta);
+        // color += transmittance * alpha *
+        //          glm::vec3(cur_cell->r / 255.0f, cur_cell->g / 255.0f, cur_cell->b / 255.0f);
+        color.x += transmittance * alpha * (cur_cell->r/255.0f);
+        color.y += transmittance * alpha * (cur_cell->g/255.0f);
+        color.z += transmittance * alpha * (cur_cell->b/255.0f);
 
-          t0 = __builtin_fmaxf(t0, closestT);
+        transmittance *= (1.0f - alpha);
+        t0 = __builtin_fmaxf(t0, closestT);
 
-          if (transmittance < 0.01f || nextIdx == -1 || nextIdx >= nLocalPts) {
-            // finished ray tracing for this one
-            // transmittance < 0.01f: too opaque, light cant pass anymore
-            // nextIdx == -1: ray has left the entire scene, depth = inf
-            if(transmittance < 0.01f) {
-              *result_u16 = 65533; 
-              *result_float = color.x;
-
-              FinishedRay* finished_ray = reinterpret_cast<FinishedRay*>(finishedRays.data()+sizeof(FinishedRay)*finished_ray_cntr);
-              finished_ray->x = ray_in1->x;
-              finished_ray->y = ray_in1->y;
-              finished_ray->r = clampToU8(color.x);
-              finished_ray->g = clampToU8(color.y);
-              finished_ray->b = clampToU8(color.z);
-              finished_ray->t = t0;
-              finished_ray_cntr++;
-              // Find where framebuffer is
-              // int tile_x = ray_in1->x / kTileImageWidth;
-              // int tile_y = ray_in1->y / kTileImageHeight;
-              // int tile_id = tile_y * kNumRayTracerTilesX + tile_x;
-
-              // ray_out->next_cluster = tile_id; //nbrPt->cluster_id; 
-              // ray_out->next_local = 0xFFFF; 
-              // ray_out->transmittance = transmittance; 
-              // ray_out->x = ray_in1->x;
-              // ray_out->y = ray_in1->y;
-              // ray_out->t = t0;
-              // ray_out->r = color.x;
-              // ray_out->g = color.y;
-              // ray_out->b = color.z;
-            } else {
-              if(nextIdx >= nLocalPts) {
-                // nextIdx >= nLocalPts : ray moves to next cluster/tile
-                const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, nextIdx-nLocalPts);
-                *result_u16 = nbrPt->cluster_id; 
-                *result_float = color.x;
-                ray_out->next_cluster = nbrPt->cluster_id; 
-                ray_out->next_local = nbrPt->local_id; 
-                ray_out->transmittance = transmittance; 
-                ray_out->x = ray_in1->x;
-                ray_out->y = ray_in1->y;
-                ray_out->t = t0;
-                ray_out->r = color.x;
-                ray_out->g = color.y;
-                ray_out->b = color.z;
-              } else {
-                if(nextIdx == -1) {
-                  *result_u16 = 65534; 
-                  *result_float = color.x;
-
-                  FinishedRay* finished_ray = reinterpret_cast<FinishedRay*>(finishedRays.data()+sizeof(FinishedRay)*finished_ray_cntr);
-                  finished_ray->x = ray_in1->x;
-                  finished_ray->y = ray_in1->y;
-                  finished_ray->r = clampToU8(color.x);
-                  finished_ray->g = clampToU8(color.y);
-                  finished_ray->b = clampToU8(color.z);
-                  finished_ray->t = t0;
-                  finished_ray_cntr++;
-
-                  // // Find where framebuffer is
-                  // int tile_x = ray_in1->x / kTileImageWidth;
-                  // int tile_y = ray_in1->y / kTileImageHeight;
-                  // int tile_id = tile_y * kNumRayTracerTilesX + tile_x;
-
-                  // ray_out->next_cluster = tile_id; //nbrPt->cluster_id; 
-                  // ray_out->next_local = 0xFFFF; 
-                  // ray_out->transmittance = transmittance; 
-                  // ray_out->x = ray_in1->x;
-                  // ray_out->y = ray_in1->y;
-                  // ray_out->t = t0;
-                  // ray_out->r = color.x;
-                  // ray_out->g = color.y;
-                  // ray_out->b = color.z;
-                }
-              }
-            }
+        // Termination conditions
+        if (transmittance < 0.01f || nextIdx == -1 || nextIdx >= nLocalPts) {
+          if (transmittance < 0.01f || nextIdx == -1) {
+            // Ray finished
+            FinishedRay* finished_ray = reinterpret_cast<FinishedRay*>(finishedRays.data() + sizeof(FinishedRay) * finished_ray_cntr);
+            finished_ray->x = ray_in->x;
+            finished_ray->y = ray_in->y;
+            finished_ray->r = clampToU8(color.x);
+            finished_ray->g = clampToU8(color.y);
+            finished_ray->b = clampToU8(color.z);
+            finished_ray->t = t0;
+            finished_ray_cntr++;
             
-            break;
+            *result_u16 = 65533;
+            if(nextIdx == -1)
+              *result_u16 = 65534; 
+            *result_float = color.x;
           }
-          steps++;
-          current = nextIdx;
-          // cntr++;
+          else if (nextIdx >= nLocalPts) {
+            // Move to next cluster
+            const GenericPoint* nbrPt = readStructAt<GenericPoint>(neighbor_pts, nextIdx - nLocalPts);
+            Ray* ray_out = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*out_ray_cntr);
+            ray_out->next_cluster = nbrPt->cluster_id;
+            ray_out->next_local   = nbrPt->local_id;
+            ray_out->transmittance = transmittance;
+            ray_out->x = ray_in->x;
+            ray_out->y = ray_in->y;
+            ray_out->t = t0;
+            ray_out->r = color.x;
+            ray_out->g = color.y;
+            ray_out->b = color.z;
+            out_ray_cntr++;
+
+            *result_u16 = nbrPt->cluster_id; // y;
+            *result_float = color.x;
+          }
+          finished = true;
+        }
+
+        ++steps;
+        current = nextIdx;
       }
-      out_ray_cntr++;
-      // *result_u16 = nNeighborPts; // y;
-      // *result_float = rayDir.x;
 
-      // for (unsigned i = 0; i < framebuffer.size(); ++i)
-      //   framebuffer[i] = (255 - tile_id/4 + ray_in1->x)%256;
-    }
-    framebuffer[0] = cell_cntr & 0xFF;
-    
-    for(int i=out_ray_cntr; i<kNumRays; i++) {
-      Ray* ray_ = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*i);
-      if(ray_->x == 0xFFFF)
-        break;
-      else
-        ray_->x = 0xFFFF;
     }
 
-    for(int i=finished_ray_cntr; i<kNumRays; i++) {
-      FinishedRay* ray_ = reinterpret_cast<FinishedRay*>(finishedRays.data()+sizeof(FinishedRay)*i);
-      if(ray_->x == 0xFFFF)
-        break;
-      else
-        ray_->x = 0xFFFF;
+    if(debug){
+      framebuffer[0] = cell_cntr & 0xFF;
     }
+
+    // Invalidate unused slots
+    invalidateRemainingRays(raysOut, out_ray_cntr);
+    invalidateRemainingFinishedRays(finishedRays, finished_ray_cntr);
+
     return true;
   }
+
+private:
+  void writeFinishedRay(poplar::Output<poplar::Vector<uint8_t>>& buffer,
+                        int& counter, uint16_t x, uint16_t y,
+                        const glm::vec3& color, float t) {
+    FinishedRay* ray = reinterpret_cast<FinishedRay*>(buffer.data() + sizeof(FinishedRay) * counter);
+    ray->x = x;
+    ray->y = y;
+    ray->r = clampToU8(color.x);
+    ray->g = clampToU8(color.y);
+    ray->b = clampToU8(color.z);
+    ray->t = t;
+    counter++;
+  }
+
+  void invalidateRemainingRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) {
+    for (int i = count; i < kNumRays; i++) {
+      Ray* ray = reinterpret_cast<Ray*>(buffer.data() + sizeof(Ray) * i);
+      ray->x = 0xFFFF;
+    }
+  }
+
+  void invalidateRemainingFinishedRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) {
+    for (int i = count; i < kNumRays; i++) {
+      FinishedRay* ray = reinterpret_cast<FinishedRay*>(buffer.data() + sizeof(FinishedRay) * i);
+      ray->x = 0xFFFF;
+    }
+  }
 };
+
+
 
 class RayGen : public poplar::Vertex {
 public:
@@ -375,7 +341,8 @@ public:
       return count;
     };
 
-    if(exec_count == 0) {
+    const int interval = 3;
+    if(exec_count%interval == 0) {
       // Ray genRay{};
       // uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
       // uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
@@ -390,14 +357,16 @@ public:
       // genRay.next_cluster = cluster_id;
       // genRay.next_local   = local_id;
       // routeRay(&genRay);
-      for(uint16_t x=0; x<40; x++) {
-        for(uint16_t y=0; y<50; y++) {
+
+
+      for(uint16_t x=0; x<640; x++) {
+        for(uint16_t y=0; y<2; y++) {
           Ray genRay{};
           uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
           uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
-          genRay.x = x+100;
-          genRay.y = y+200; //(y+(exec_count/20)*3)%480;
+          genRay.x = x;
+          genRay.y = (y+(exec_count/interval)*2)%480;
           genRay.r = 0.0f;
           genRay.g = 0.0f;
           genRay.b = 0.0f;

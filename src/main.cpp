@@ -199,7 +199,7 @@ int main(int argc, char** argv) {
   // ------------------------------
   // Build and Configure IPU Graph
   // ------------------------------
-  radfoam::ipu::RadiantFoamIpuBuilder builder(inputFile, tileToDebug);
+  radfoam::ipu::RadiantFoamIpuBuilder builder(inputFile, tileToDebug, enableDebug);
 
   ipu_utils::RuntimeConfig cfg{
     /*numIpus=*/1,

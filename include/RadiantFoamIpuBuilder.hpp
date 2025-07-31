@@ -51,7 +51,7 @@ class RadiantFoamIpuBuilder final : public ipu_utils::BuilderInterface {
 public:
     /// @param h5_scene_file    Path to the baked HDF5 scene file.
     /// @param debug_tile       Optional: tile ID to emit extra debug for.
-    explicit RadiantFoamIpuBuilder(std::string h5_scene_file, int debug_tile = 0);
+    explicit RadiantFoamIpuBuilder(std::string h5_scene_file, int debug_tile = 0, bool debug = false);
 
     // BuilderInterface -------------------------------------------------------
     void build(poplar::Graph& graph, const poplar::Target& target) override;
@@ -88,6 +88,7 @@ private:
     // Construction‑time constants
     const std::string h5_file_;
     const int         tile_to_debug_;
+    bool debug_;
 
     // Scene data -------------------------------------------------------------
     std::vector<std::vector<radfoam::geometry::LocalPoint>>   local_pts_;

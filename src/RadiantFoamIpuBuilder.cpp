@@ -12,9 +12,10 @@ using ipu_utils::logger;
 // ----------------------------------------------------------------------------
 //  ctor
 // ----------------------------------------------------------------------------
-RadiantFoamIpuBuilder::RadiantFoamIpuBuilder(std::string h5_scene_file, int debug_tile)
+RadiantFoamIpuBuilder::RadiantFoamIpuBuilder(std::string h5_scene_file, int debug_tile, bool debug)
     : h5_file_(std::move(h5_scene_file)),
-      tile_to_debug_(debug_tile) {
+      tile_to_debug_(debug_tile),
+      debug_(debug) {
         initialised_ = false;
         hostViewMatrix_.assign(16, 0.0f);
         hostProjMatrix_.assign(16, 0.0f);
@@ -126,7 +127,8 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
     eng.run(getPrograms().getOrdinals().at("DataExchange"));
     eng.run(getPrograms().getOrdinals().at("read_finished_rays"));
 
-    // readAllTiles(eng);
+    if(debug_)
+        readAllTiles(eng);
     exec_counter_++;
 }
 
