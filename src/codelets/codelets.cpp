@@ -365,7 +365,7 @@ public:
           uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
           uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
-          genRay.x = x;
+          genRay.x = x; //(x+(exec_count/interval)*3)%640;
           genRay.y = (y+(exec_count/interval)*2)%480;
           genRay.r = 0.0f;
           genRay.g = 0.0f;
