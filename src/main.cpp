@@ -67,14 +67,24 @@ static cv::Mat AssembleFullImage(const std::vector<uint8_t>& tiles) {
   return img;
 }
 
+inline cv::Vec3b mapTtoHSV(float t) {
+    if (t < 0) t = 0;
+    if (t > 80) t = 80;
+
+    // Map to hue range (0-179)
+    float hue = (t / 80.0f) * 179.0f;
+
+    // Full saturation and value
+    return cv::Vec3b(static_cast<uint8_t>(hue), 255, 255);
+}
+
 // Assemble full image from finished rays buffer, persistent between frames
-static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRaysHost) {
+static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRaysHost, int mode) {
     static cv::Mat img(kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0)); 
     // Retains previous content across calls
 
     const size_t numFinishedRays = finishedRaysHost.size() / sizeof(FinishedRay);
     const FinishedRay* rays = reinterpret_cast<const FinishedRay*>(finishedRaysHost.data());
-
     for (size_t i = 0; i < numFinishedRays; ++i) {
         const FinishedRay& r = rays[i];
 
@@ -83,10 +93,24 @@ static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRay
         if (r.x >= kFullImageWidth || r.y >= kFullImageHeight) continue;
 
         // Update pixel color in persistent image
-        cv::Vec3b& pixel = img.at<cv::Vec3b>(r.y, r.x);
-        pixel[0] = r.b; // B
-        pixel[1] = r.g; // G
-        pixel[2] = r.r; // R
+        if(mode == 0) {
+          cv::Vec3b& pixel = img.at<cv::Vec3b>(r.y, r.x);
+          pixel[0] = r.b; // B
+          pixel[1] = r.g; // G
+          pixel[2] = r.r; // R
+        } else if (mode == 1) {
+          // Convert t to HSV color
+          cv::Vec3b hsv = mapTtoHSV(r.t);
+  
+          // Convert HSV to BGR (OpenCV expects H,S,V format in 8-bit)
+          cv::Mat hsvMat(1, 1, CV_8UC3, hsv);
+          cv::Mat bgrMat;
+          cv::cvtColor(hsvMat, bgrMat, cv::COLOR_HSV2BGR);
+  
+          // Assign pixel color
+          img.at<cv::Vec3b>(r.y, r.x) = bgrMat.at<cv::Vec3b>(0, 0);
+        }
+
 				// fmt::print("Ray {:3}: (x={}, y={}) RGB=({}, {}, {})\n",
         //                i, r.x, r.y, r.r, r.g, r.b);
     }
@@ -154,6 +178,7 @@ int main(int argc, char** argv) {
 	options.add_options()
     ("i,input", "Input HDF5 file", cxxopts::value<std::string>()->default_value("./data/garden.h5"))
     ("t,tile", "Tile to debug", cxxopts::value<int>()->default_value("0"))
+    ("m,mode", "Display mode rgb/depth", cxxopts::value<int>()->default_value("0"))
     ("no-ui", "Disable UI server", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("debug", "Enable debug reporting", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("p,port", "UI port", cxxopts::value<int>()->default_value("5000"))
@@ -168,6 +193,7 @@ int main(int argc, char** argv) {
 
 	std::string inputFile = result["input"].as<std::string>();
 	int tileToDebug = result["tile"].as<int>();
+	int vis_mode = result["mode"].as<int>();
 	bool enableUI = !result["no-ui"].as<bool>();
 	bool enableDebug = result["debug"].as<bool>();
 	int uiPort = result["port"].as<int>();
@@ -282,7 +308,7 @@ int main(int argc, char** argv) {
 		if (enableUI) hostProcessing.waitForCompletion();
 		mgr.execute(builder);
 		// *imagePtr = AssembleFullImage(builder.framebuffer_host);
-		*imagePtr = AssembleFinishedRaysImage(builder.finishedRaysHost_);
+		*imagePtr = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
 		std::swap(imagePtr, imagePtrBuffered);
 		if (enableUI) hostProcessing.run(uiUpdateFunc);
 
@@ -292,7 +318,7 @@ int main(int argc, char** argv) {
 	if (enableUI) hostProcessing.waitForCompletion();
 
   // cv::imwrite("framebuffer_full.png", AssembleFullImage(builder.framebuffer_host));
-  cv::imwrite("framebuffer_full.png", AssembleFinishedRaysImage(builder.finishedRaysHost_));
+  cv::imwrite("framebuffer_full.png", AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode));
 
   return 0;
 }

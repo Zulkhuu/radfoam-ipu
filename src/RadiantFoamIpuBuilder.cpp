@@ -850,74 +850,75 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
             }
         }
     }
-    {
-        auto targetrouters = {2, 3};
-        for(const auto& targetRouter : targetrouters) {
-            fmt::print("L3 router {:4}:", targetRouter);
+    
+    // {
+    //     auto targetrouters = {2, 3};
+    //     for(const auto& targetRouter : targetrouters) {
+    //         fmt::print("L3 router {:4}:", targetRouter);
 
-            const uint8_t* base = &l3routerDebugBytesHost_[targetRouter * kRouterDebugSize];
+    //         const uint8_t* base = &l3routerDebugBytesHost_[targetRouter * kRouterDebugSize];
 
-            for (size_t i = 0; i < kRouterDebugSize; i += 2) {
-                uint16_t val = static_cast<uint16_t>(base[i]) |
-                            (static_cast<uint16_t>(base[i + 1]) << 8);
+    //         for (size_t i = 0; i < kRouterDebugSize; i += 2) {
+    //             uint16_t val = static_cast<uint16_t>(base[i]) |
+    //                         (static_cast<uint16_t>(base[i + 1]) << 8);
 
-                fmt::print("{:5} ", val);
-                if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
-            }
-            fmt::print("\n");
-        }
-    }
-    {
-        auto targetrouters = {8, 11, 13};
-        for(const auto& targetRouter : targetrouters) {
-            fmt::print("L2 router {:4}:", targetRouter);
+    //             fmt::print("{:5} ", val);
+    //             if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
+    //         }
+    //         fmt::print("\n");
+    //     }
+    // }
+    // {
+    //     auto targetrouters = {8, 11, 13};
+    //     for(const auto& targetRouter : targetrouters) {
+    //         fmt::print("L2 router {:4}:", targetRouter);
 
-            const uint8_t* base = &l2routerDebugBytesHost_[targetRouter * kRouterDebugSize];
+    //         const uint8_t* base = &l2routerDebugBytesHost_[targetRouter * kRouterDebugSize];
 
-            for (size_t i = 0; i < kRouterDebugSize; i += 2) {
-                uint16_t val = static_cast<uint16_t>(base[i]) |
-                            (static_cast<uint16_t>(base[i + 1]) << 8);
+    //         for (size_t i = 0; i < kRouterDebugSize; i += 2) {
+    //             uint16_t val = static_cast<uint16_t>(base[i]) |
+    //                         (static_cast<uint16_t>(base[i + 1]) << 8);
 
-                fmt::print("{:5} ", val);
-                if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
-            }
-            fmt::print("\n");
-        }
-    }
-    {
-        auto targetrouters = {32, 33, 45, 53};
-        for(const auto& targetRouter : targetrouters) {
-            fmt::print("L1 router {:4}:", targetRouter);
+    //             fmt::print("{:5} ", val);
+    //             if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
+    //         }
+    //         fmt::print("\n");
+    //     }
+    // }
+    // {
+    //     auto targetrouters = {32, 33, 45, 53};
+    //     for(const auto& targetRouter : targetrouters) {
+    //         fmt::print("L1 router {:4}:", targetRouter);
 
-            const uint8_t* base = &l1routerDebugBytesHost_[targetRouter * kRouterDebugSize];
+    //         const uint8_t* base = &l1routerDebugBytesHost_[targetRouter * kRouterDebugSize];
 
-            for (size_t i = 0; i < kRouterDebugSize; i += 2) {
-                uint16_t val = static_cast<uint16_t>(base[i]) |
-                            (static_cast<uint16_t>(base[i + 1]) << 8);
+    //         for (size_t i = 0; i < kRouterDebugSize; i += 2) {
+    //             uint16_t val = static_cast<uint16_t>(base[i]) |
+    //                         (static_cast<uint16_t>(base[i + 1]) << 8);
 
-                fmt::print("{:5} ", val);
-                if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
-            }
-            fmt::print("\n");
-        }
-    }
-    {
-        auto targetrouters = {130, 131, 134, 176, 177, 182, 214};
-        for(const auto& targetRouter : targetrouters) {
-            fmt::print("L0 router {:4}:", targetRouter);
+    //             fmt::print("{:5} ", val);
+    //             if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
+    //         }
+    //         fmt::print("\n");
+    //     }
+    // }
+    // {
+    //     auto targetrouters = {130, 131, 134, 176, 177, 182, 214};
+    //     for(const auto& targetRouter : targetrouters) {
+    //         fmt::print("L0 router {:4}:", targetRouter);
 
-            const uint8_t* base = &l0routerDebugBytesHost_[targetRouter * kRouterDebugSize];
+    //         const uint8_t* base = &l0routerDebugBytesHost_[targetRouter * kRouterDebugSize];
 
-            for (size_t i = 0; i < kRouterDebugSize; i += 2) {
-                uint16_t val = static_cast<uint16_t>(base[i]) |
-                            (static_cast<uint16_t>(base[i + 1]) << 8);
+    //         for (size_t i = 0; i < kRouterDebugSize; i += 2) {
+    //             uint16_t val = static_cast<uint16_t>(base[i]) |
+    //                         (static_cast<uint16_t>(base[i + 1]) << 8);
 
-                fmt::print("{:5} ", val);
-                if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
-            }
-            fmt::print("\n");
-        }
-    }
+    //             fmt::print("{:5} ", val);
+    //             if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
+    //         }
+    //         fmt::print("\n");
+    //     }
+    // }
 
 }
 

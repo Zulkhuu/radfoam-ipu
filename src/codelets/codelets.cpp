@@ -161,11 +161,6 @@ public:
           }
         }
 
-        // Guard for stuck rays
-        if (closestT <= t0 + 1e-5f || steps > 50) {
-          nextIdx = -1;
-        }
-
         // Accumulate color
         float delta = closestT - t0;
         float alpha = 1.0f - expf(-cur_cell->density * delta);
