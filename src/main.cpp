@@ -187,43 +187,37 @@ int main(int argc, char** argv) {
 	bool enableDebug = result["debug"].as<bool>();
 	int uiPort = result["port"].as<int>();
 
-	KDTreeManager kdtree(inputFile);
-
 	glm::mat4 inverseView = glm::inverse(ViewMatrix);
 	glm::vec3 cameraPos = glm::vec3(inverseView[3]);
-	auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
-	fmt::print("Camera position ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
-							cameraPos.x, cameraPos.y, cameraPos.z);
-	fmt::print("Closest Point to Camera:\n"
-							"  Cluster: {:>5}\n"
-							"  Local  : {:>5}\n"
-							"  Position: ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
-							camera_cell.cluster_id, camera_cell.local_id, 
-							camera_cell.x, camera_cell.y, camera_cell.z);
+  
+	// KDTreeManager kdtree(inputFile);
+  // 
+	// auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
+	// fmt::print("Camera position ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
+	// 						cameraPos.x, cameraPos.y, cameraPos.z);
+	// fmt::print("Closest Point to Camera:\n"
+	// 						"  Cluster: {:>5}\n"
+	// 						"  Local  : {:>5}\n"
+	// 						"  Position: ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
+	// 						camera_cell.cluster_id, camera_cell.local_id, 
+	// 						camera_cell.x, camera_cell.y, camera_cell.z);
+  radfoam::geometry::GenericPoint camera_cell{
+     0.6503f, -1.2979f,  3.3524f, 
+     static_cast<uint16_t>(779),   // cluster_id
+     static_cast<uint16_t>(3532)   // local_id
+  };
 
   // ------------------------------
   // Poplar Engine Options
   // ------------------------------
   poplar::OptionFlags engineOptions = {};
-  // if (radfoam::util::isPoplarEngineOptionsEnabled()) {
-  //   logger()->info("Poplar auto-reporting is enabled (POPLAR_ENGINE_OPTIONS set)");
-  //   engineOptions = {{"debug.instrument", "true"}};
-  // } else {
-  //   logger()->info("Poplar auto-reporting is NOT enabled");
-  //   engineOptions = {};
-  // }
   if (enableDebug) {
     logger()->info("Enabling Poplar auto-reporting (POPLAR_ENGINE_OPTIONS set)");
-		setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true","autoReport.directory":"./report"})", 1);
+		setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true", "autoReport.executionProfileProgramRunCount":"10","debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
     engineOptions = {{"debug.instrument", "true"}};
-    // engineOptions.set("debug.instrument", "true");
-    // engineOptions.set("autoReport.all", "true");
-    // engineOptions.set("autoReport.directory", "./report");
   } else {
 		unsetenv("POPLAR_ENGINE_OPTIONS");
     logger()->info("Poplar auto-reporting is NOT enabled");
-    // engineOptions.set("autoReport.all", "false");
-    // engineOptions = {};
   }
   // ------------------------------
   // Build and Configure IPU Graph
@@ -286,8 +280,8 @@ int main(int argc, char** argv) {
 		if(i==tileToDebug) break;
 		glm::mat4 inverseView = glm::inverse(ViewMatrix);
 		glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
-		glm::vec3 cameraPos = glm::vec3(inverseView[3]);
-		auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
+		// glm::vec3 cameraPos = glm::vec3(inverseView[3]);
+		// auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
 
 		builder.updateViewMatrix(inverseView);
 		builder.updateProjectionMatrix(inverseProj);
@@ -302,13 +296,23 @@ int main(int argc, char** argv) {
         vis_mode = 1;
       }
     }
+
+    auto startTime = std::chrono::steady_clock::now();
 		mgr.execute(builder);
-		// *imagePtr = AssembleFullImage(builder.framebuffer_host);
+    auto endTime = std::chrono::steady_clock::now();
+    auto execTime = std::chrono::duration<double>(endTime - startTime).count();
+    logger()->info("IPU execution time: {}", execTime);
+
+    // startTime = std::chrono::steady_clock::now();
 		*imagePtr = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
 		std::swap(imagePtr, imagePtrBuffered);
 		if (enableUI) hostProcessing.run(uiUpdateFunc);
-
+    
 		state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
+
+    // endTime = std::chrono::steady_clock::now();
+    // execTime = std::chrono::duration<double>(endTime - startTime).count();
+    // logger()->info("UI execution time: {}", execTime);
 	} while (!enableUI || (uiServer && !state.stop));
 
 	if (enableUI) hostProcessing.waitForCompletion();

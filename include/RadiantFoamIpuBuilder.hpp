@@ -135,6 +135,7 @@ private:
     poplar::program::Sequence per_tile_writes_;
     poplar::program::Sequence broadcastMatrices_;
     poplar::program::Sequence zero_seq;
+    poplar::program::Sequence frame_;
 
     // Router bookkeeping -----------------------------------------------------
     static constexpr uint16_t kRouterDebugSize = 24;

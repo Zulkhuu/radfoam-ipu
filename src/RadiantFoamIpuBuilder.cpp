@@ -1,6 +1,7 @@
 #include "RadiantFoamIpuBuilder.hpp"
 
 #include <spdlog/fmt/fmt.h>
+#include <poplar/Program.hpp>
 
 // Utility macro for logging inside the class implementation
 #define RF_LOG(...) ipu_utils::logger()->info(__VA_ARGS__)
@@ -8,6 +9,7 @@
 using namespace radfoam::ipu;
 using namespace radfoam::geometry;
 using ipu_utils::logger;
+using poplar::DebugContext;
 
 // ----------------------------------------------------------------------------
 //  ctor
@@ -81,6 +83,8 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph, const poplar::Target&) {
     }
 
     getPrograms().add("zero_rays", zero_seq);
+    getPrograms().add("frame", frame_);
+
 }
 
 // ----------------------------------------------------------------------------
@@ -117,18 +121,28 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
         eng.run(getPrograms().getOrdinals().at("zero_rays"));
         eng.run(getPrograms().getOrdinals().at("write"));
         initialised_ = true;
+        exec_counter_ = 0;
+        eng.run(getPrograms().getOrdinals().at("write_exec_count"),
+            fmt::format("frame_{:03d}/write_exec_count", exec_counter_));
+        eng.run(getPrograms().getOrdinals().at("broadcast_matrices"),
+            fmt::format("frame_{:03d}/broadcast_matrices", exec_counter_));
+        eng.run(getPrograms().getOrdinals().at("write_camera_cell_info"),
+            fmt::format("frame_{:03d}/write_camera_cell_info", exec_counter_));
     }
 
     // Per‑frame updates ------------------------------------------------------
-    eng.run(getPrograms().getOrdinals().at("write_exec_count"));
-    eng.run(getPrograms().getOrdinals().at("broadcast_matrices"));
-    eng.run(getPrograms().getOrdinals().at("write_camera_cell_info"));
-    eng.run(getPrograms().getOrdinals().at("RayTraceCS"));
-    eng.run(getPrograms().getOrdinals().at("DataExchange"));
-    eng.run(getPrograms().getOrdinals().at("read_finished_rays"));
+    
+    // eng.run(getPrograms().getOrdinals().at("RayTraceCSExecution"),
+    //     fmt::format("frame_{:03d}/RayTraceCSExecution", exec_counter_));
+    // eng.run(getPrograms().getOrdinals().at("DataExchange"),
+    //     fmt::format("frame_{:03d}/DataExchange", exec_counter_));
+    // eng.run(getPrograms().getOrdinals().at("read_finished_rays"),
+    //     fmt::format("frame_{:03d}/ReadFinishedRays", exec_counter_));
 
-    if(debug_)
-        readAllTiles(eng);
+    eng.run(getPrograms().getOrdinals().at("frame"),
+            fmt::format("frame_{:03d}", exec_counter_));
+    // if(debug_)
+    //     readAllTiles(eng);
     exec_counter_++;
 }
 
@@ -204,6 +218,10 @@ void RadiantFoamIpuBuilder::createRayTraceVertices(poplar::Graph& g, poplar::Com
     const size_t kRayIOBytesPerTile = kNumRays * sizeof(Ray);
     const size_t kFinishedRayBytesPerTile = kNumRays * sizeof(FinishedRay);
 
+    // Collect per-tile local matrix clones to build one big destination tensor later
+    std::vector<poplar::Tensor> viewDests;  viewDests.reserve(kNumRayTracerTiles);
+    std::vector<poplar::Tensor> projDests;  projDests.reserve(kNumRayTracerTiles);
+
     for (size_t tid = 0; tid < kNumRayTracerTiles; ++tid) {
         // H2D tensors --------------------------------------------------------
         ipu_utils::StreamableTensor in_local (fmt::format("local_{}", tid));
@@ -225,10 +243,13 @@ void RadiantFoamIpuBuilder::createRayTraceVertices(poplar::Graph& g, poplar::Com
         auto localProj = g.clone(projMatrix_.get(), "proj_mat_t"+std::to_string(tid));
         g.setTileMapping(localView, tid);
         g.setTileMapping(localProj, tid);
-        broadcastMatrices_.add(poplar::program::Copy(viewMatrix_.get(), localView));
-        broadcastMatrices_.add(poplar::program::Copy(projMatrix_.get(), localProj));
+
         g.connect(v["view_matrix"],      localView.flatten());
         g.connect(v["projection_matrix"],localProj.flatten());
+
+        // Save flattened 1×16 views for one-shot big copy later
+        viewDests.push_back(localView.reshape({1, 16}));
+        projDests.push_back(localProj.reshape({1, 16}));
 
         // Connect point clouds / adjacency
         g.connect(v["local_pts"],    in_local.get());
@@ -279,7 +300,19 @@ void RadiantFoamIpuBuilder::createRayTraceVertices(poplar::Graph& g, poplar::Com
         zero_seq.add(poplar::program::Copy(zero_const, in_slice));
     }
 
-    getPrograms().add("RayTraceCS", poplar::program::Execute(cs));
+    // Build two big Copies (one for view, one for proj)
+    // Source: 1×16 broadcast to [kNumTiles,16]; Dest: concat of all per-tile clones → [kNumTiles,16]
+    auto srcView = viewMatrix_.get().reshape({1, 16}).broadcast(kNumRayTracerTiles, 0);
+    auto dstView = poplar::concat(viewDests, 0);
+    broadcastMatrices_.add(poplar::program::Copy(srcView, dstView, /*dontOutline*/true,
+                                                DebugContext{"broadcast_matrices/view"}));
+
+    auto srcProj = projMatrix_.get().reshape({1, 16}).broadcast(kNumRayTracerTiles, 0);
+    auto dstProj = poplar::concat(projDests, 0);
+    broadcastMatrices_.add(poplar::program::Copy(srcProj, dstProj, /*dontOutline*/true,
+                                                DebugContext{"broadcast_matrices/proj"}));
+
+    // getPrograms().add("RayTraceCSExecution", poplar::program::Execute(cs));
     getPrograms().add("broadcast_matrices", broadcastMatrices_);
     getPrograms().add("write", per_tile_writes_);
 }
@@ -330,6 +363,8 @@ void RadiantFoamIpuBuilder::createRayGenVertex(poplar::Graph& g, poplar::Compute
     g.connect(v["debugBytes"], raygenDebugBytesRead_.get());
 
     g.setTileMapping(v, kRaygenTile);
+
+    frame_.add(poplar::program::Execute(cs));
 }
 
 void RadiantFoamIpuBuilder::createRayRoutersLevel0(poplar::Graph& g, poplar::ComputeSet& cs) {
@@ -647,140 +682,206 @@ void RadiantFoamIpuBuilder::createRayRoutersLevel3(poplar::Graph& g, poplar::Com
 }
 
 void RadiantFoamIpuBuilder::createDataExchangePrograms(poplar::Graph& g) {
-    constexpr uint16_t router_tile_offset = 1024;
-    constexpr size_t   kChildrenPerRouter = 4;
-    constexpr size_t   kRayIOBytesPerTile = kNumRays * sizeof(Ray);
-    const size_t kRouterPerTileBuffer = kRayIOBytesPerTile * 5;
+  constexpr size_t   kChildrenPerRouter  = 4;
+  constexpr size_t   kRayIOBytesPerTile  = kNumRays * sizeof(Ray);
+  const     size_t   kRouterPerTileBuffer = kRayIOBytesPerTile * 5; // [parent | child0..3]
 
-    poplar::program::Sequence seq;
+  poplar::program::Sequence seq;
 
-    for (uint16_t routerId = 0; routerId < kNumL0RouterTiles; ++routerId) {
-        const size_t base = routerId * kRouterPerTileBuffer;
-        auto childOut = [&](int i){return L0RouterOut.slice(base+(i+1)*kRayIOBytesPerTile, base+(i+2)*kRayIOBytesPerTile);} ;
-        auto childIn  = [&](int i){return L0RouterIn .slice(base+(i+1)*kRayIOBytesPerTile, base+(i+2)*kRayIOBytesPerTile);} ;
+  auto childBlock = [&](poplar::Tensor &buf, uint16_t rid) -> poplar::Tensor {
+    const size_t base = static_cast<size_t>(rid) * kRouterPerTileBuffer;
+    return buf.slice(base + kRayIOBytesPerTile, base + 5 * kRayIOBytesPerTile); // slots 1..4
+  };
+  auto parentSlot = [&](poplar::Tensor &buf, uint16_t rid) -> poplar::Tensor {
+    const size_t base = static_cast<size_t>(rid) * kRouterPerTileBuffer;
+    return buf.slice(base, base + kRayIOBytesPerTile); // slot 0
+  };
 
-        // Router ‑> RayTracer
-        for (int c = 0; c < 4; ++c) {
-            uint16_t tracerTile = routerId * kChildrenPerRouter + c;
-            auto rtIn = rayTracerInputRays_.slice(tracerTile * kRayIOBytesPerTile,
-                                                  (tracerTile+1)*kRayIOBytesPerTile);
-            seq.add(poplar::program::Copy(childOut(c), rtIn));
-        }
+  // ────────────────────────────────────────────────────────────────────────────
+  // L0 children → RT input   (DOWN)   and   RT output → L0 children (UP)
+  // ────────────────────────────────────────────────────────────────────────────
+  {
+    std::vector<poplar::Tensor> srcAll, dstAll;
+    srcAll.reserve(kNumL0RouterTiles);
+    dstAll.reserve(kNumL0RouterTiles);
 
-        // RayTracer ‑> Router
-        for (int c = 0; c < 4; ++c) {
-            uint16_t tracerTile = routerId * kChildrenPerRouter + c;
-            auto rtOut = rayTracerOutputRays_.slice(tracerTile * kRayIOBytesPerTile,
-                                                    (tracerTile+1)*kRayIOBytesPerTile);
-            seq.add(poplar::program::Copy(rtOut, childIn(c)));
-        }
-
+    for (uint16_t l0 = 0; l0 < kNumL0RouterTiles; ++l0) {
+      const size_t baseRT = static_cast<size_t>(l0) * kChildrenPerRouter * kRayIOBytesPerTile;
+      srcAll.push_back(childBlock(L0RouterOut, l0)); // 4×bytes
+      dstAll.push_back(rayTracerInputRays_.slice(baseRT, baseRT + kChildrenPerRouter * kRayIOBytesPerTile));
     }
-    // -------------------------------
-    // L0 <-> L1
-    // -------------------------------
-    for (uint16_t l1_id = 0; l1_id < kNumL1RouterTiles; ++l1_id) {
-        // Each L1 router handles 4 L0 routers
-        uint16_t firstL0 = l1_id * 4; // starting L0 router index for this L1
+    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+                                  /*dontOutline*/true, DebugContext{"DX/L0->RT/down"}));
 
-        // Slices for L1 parent IO
-        const size_t l1_base = l1_id * kRouterPerTileBuffer;
-        auto l1ChildIn  = [&](int i){return L1RouterIn.slice (l1_base+(i+1)*kRayIOBytesPerTile,
-                                                            l1_base+(i+2)*kRayIOBytesPerTile);};
-        auto l1ChildOut = [&](int i){return L1RouterOut.slice(l1_base+(i+1)*kRayIOBytesPerTile,
-                                                            l1_base+(i+2)*kRayIOBytesPerTile);};
-
-        for (int c = 0; c < 4; ++c) {
-            uint16_t l0_id = firstL0 + c;
-            const size_t l0_base = l0_id * kRouterPerTileBuffer;
-
-            // L0 parentOut → L1 childIn
-            auto l0ParentOut = L0RouterOut.slice(l0_base, l0_base + kRayIOBytesPerTile);
-            seq.add(poplar::program::Copy(l0ParentOut, l1ChildIn(c)));
-
-            // L1 childOut → L0 parentIn
-            auto l0ParentIn = L0RouterIn.slice(l0_base, l0_base + kRayIOBytesPerTile);
-            seq.add(poplar::program::Copy(l1ChildOut(c), l0ParentIn));
-        }
+    srcAll.clear(); dstAll.clear();
+    for (uint16_t l0 = 0; l0 < kNumL0RouterTiles; ++l0) {
+      const size_t baseRT = static_cast<size_t>(l0) * kChildrenPerRouter * kRayIOBytesPerTile;
+      srcAll.push_back(rayTracerOutputRays_.slice(baseRT, baseRT + kChildrenPerRouter * kRayIOBytesPerTile));
+      dstAll.push_back(childBlock(L0RouterIn, l0)); // 4×bytes
     }
-    // -------------------------------
-    // L1 <-> L2 
-    // -------------------------------
-    for (uint16_t l2_id = 0; l2_id < kNumL2RouterTiles; ++l2_id) {
-        uint16_t firstL1 = l2_id * 4; // Each L2 manages 4 L1 routers
+    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+                                  /*dontOutline*/true, DebugContext{"DX/RT->L0/up"}));
+  }
 
-        // Base index for this L2 router buffers
-        const size_t l2_base = l2_id * kRouterPerTileBuffer;
+  // ────────────────────────────────────────────────────────────────────────────
+  // L0 parents → L1 children (DOWN)   and   L1 children → L0 parents (UP)
+  // ────────────────────────────────────────────────────────────────────────────
+  {
+    std::vector<poplar::Tensor> srcAll, dstAll; // DOWN
+    srcAll.reserve(kNumL1RouterTiles);
+    dstAll.reserve(kNumL1RouterTiles);
 
-        auto l2ChildIn  = [&](int i){
-            return L2RouterIn.slice(l2_base+(i+1)*kRayIOBytesPerTile,
-                                    l2_base+(i+2)*kRayIOBytesPerTile);
-        };
-        auto l2ChildOut = [&](int i){
-            return L2RouterOut.slice(l2_base+(i+1)*kRayIOBytesPerTile,
-                                    l2_base+(i+2)*kRayIOBytesPerTile);
-        };
+    for (uint16_t l1 = 0; l1 < kNumL1RouterTiles; ++l1) {
+      const size_t l1_base = l1 * kRouterPerTileBuffer;
 
-        for (int c = 0; c < 4; ++c) {
-            uint16_t l1_id = firstL1 + c;
-            const size_t l1_base = l1_id * kRouterPerTileBuffer;
+      // L1 child block (slots 1..4) is contiguous
+      poplar::Tensor l1ChildInBlock = L1RouterIn.slice(l1_base + kRayIOBytesPerTile, l1_base + 5 * kRayIOBytesPerTile);
 
-            // L1 parentOut → L2 childIn
-            auto l1ParentOut = L1RouterOut.slice(l1_base, l1_base + kRayIOBytesPerTile);
-            seq.add(poplar::program::Copy(l1ParentOut, l2ChildIn(c)));
-
-            // L2 childOut → L1 parentIn
-            auto l1ParentIn = L1RouterIn.slice(l1_base, l1_base + kRayIOBytesPerTile);
-            seq.add(poplar::program::Copy(l2ChildOut(c), l1ParentIn));
-        }
+      // Gather 4 L0 parents for this L1
+      std::array<poplar::Tensor,4> l0Parents{};
+      for (int c = 0; c < 4; ++c) {
+        const uint16_t l0 = l1 * 4 + c;
+        l0Parents[c] = parentSlot(L0RouterOut, l0);
+      }
+      srcAll.push_back(poplar::concat(l0Parents));
+      dstAll.push_back(l1ChildInBlock);
     }
-    // L2 <-> L3 exchange
-    for (uint16_t l3_id = 0; l3_id < kNumL3RouterTiles; ++l3_id) {
-        uint16_t firstL2 = l3_id * 4;
-        const size_t l3_base = l3_id * kRouterPerTileBuffer;
+    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+                                  true, DebugContext{"DX/L0->L1/down"}));
 
-        auto l3ChildIn = [&](int i){ return L3RouterIn.slice(l3_base + (i+1)*kRayIOBytesPerTile,
-                                                            l3_base + (i+2)*kRayIOBytesPerTile); };
-        auto l3ChildOut = [&](int i){ return L3RouterOut.slice(l3_base + (i+1)*kRayIOBytesPerTile,
-                                                            l3_base + (i+2)*kRayIOBytesPerTile); };
+    // UP
+    srcAll.clear(); dstAll.clear();
+    for (uint16_t l1 = 0; l1 < kNumL1RouterTiles; ++l1) {
+      const size_t l1_base = l1 * kRouterPerTileBuffer;
+      poplar::Tensor l1ChildOutBlock = L1RouterOut.slice(l1_base + kRayIOBytesPerTile, l1_base + 5 * kRayIOBytesPerTile);
 
-        for (int c = 0; c < 4; ++c) {
-            uint16_t l2_id = firstL2 + c;
-            const size_t l2_base = l2_id * kRouterPerTileBuffer;
-
-            // L2 parentOut → L3 childIn
-            auto l2ParentOut = L2RouterOut.slice(l2_base, l2_base + kRayIOBytesPerTile);
-            seq.add(poplar::program::Copy(l2ParentOut, l3ChildIn(c)));
-
-            // L3 childOut → L2 parentIn
-            auto l2ParentIn = L2RouterIn.slice(l2_base, l2_base + kRayIOBytesPerTile);
-            seq.add(poplar::program::Copy(l3ChildOut(c), l2ParentIn));
-        }
+      std::array<poplar::Tensor,4> l0ParentsIn{};
+      for (int c = 0; c < 4; ++c) {
+        const uint16_t l0 = l1 * 4 + c;
+        l0ParentsIn[c] = parentSlot(L0RouterIn, l0);
+      }
+      srcAll.push_back(l1ChildOutBlock);
+      dstAll.push_back(poplar::concat(l0ParentsIn));
     }
-    // -------------------------------
-    // L3 <-> RayGen (acts as L4 router)
-    // -------------------------------
+    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+                                  true, DebugContext{"DX/L1->L0/up"}));
+  }
 
-    auto rayGenChildOut = [&](int i) {
-        return raygenOutput.slice(i * kRayIOBytesPerTile, (i + 1) * kRayIOBytesPerTile);};
+  // ────────────────────────────────────────────────────────────────────────────
+  // L1 parents → L2 children (DOWN)   and   L2 children → L1 parents (UP)
+  // ────────────────────────────────────────────────────────────────────────────
+  {
+    std::vector<poplar::Tensor> srcAll, dstAll; // DOWN
+    srcAll.reserve(kNumL2RouterTiles);
+    dstAll.reserve(kNumL2RouterTiles);
 
-    auto rayGenChildIn = [&](int i) {
-        return raygenInput.slice(i * kRayIOBytesPerTile, (i + 1) * kRayIOBytesPerTile);};
+    for (uint16_t l2 = 0; l2 < kNumL2RouterTiles; ++l2) {
+      const size_t l2_base = l2 * kRouterPerTileBuffer;
+      poplar::Tensor l2ChildInBlock = L2RouterIn.slice(l2_base + kRayIOBytesPerTile, l2_base + 5 * kRayIOBytesPerTile);
 
-    for (uint16_t l3_id = 0; l3_id < kNumL3RouterTiles; ++l3_id) {
-        // Connect RayGen outputs → L3 parent inputs
-        const size_t l3_base = l3_id * kRouterPerTileBuffer;
-
-        auto l3ParentIn = L3RouterIn.slice(l3_base, l3_base + kRayIOBytesPerTile);
-        seq.add(poplar::program::Copy(rayGenChildOut(l3_id), l3ParentIn));
-
-        // Connect L3 parent outputs → RayGen inputs
-        auto l3ParentOut = L3RouterOut.slice(l3_base, l3_base + kRayIOBytesPerTile);
-        seq.add(poplar::program::Copy(l3ParentOut, rayGenChildIn(l3_id)));
+      std::array<poplar::Tensor,4> l1Parents{};
+      for (int c = 0; c < 4; ++c) {
+        const uint16_t l1 = l2 * 4 + c;
+        l1Parents[c] = parentSlot(L1RouterOut, l1);
+      }
+      srcAll.push_back(poplar::concat(l1Parents));
+      dstAll.push_back(l2ChildInBlock);
     }
+    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+                                  true, DebugContext{"DX/L1->L2/down"}));
 
-    getPrograms().add("DataExchange", seq);
+    // UP
+    srcAll.clear(); dstAll.clear();
+    for (uint16_t l2 = 0; l2 < kNumL2RouterTiles; ++l2) {
+      const size_t l2_base = l2 * kRouterPerTileBuffer;
+      poplar::Tensor l2ChildOutBlock = L2RouterOut.slice(l2_base + kRayIOBytesPerTile, l2_base + 5 * kRayIOBytesPerTile);
+
+      std::array<poplar::Tensor,4> l1ParentsIn{};
+      for (int c = 0; c < 4; ++c) {
+        const uint16_t l1 = l2 * 4 + c;
+        l1ParentsIn[c] = parentSlot(L1RouterIn, l1);
+      }
+      srcAll.push_back(l2ChildOutBlock);
+      dstAll.push_back(poplar::concat(l1ParentsIn));
+    }
+    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+                                  true, DebugContext{"DX/L2->L1/up"}));
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // L2 parents → L3 children (DOWN)   and   L3 children → L2 parents (UP)
+  // ────────────────────────────────────────────────────────────────────────────
+  {
+    std::vector<poplar::Tensor> srcAll, dstAll; // DOWN
+    srcAll.reserve(kNumL3RouterTiles);
+    dstAll.reserve(kNumL3RouterTiles);
+
+    for (uint16_t l3 = 0; l3 < kNumL3RouterTiles; ++l3) {
+      const size_t l3_base = l3 * kRouterPerTileBuffer;
+      poplar::Tensor l3ChildInBlock = L3RouterIn.slice(l3_base + kRayIOBytesPerTile, l3_base + 5 * kRayIOBytesPerTile);
+
+      std::array<poplar::Tensor,4> l2Parents{};
+      for (int c = 0; c < 4; ++c) {
+        const uint16_t l2 = l3 * 4 + c;
+        l2Parents[c] = parentSlot(L2RouterOut, l2);
+      }
+      srcAll.push_back(poplar::concat(l2Parents));
+      dstAll.push_back(l3ChildInBlock);
+    }
+    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+                                  true, DebugContext{"DX/L2->L3/down"}));
+
+    // UP
+    srcAll.clear(); dstAll.clear();
+    for (uint16_t l3 = 0; l3 < kNumL3RouterTiles; ++l3) {
+      const size_t l3_base = l3 * kRouterPerTileBuffer;
+      poplar::Tensor l3ChildOutBlock = L3RouterOut.slice(l3_base + kRayIOBytesPerTile, l3_base + 5 * kRayIOBytesPerTile);
+
+      std::array<poplar::Tensor,4> l2ParentsIn{};
+      for (int c = 0; c < 4; ++c) {
+        const uint16_t l2 = l3 * 4 + c;
+        l2ParentsIn[c] = parentSlot(L2RouterIn, l2);
+      }
+      srcAll.push_back(l3ChildOutBlock);
+      dstAll.push_back(poplar::concat(l2ParentsIn));
+    }
+    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+                                  true, DebugContext{"DX/L3->L2/up"}));
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // L3 parent ↔ RayGen child   (DOWN: RG→L3 parent,  UP: L3 parent→RG)
+  // ────────────────────────────────────────────────────────────────────────────
+  {
+    std::vector<poplar::Tensor> srcAll, dstAll; // DOWN (RG -> L3 parentIn)
+    srcAll.reserve(kNumL3RouterTiles);
+    dstAll.reserve(kNumL3RouterTiles);
+
+    for (uint16_t l3 = 0; l3 < kNumL3RouterTiles; ++l3) {
+      const size_t base = l3 * kRayIOBytesPerTile;
+      srcAll.push_back(raygenOutput.slice(base, base + kRayIOBytesPerTile)); // RG child out (index = l3)
+      dstAll.push_back(parentSlot(L3RouterIn, l3));                          // L3 parentIn
+    }
+    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+                                  true, DebugContext{"DX/RG->L3/down"}));
+
+    // UP (L3 parentOut -> RG childIn)
+    srcAll.clear(); dstAll.clear();
+    for (uint16_t l3 = 0; l3 < kNumL3RouterTiles; ++l3) {
+      const size_t base = l3 * kRayIOBytesPerTile;
+      srcAll.push_back(parentSlot(L3RouterOut, l3));                         // L3 parentOut
+      dstAll.push_back(raygenInput.slice(base, base + kRayIOBytesPerTile));  // RG child in (index = l3)
+    }
+    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+                                  true, DebugContext{"DX/L3->RG/up"}));
+  }
+
+  // Register the program (use this if you still call it by name from execute())
+    //   getPrograms().add("DataExchange", seq);
+
+  frame_.add(seq);
 }
+
 
 void RadiantFoamIpuBuilder::setupHostStreams(poplar::Graph& g) {
     framebuffer_host.resize(kTileFramebufferSize * kNumRayTracerTiles);
@@ -793,7 +894,8 @@ void RadiantFoamIpuBuilder::setupHostStreams(poplar::Graph& g) {
     getPrograms().add("read_result_u16", result_u16_read_.buildRead(g,true));
 
     finishedRaysHost_.resize(kNumRayTracerTiles * kNumRays * sizeof(FinishedRay));
-    getPrograms().add("read_finished_rays", finishedRaysRead_.buildRead(g,true));
+    // getPrograms().add("read_finished_rays", finishedRaysRead_.buildRead(g,true));
+    frame_.add(finishedRaysRead_.buildRead(g,true));
 
     l0routerDebugBytesHost_.resize(kNumL0RouterTiles * kRouterDebugSize);
     getPrograms().add("read_l0_router_debug_bytes", l0routerDebugBytesRead_.buildRead(g,true));
@@ -850,7 +952,7 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
             }
         }
     }
-    
+
     // {
     //     auto targetrouters = {2, 3};
     //     for(const auto& targetRouter : targetrouters) {

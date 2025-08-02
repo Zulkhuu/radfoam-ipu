@@ -279,12 +279,13 @@ public:
   poplar::Output<poplar::Vector<uint8_t>> childRaysOut2;
   poplar::Output<poplar::Vector<uint8_t>> childRaysOut3;
 
-  poplar::Input<unsigned> exec_count; 
+  poplar::InOut<unsigned> exec_count; 
   poplar::Input<poplar::Vector<uint8_t>> camera_cell_info;
 
   poplar::Output<poplar::Vector<uint8_t>> debugBytes;
 
   bool compute() {
+    *exec_count = exec_count+1;
     constexpr int RaySize = sizeof(Ray);  
     constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
     const uint16_t childClusterIds[4] = {0, 256, 512, 768};
