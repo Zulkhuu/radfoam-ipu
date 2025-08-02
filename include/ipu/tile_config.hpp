@@ -32,11 +32,13 @@ constexpr std::size_t kNumRays = 2080;
 // -----------------------------------------------------------------------------
 // Tile dimensions (pixels)
 // -----------------------------------------------------------------------------
-constexpr std::size_t kTileImageWidth  = 20; // kFullImageWidth  / kNumRayTracerTilesX;
-constexpr std::size_t kTileImageHeight = 15; // kFullImageHeight / kNumRayTracerTilesY;
+constexpr std::size_t kTileImageWidth  = kFullImageWidth  / kNumRayTracerTilesX;
+constexpr std::size_t kTileImageHeight = kFullImageHeight / kNumRayTracerTilesY;
 
 // Per-tile framebuffer size (RGB: 3 bytes per pixel)
-constexpr std::size_t kTileFramebufferSize = 20 * 15 * 3; // kTileImageWidth * kTileImageHeight * 3;
+constexpr std::size_t kTileFramebufferSize = kTileImageWidth * kTileImageHeight * 3;
+// 40 * 24 * 3; for 1280x768
+// 20 * 15 * 3; for 640x480
 
 
 // -----------------------------------------------------------------------------

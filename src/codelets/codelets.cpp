@@ -79,8 +79,8 @@ public:
     glm::vec3 rayOrigin = glm::vec3(invView[3]);
 
     auto computeRayDir = [&](uint16_t x, uint16_t y) __attribute__((always_inline)) -> glm::vec3 {
-      float ndcX = (2.0f * x) / 640.0f - 1.0f;
-      float ndcY = 1.0f - (2.0f * y) / 480.0f;
+      float ndcX = (2.0f * x) / kFullImageWidth - 1.0f;
+      float ndcY = 1.0f - (2.0f * y) / kFullImageHeight;
       glm::vec4 clipRay(ndcX, ndcY, -1.0f, 1.0f);
       glm::vec4 eyeRay = invProj * clipRay;
       eyeRay.z = -1.0f;
@@ -155,13 +155,19 @@ public:
           if (dotND <= 0.0f) continue;
 
           float t = glm::dot(faceOrigin - rayOrigin, faceNormal) / dotND;
-          if (t > 0 && t < closestT) {
+          if (t > 0 && t < closestT  && t >= t0) {
             closestT = t;
             nextIdx = neighborIdx;
           }
         }
 
+        // // Guard for stuck rays
+        // if (steps > 1050) {
+        //   nextIdx = -1;
+        // }
+
         // Accumulate color
+        // float delta = __builtin_fmaxf(0.0f, closestT - t0);
         float delta = closestT - t0;
         float alpha = 1.0f - expf(-cur_cell->density * delta);
         // color += transmittance * alpha *
@@ -213,6 +219,7 @@ public:
         }
 
         ++steps;
+        t0 = __builtin_fmaxf(t0, closestT);
         current = nextIdx;
       }
 
@@ -337,13 +344,14 @@ public:
     };
 
     const int interval = 3;
+    const int nRowsPerFrame = 2;
     if(exec_count%interval == 0) {
       // Ray genRay{};
       // uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
       // uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
-      // genRay.x = 4;
-      // genRay.y = 161;
+      // genRay.x = 343;
+      // genRay.y = 428;
       // genRay.r = 0.0f;
       // genRay.g = 0.0f;
       // genRay.b = 0.0f;
@@ -353,15 +361,14 @@ public:
       // genRay.next_local   = local_id;
       // routeRay(&genRay);
 
-
-      for(uint16_t x=0; x<640; x++) {
-        for(uint16_t y=0; y<2; y++) {
+      for(uint16_t x=0; x<kFullImageWidth; x++) {
+        for(uint16_t y=0; y<nRowsPerFrame; y++) {
           Ray genRay{};
           uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
           uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
-          genRay.x = x; //(x+(exec_count/interval)*3)%640;
-          genRay.y = (y+(exec_count/interval)*2)%480;
+          genRay.x = x; //(x+(exec_count/interval)*3)%kFullImageWidth;
+          genRay.y = (y+(exec_count/interval)*nRowsPerFrame)%kFullImageHeight;
           genRay.r = 0.0f;
           genRay.g = 0.0f;
           genRay.b = 0.0f;
@@ -373,6 +380,26 @@ public:
           routeRay(&genRay);
         }
       }
+
+      // for(uint16_t x=310; x<350; x++) {
+      //   for(uint16_t y=390; y<420; y++) {
+      //     Ray genRay{};
+      //     uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
+      //     uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
+
+      //     genRay.x = x;
+      //     genRay.y = y;
+      //     genRay.r = 0.0f;
+      //     genRay.g = 0.0f;
+      //     genRay.b = 0.0f;
+      //     genRay.t = 0.0f;
+      //     genRay.transmittance = 1.0f;
+      //     genRay.next_cluster = cluster_id;
+      //     genRay.next_local   = local_id;
+
+      //     routeRay(&genRay);
+      //   }
+      // }
 
     } 
 

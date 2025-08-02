@@ -80,7 +80,8 @@ inline cv::Vec3b mapTtoHSV(float t) {
 
 // Assemble full image from finished rays buffer, persistent between frames
 static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRaysHost, int mode) {
-    static cv::Mat img(kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0)); 
+    static cv::Mat rgb_img(kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0)); 
+    static cv::Mat depth_img(kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0)); 
     // Retains previous content across calls
 
     const size_t numFinishedRays = finishedRaysHost.size() / sizeof(FinishedRay);
@@ -93,29 +94,30 @@ static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRay
         if (r.x >= kFullImageWidth || r.y >= kFullImageHeight) continue;
 
         // Update pixel color in persistent image
-        if(mode == 0) {
-          cv::Vec3b& pixel = img.at<cv::Vec3b>(r.y, r.x);
-          pixel[0] = r.b; // B
-          pixel[1] = r.g; // G
-          pixel[2] = r.r; // R
-        } else if (mode == 1) {
-          // Convert t to HSV color
-          cv::Vec3b hsv = mapTtoHSV(r.t);
-  
-          // Convert HSV to BGR (OpenCV expects H,S,V format in 8-bit)
-          cv::Mat hsvMat(1, 1, CV_8UC3, hsv);
-          cv::Mat bgrMat;
-          cv::cvtColor(hsvMat, bgrMat, cv::COLOR_HSV2BGR);
-  
-          // Assign pixel color
-          img.at<cv::Vec3b>(r.y, r.x) = bgrMat.at<cv::Vec3b>(0, 0);
-        }
+        cv::Vec3b& pixel = rgb_img.at<cv::Vec3b>(r.y, r.x);
+        pixel[0] = r.b; // B
+        pixel[1] = r.g; // G
+        pixel[2] = r.r; // R
+
+        // Convert t to HSV color
+        cv::Vec3b hsv = mapTtoHSV(r.t);
+
+        // Convert HSV to BGR (OpenCV expects H,S,V format in 8-bit)
+        cv::Mat hsvMat(1, 1, CV_8UC3, hsv);
+        cv::Mat bgrMat;
+        cv::cvtColor(hsvMat, bgrMat, cv::COLOR_HSV2BGR);
+
+        // Assign pixel color
+        depth_img.at<cv::Vec3b>(r.y, r.x) = bgrMat.at<cv::Vec3b>(0, 0);
 
 				// fmt::print("Ray {:3}: (x={}, y={}) RGB=({}, {}, {})\n",
         //                i, r.x, r.y, r.r, r.g, r.b);
     }
 
-    return img; // Returns reference (copy-on-write in OpenCV)
+    if(mode == 0) 
+      return rgb_img;
+    else
+      return depth_img;
 }
 
 
@@ -129,12 +131,6 @@ int main(int argc, char** argv) {
   //   glm::vec4(-0.000000f, -0.000000f, -6.700000f, 1.000000f)
 	// );
 
-	// glm::mat4 ProjectionMatrix(
-  //   glm::vec4(1.299038f, 0.000000f,  0.000000f,  0.000000f),
-  //   glm::vec4(0.000000f, 1.732051f,  0.000000f,  0.000000f),
-  //   glm::vec4(0.000000f, 0.000000f, -1.002002f, -1.000000f),
-  //   glm::vec4(0.000000f, 0.000000f, -0.200200f,  0.000000f)
-	// );
 	// glm::mat4 ViewMatrix(
   //   glm::vec4(-0.034899458f,  0.000000000f, -0.999390781f, 0.000000000f),
   //   glm::vec4( 0.484514207f, -0.874619782f, -0.016919592f, 0.000000000f),
@@ -142,12 +138,6 @@ int main(int argc, char** argv) {
   //   glm::vec4(-0.000000000f, -0.000000000f, -6.699999809f, 1.000000000f)
 	// );
 
-	// glm::mat4 ProjectionMatrix(
-	// 	glm::vec4(1.299038053f, 0.000000000f,  0.000000000f,  0.000000000f),
-	// 	glm::vec4(0.000000000f, 1.732050657f,  0.000000000f,  0.000000000f),
-	// 	glm::vec4(0.000000000f, 0.000000000f, -1.002002001f, -1.000000000f),
-	// 	glm::vec4(0.000000000f, 0.000000000f, -0.200200200f,  0.000000000f)
-	// );
   glm::mat4 ViewMatrix(
       glm::vec4(-0.995107710f,  0.000000000f,  0.098795786f, 0.000000000f),
       glm::vec4(-0.067882277f, -0.726565778f, -0.683735430f, 0.000000000f),
@@ -178,7 +168,6 @@ int main(int argc, char** argv) {
 	options.add_options()
     ("i,input", "Input HDF5 file", cxxopts::value<std::string>()->default_value("./data/garden.h5"))
     ("t,tile", "Tile to debug", cxxopts::value<int>()->default_value("0"))
-    ("m,mode", "Display mode rgb/depth", cxxopts::value<int>()->default_value("0"))
     ("no-ui", "Disable UI server", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("debug", "Enable debug reporting", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("p,port", "UI port", cxxopts::value<int>()->default_value("5000"))
@@ -193,7 +182,7 @@ int main(int argc, char** argv) {
 
 	std::string inputFile = result["input"].as<std::string>();
 	int tileToDebug = result["tile"].as<int>();
-	int vis_mode = result["mode"].as<int>();
+	int vis_mode = 0;
 	bool enableUI = !result["no-ui"].as<bool>();
 	bool enableDebug = result["debug"].as<bool>();
 	int uiPort = result["port"].as<int>();
@@ -270,7 +259,6 @@ int main(int argc, char** argv) {
   std::unique_ptr<InterfaceServer> uiServer;
   InterfaceServer::State state;
   state.fov    = glm::radians(40.f);
-  state.device = "cpu"; // Could parameterize if needed
 
 	if (enableUI && uiPort) {
     uiServer = std::make_unique<InterfaceServer>(uiPort);
@@ -305,7 +293,15 @@ int main(int argc, char** argv) {
 		builder.updateProjectionMatrix(inverseProj);
 		builder.updateCameraCell(camera_cell);
 
-		if (enableUI) hostProcessing.waitForCompletion();
+		if (enableUI) {
+      hostProcessing.waitForCompletion();
+      state = uiServer->consumeState();
+      if (state.device == "rgb") {
+        vis_mode = 0;
+      } else if(state.device == "depth") {
+        vis_mode = 1;
+      }
+    }
 		mgr.execute(builder);
 		// *imagePtr = AssembleFullImage(builder.framebuffer_host);
 		*imagePtr = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
