@@ -6,6 +6,12 @@
 // Utility macro for logging inside the class implementation
 #define RF_LOG(...) ipu_utils::logger()->info(__VA_ARGS__)
 
+template <typename T>
+static void SetInit(poplar::Graph& g, const poplar::Tensor& t, T value) {
+  std::vector<T> tmp(t.numElements(), value);
+  g.setInitialValue(t, poplar::ArrayRef<T>(tmp));
+}
+
 using namespace radfoam::ipu;
 using namespace radfoam::geometry;
 using namespace radfoam::config;
@@ -57,11 +63,8 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& graph, const poplar::Target&) {
     buildRayRoutersL2(graph, cs);
     buildRayRoutersL3(graph, cs);
     buildRayGenerator(graph, cs);
-    
     buildDataExchange(graph);
     setupHostStreams(graph);
-
-    getPrograms().add("zero_rays", zero_seq);
 
     poplar::program::Sequence frame_;
     frame_.add(poplar::program::Repeat(kSubsteps, frameStep_));
@@ -77,7 +80,6 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
     if (exec_counter_ == 0) {
         connectHostStreams(eng);
 
-        eng.run(getPrograms().getOrdinals().at("zero_rays"));
         eng.run(getPrograms().getOrdinals().at("write_scene_data"));
         eng.run(getPrograms().getOrdinals().at("broadcast_matrices"),
             fmt::format("frame_{:03d}/broadcast_matrices", exec_counter_));
@@ -158,12 +160,6 @@ void RadiantFoamIpuBuilder::allocateGlobalTensors(poplar::Graph& g) {
     projMatrix_.buildTensor(g, poplar::FLOAT, {4,4});
     g.setTileMapping(projMatrix_.get(), 0);
     broadcastMatrices_.add(projMatrix_.buildWrite(g, true));
-
-    zero_const = g.addConstant(poplar::UNSIGNED_CHAR, {kRayIOBytesPerTile}, 0xFF);
-    g.setTileMapping(zero_const, kRaygenTile);
-
-    zero_constf = g.addConstant(poplar::UNSIGNED_CHAR, {kFinishedRayBytesPerTile}, 0xFF);
-    g.setTileMapping(zero_constf, kRaygenTile);
 }
 
 void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet& cs) {
@@ -173,7 +169,9 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
 
     rayTracerOutputRays_ = g.addVariable(poplar::UNSIGNED_CHAR, {kRayTracerIoBytesAllTiles}, "rt_out");
     rayTracerInputRays_  = g.addVariable(poplar::UNSIGNED_CHAR, {kRayTracerIoBytesAllTiles}, "rt_in");
-    
+    SetInit<uint8_t>(g, rayTracerOutputRays_,  0xFF);
+    SetInit<uint8_t>(g, rayTracerInputRays_,  0xFF);
+
     std::vector<poplar::Tensor> viewDests;  
     viewDests.reserve(kNumRayTracerTiles);
 
@@ -256,9 +254,6 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
         local_tensors_.push_back(std::move(in_local));
         neighbor_tensors_.push_back(std::move(in_nbr));
         adj_tensors_.push_back(std::move(in_adj));
-
-        zero_seq.add(poplar::program::Copy(zero_const, out_slice));
-        zero_seq.add(poplar::program::Copy(zero_const, in_slice));
     }
 
     // Source: 1×16 broadcast to [kNumTiles,16]; Dest: concat of all per-tile clones → [kNumTiles,16]
@@ -281,6 +276,8 @@ void RadiantFoamIpuBuilder::buildRayGenerator(poplar::Graph& g, poplar::ComputeS
     const size_t kRayIOBytesPerTile = kNumRays * sizeof(Ray);
     raygenInput  = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile*4}, "raygen_in");
     raygenOutput = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile*4}, "raygen_out");
+    SetInit<uint8_t>(g, raygenInput,  0xFF);
+    SetInit<uint8_t>(g, raygenOutput,  0xFF);
     g.setTileMapping(raygenInput,  kRaygenTile);
     g.setTileMapping(raygenOutput, kRaygenTile);
 
@@ -300,10 +297,6 @@ void RadiantFoamIpuBuilder::buildRayGenerator(poplar::Graph& g, poplar::ComputeS
         // Output slice (RayGen → L3 routers)
         auto outSlice = sliceOut(i);
         g.connect(v[fmt::format("childRaysOut{}", i)], outSlice);
-
-        // Zero-sequence initialization (invalidate buffers)
-        zero_seq.add(poplar::program::Copy(zero_const, inSlice));
-        zero_seq.add(poplar::program::Copy(zero_const, outSlice));
     }
     
     cameraCellInfo_.buildTensor(g, poplar::UNSIGNED_CHAR,{4});
@@ -333,6 +326,8 @@ void RadiantFoamIpuBuilder::buildRayRoutersL0(poplar::Graph& g, poplar::ComputeS
 
     L0RouterOut = g.addVariable(poplar::UNSIGNED_CHAR,{kTotalBuffer},"router_out");
     L0RouterIn  = g.addVariable(poplar::UNSIGNED_CHAR,{kTotalBuffer},"router_in");
+    SetInit<uint8_t>(g, L0RouterOut,  0xFF);
+    SetInit<uint8_t>(g, L0RouterIn,  0xFF);
 
     l0routerDebugRead_.buildTensor(g, poplar::UNSIGNED_CHAR,{kNumL0RouterTiles,kRouterDebugSize});
     poputil::mapTensorLinearlyWithOffset(g,
@@ -363,8 +358,6 @@ void RadiantFoamIpuBuilder::buildRayRoutersL0(poplar::Graph& g, poplar::ComputeS
         g.setTileMapping(parentOut, tile);
         g.connect(v["parentRaysIn" ], parentIn);
         g.connect(v["parentRaysOut"], parentOut);
-        zero_seq.add(poplar::program::Copy(zero_const, parentIn));
-        zero_seq.add(poplar::program::Copy(zero_const, parentOut));
 
         for (int i = 0; i < 4; ++i) {
             auto in  = sliceIn(i+1);
@@ -373,8 +366,6 @@ void RadiantFoamIpuBuilder::buildRayRoutersL0(poplar::Graph& g, poplar::ComputeS
             g.setTileMapping(out, tile);
             g.connect(v[fmt::format("childRaysIn{}",  i)], in);
             g.connect(v[fmt::format("childRaysOut{}", i)], out);
-            zero_seq.add(poplar::program::Copy(zero_const, in));
-            zero_seq.add(poplar::program::Copy(zero_const, out));
         }
 
         // Constant child cluster IDs (4)
@@ -405,6 +396,8 @@ void RadiantFoamIpuBuilder::buildRayRoutersL1(poplar::Graph& g, poplar::ComputeS
 
     L1RouterOut = g.addVariable(poplar::UNSIGNED_CHAR, {kTotalBuffer}, "l1_router_out");
     L1RouterIn  = g.addVariable(poplar::UNSIGNED_CHAR, {kTotalBuffer}, "l1_router_in");
+    SetInit<uint8_t>(g, L1RouterOut,  0xFF);
+    SetInit<uint8_t>(g, L1RouterIn,  0xFF);
 
     l1routerDebugRead_.buildTensor(g, poplar::UNSIGNED_CHAR,{kNumL1RouterTiles,kRouterDebugSize});
     poputil::mapTensorLinearlyWithOffset(g,
@@ -438,8 +431,6 @@ void RadiantFoamIpuBuilder::buildRayRoutersL1(poplar::Graph& g, poplar::ComputeS
         g.setTileMapping(parentOut, tile);
         g.connect(v["parentRaysIn" ], parentIn);
         g.connect(v["parentRaysOut"], parentOut);
-        zero_seq.add(poplar::program::Copy(zero_const, parentIn));
-        zero_seq.add(poplar::program::Copy(zero_const, parentOut));
 
         // Child buffers
         for (int i = 0; i < 4; ++i) {
@@ -449,9 +440,6 @@ void RadiantFoamIpuBuilder::buildRayRoutersL1(poplar::Graph& g, poplar::ComputeS
             g.setTileMapping(out, tile);
             g.connect(v[fmt::format("childRaysIn{}",  i)], in);
             g.connect(v[fmt::format("childRaysOut{}", i)], out);
-            
-            zero_seq.add(poplar::program::Copy(zero_const, in));
-            zero_seq.add(poplar::program::Copy(zero_const, out));
         }
 
         // Child cluster IDs
@@ -486,6 +474,8 @@ void RadiantFoamIpuBuilder::buildRayRoutersL2(poplar::Graph& g, poplar::ComputeS
     // Allocate IO tensors
     L2RouterOut = g.addVariable(poplar::UNSIGNED_CHAR, {kTotalBuffer}, "l2_router_out");
     L2RouterIn  = g.addVariable(poplar::UNSIGNED_CHAR, {kTotalBuffer}, "l2_router_in");
+    SetInit<uint8_t>(g, L2RouterOut,  0xFF);
+    SetInit<uint8_t>(g, L2RouterIn, 0xFF);
 
     // Debug bytes
     l2routerDebugRead_.buildTensor(g, poplar::UNSIGNED_CHAR, {kNumL2RouterTiles, kRouterDebugSize});
@@ -520,8 +510,6 @@ void RadiantFoamIpuBuilder::buildRayRoutersL2(poplar::Graph& g, poplar::ComputeS
         g.setTileMapping(parentOut, tile);
         g.connect(v["parentRaysIn"], parentIn);
         g.connect(v["parentRaysOut"], parentOut);
-        zero_seq.add(poplar::program::Copy(zero_const, parentIn));
-        zero_seq.add(poplar::program::Copy(zero_const, parentOut));
 
         // Child IO
         for (int i = 0; i < 4; ++i) {
@@ -531,8 +519,6 @@ void RadiantFoamIpuBuilder::buildRayRoutersL2(poplar::Graph& g, poplar::ComputeS
             g.setTileMapping(out, tile);
             g.connect(v[fmt::format("childRaysIn{}", i)], in);
             g.connect(v[fmt::format("childRaysOut{}", i)], out);
-            zero_seq.add(poplar::program::Copy(zero_const, in));
-            zero_seq.add(poplar::program::Copy(zero_const, out));
         }
 
         // Child cluster IDs
@@ -566,6 +552,8 @@ void RadiantFoamIpuBuilder::buildRayRoutersL3(poplar::Graph& g, poplar::ComputeS
 
     L3RouterOut = g.addVariable(poplar::UNSIGNED_CHAR, {kTotalBuffer}, "l3_router_out");
     L3RouterIn  = g.addVariable(poplar::UNSIGNED_CHAR, {kTotalBuffer}, "l3_router_in");
+    SetInit<uint8_t>(g, L3RouterOut,  0xFF);
+    SetInit<uint8_t>(g, L3RouterIn, 0xFF);
 
     l3routerDebugRead_.buildTensor(g, poplar::UNSIGNED_CHAR, {kNumL3RouterTiles, kRouterDebugSize});
     poputil::mapTensorLinearlyWithOffset(
@@ -601,8 +589,6 @@ void RadiantFoamIpuBuilder::buildRayRoutersL3(poplar::Graph& g, poplar::ComputeS
         g.setTileMapping(parentOut, tile);
         g.connect(v["parentRaysIn"], parentIn);
         g.connect(v["parentRaysOut"], parentOut);
-        zero_seq.add(poplar::program::Copy(zero_const, parentIn));
-        zero_seq.add(poplar::program::Copy(zero_const, parentOut));
 
         // Child IO
         for (int i = 0; i < 4; ++i) {
@@ -612,8 +598,6 @@ void RadiantFoamIpuBuilder::buildRayRoutersL3(poplar::Graph& g, poplar::ComputeS
             g.setTileMapping(out, tile);
             g.connect(v[fmt::format("childRaysIn{}", i)], in);
             g.connect(v[fmt::format("childRaysOut{}", i)], out);
-            zero_seq.add(poplar::program::Copy(zero_const, in));
-            zero_seq.add(poplar::program::Copy(zero_const, out));
         }
 
         // Child cluster IDs

@@ -99,8 +99,6 @@ private:
     poplar::Tensor L3RouterIn; 
     poplar::Tensor raygenOutput;
     poplar::Tensor raygenInput;
-    poplar::Tensor zero_const;
-    poplar::Tensor zero_constf;
 
     std::vector<ipu_utils::StreamableTensor> local_tensors_;
     std::vector<ipu_utils::StreamableTensor> neighbor_tensors_;
