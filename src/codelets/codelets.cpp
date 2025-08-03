@@ -3,9 +3,10 @@
 #include <glm/mat4x4.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <geometry/primitives.hpp>
-#include <ipu/tile_config.hpp>
+#include <ipu/rf_config.hpp>
 
 using namespace radfoam::geometry;
+using namespace radfoam::config;
 
 // static const glm::mat4 View2(
 //     glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),

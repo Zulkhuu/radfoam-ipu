@@ -10,7 +10,7 @@
 
 #include "io/hdf5_types.hpp"
 #include "geometry/primitives.hpp"   // GenericPoint, LocalPoint
-#include "ipu/tile_config.hpp"       // kNumRayTracerTiles
+#include "ipu/rf_config.hpp" 
 #include "util/nanoflann.hpp"
 
 class KDTreeManager {
@@ -56,7 +56,7 @@ private:
     using namespace radfoam::geometry;
     HighFive::File f(h5, HighFive::File::ReadOnly);
     pts_.clear();
-    for (size_t tid=0; tid<kNumRayTracerTiles; ++tid) {
+    for (size_t tid=0; tid<radfoam::config::kNumRayTracerTiles; ++tid) {
       auto g = f.getGroup(fmt::format("part{:04}", tid));
       std::vector<LocalPoint> locals; g.getDataSet("local_pts").read(locals);
       for (size_t i=0;i<locals.size();++i) {

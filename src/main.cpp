@@ -36,13 +36,14 @@
 #include "util/debug_utils.hpp"
 #include "geometry/primitives.hpp"
 #include "ipu/ipu_utils.hpp"
-#include "ipu/tile_config.hpp"
+#include "ipu/rf_config.hpp"
 #include "util/debug_utils.hpp"
 #include "util/nanoflann.hpp"
 #include "KDTreeManager.hpp"
 #include "RadiantFoamIpuBuilder.hpp"
 
 using namespace radfoam::geometry;
+using namespace radfoam::config;
 
 using ipu_utils::logger;
 
@@ -158,9 +159,6 @@ int main(int argc, char** argv) {
       glm::vec4(0.000000000f, 0.000000000f, -0.200200200f,  0.000000000f)
   );
 
-
-	fmt::print("Ray size: {}, kNumRays: {}, buffer size: {}\n",
-       sizeof(Ray), kNumRays, kNumRays * sizeof(Ray));
   // ------------------------------
   // Profiling Trace Setup (PVTI)
   // ------------------------------
@@ -173,7 +171,7 @@ int main(int argc, char** argv) {
 
 	options.add_options()
     ("i,input", "Input HDF5 file", cxxopts::value<std::string>()->default_value("./data/garden.h5"))
-    ("t,tile", "Tile to debug", cxxopts::value<int>()->default_value("0"))
+    ("n,nruns", "Number of runs to execute 0=inf", cxxopts::value<int>()->default_value("0"))
     ("no-ui", "Disable UI server", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("debug", "Enable debug reporting", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("p,port", "UI port", cxxopts::value<int>()->default_value("5000"))
@@ -187,7 +185,7 @@ int main(int argc, char** argv) {
 	}
 
 	std::string inputFile = result["input"].as<std::string>();
-	int tileToDebug = result["tile"].as<int>();
+	int nRuns = result["nruns"].as<int>();
 	int vis_mode = 0;
 	bool enableUI = !result["no-ui"].as<bool>();
 	bool enableDebug = result["debug"].as<bool>();
@@ -228,7 +226,7 @@ int main(int argc, char** argv) {
   // ------------------------------
   // Build and Configure IPU Graph
   // ------------------------------
-  radfoam::ipu::RadiantFoamIpuBuilder builder(inputFile, tileToDebug, enableDebug);
+  radfoam::ipu::RadiantFoamIpuBuilder builder(inputFile, enableDebug);
 
   ipu_utils::RuntimeConfig cfg{
     /*numIpus=*/1,
@@ -277,13 +275,12 @@ int main(int argc, char** argv) {
 		}
 	};
 
-	int i=0;
+	int step=0;
 	do {
 		// ViewMatrix[2][2] += 2;
 		// ProjectionMatrix[2][2] += 1;
-		i++;
-		// if(i==builder.debug_chains_.size()+2) break;
-		if(i==tileToDebug) break;
+		step++;
+		if(step==nRuns) break;
 		glm::mat4 inverseView = glm::inverse(ViewMatrix);
 		glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
 		// glm::vec3 cameraPos = glm::vec3(inverseView[3]);

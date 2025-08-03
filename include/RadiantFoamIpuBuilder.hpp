@@ -1,15 +1,3 @@
-// ============================================================================
-// RadiantFoamIpuBuilder – full, refactored implementation
-//   • Stand‑alone translation unit (add to your CMakeLists/src list)
-//   • Public API identical to the original, so existing call‑sites keep working
-//   • Internal logic split into well‑named helper functions with early‑exit
-//     checks and clear ownership semantics.
-// ============================================================================
-//                         BSD‑3‑Clause License
-// ============================================================================
-// 2025‑07‑29 – Foam Refactor Team
-// ============================================================================
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  Header
 // ─────────────────────────────────────────────────────────────────────────────
@@ -36,7 +24,7 @@
 #include <poputil/TileMapping.hpp>
 
 // Local
-#include "ipu/tile_config.hpp"
+#include "ipu/rf_config.hpp"
 #include "ipu/ipu_utils.hpp"
 #include "geometry/primitives.hpp"
 #include "io/hdf5_types.hpp"
@@ -51,7 +39,7 @@ class RadiantFoamIpuBuilder final : public ipu_utils::BuilderInterface {
 public:
     /// @param h5_scene_file    Path to the baked HDF5 scene file.
     /// @param debug_tile       Optional: tile ID to emit extra debug for.
-    explicit RadiantFoamIpuBuilder(std::string h5_scene_file, int debug_tile = 0, bool debug = false);
+    explicit RadiantFoamIpuBuilder(std::string h5_scene_file, bool debug = false);
 
     // BuilderInterface -------------------------------------------------------
     void build(poplar::Graph& graph, const poplar::Target& target) override;
@@ -74,22 +62,23 @@ private:
     void loadScenePartitions();
     void registerCodeletsAndOps(poplar::Graph& g);
     void allocateGlobalTensors(poplar::Graph& g);
-    void createRayTraceVertices(poplar::Graph& g, poplar::ComputeSet& cs);
-    void createRayGenVertex(poplar::Graph& g, poplar::ComputeSet& cs);
-    void createRayRoutersLevel0(poplar::Graph& g, poplar::ComputeSet& cs);
-    void createRayRoutersLevel1(poplar::Graph& g, poplar::ComputeSet& cs);
-    void createRayRoutersLevel2(poplar::Graph& g, poplar::ComputeSet& cs);
-    void createRayRoutersLevel3(poplar::Graph& g, poplar::ComputeSet& cs);
-    void createDataExchangePrograms(poplar::Graph& g);
+    void buildRayTracers(poplar::Graph& g, poplar::ComputeSet& cs);
+    void buildRayGenerator(poplar::Graph& g, poplar::ComputeSet& cs);
+    void buildRayRoutersL0(poplar::Graph& g, poplar::ComputeSet& cs);
+    void buildRayRoutersL1(poplar::Graph& g, poplar::ComputeSet& cs);
+    void buildRayRoutersL2(poplar::Graph& g, poplar::ComputeSet& cs);
+    void buildRayRoutersL3(poplar::Graph& g, poplar::ComputeSet& cs);
+    void buildDataExchange(poplar::Graph& g);
     void setupHostStreams(poplar::Graph& g);
+    void connectHostStreams(poplar::Engine& eng);
     void readAllTiles(poplar::Engine& engine);
 
     // ───────────── members ─────────────
     // Construction‑time constants
     const std::string h5_file_;
-    const int         tile_to_debug_;
     bool debug_;
-    unsigned substeps_ = 10;
+    static constexpr int kSubsteps = 20;
+    static constexpr int kRouterDebugSize = 24;
 
     // Scene data -------------------------------------------------------------
     std::vector<std::vector<radfoam::geometry::LocalPoint>>   local_pts_;
@@ -100,53 +89,6 @@ private:
     // Poplar tensors ---------------------------------------------------------
     poplar::Tensor rayTracerOutputRays_;
     poplar::Tensor rayTracerInputRays_;
-
-    std::vector<ipu_utils::StreamableTensor> local_tensors_;
-    std::vector<ipu_utils::StreamableTensor> neighbor_tensors_;
-    std::vector<ipu_utils::StreamableTensor> adj_tensors_;
-
-    ipu_utils::StreamableTensor execCountT_{"exec_count"};
-    ipu_utils::StreamableTensor fb_read_all_{"fb_read_all"};
-    ipu_utils::StreamableTensor result_f32_read_{"result_f32_read"};
-    ipu_utils::StreamableTensor result_u16_read_{"result_u16_read"};
-    ipu_utils::StreamableTensor viewMatrix_{"view_matrix"};
-    ipu_utils::StreamableTensor projMatrix_{"proj_matrix"};
-    ipu_utils::StreamableTensor cameraCellInfo_{"camera_cell_info"};
-    ipu_utils::StreamableTensor l0routerDebugBytesRead_{"l0_router_debug_bytes_read"};
-    ipu_utils::StreamableTensor l1routerDebugBytesRead_{"l1_router_debug_bytes_read"};
-    ipu_utils::StreamableTensor l2routerDebugBytesRead_{"l2_router_debug_bytes_read"};
-    ipu_utils::StreamableTensor l3routerDebugBytesRead_{"l3_router_debug_bytes_read"};
-    ipu_utils::StreamableTensor raygenDebugBytesRead_{"raygen_debug_bytes_read"};
-    ipu_utils::StreamableTensor finishedRaysRead_{"finished_rays_read"};
-    ipu_utils::StreamableTensor rtExecCounts_{"exec_count_rt"};   
-    ipu_utils::StreamableTensor finishedWriteOffsets_{"finished_rays_write_offsets"};
-
-    // CPU‑side mirrors -------------------------------------------------------
-    bool initialised_      = false;
-    unsigned exec_counter_ = 0;
-    std::vector<float> hostViewMatrix_;
-    std::vector<float> hostProjMatrix_;
-    std::array<uint8_t, 4> hostCameraCellInfo_{{0,0,0,0}};
-    std::vector<uint8_t> l0routerDebugBytesHost_;
-    std::vector<uint8_t> l1routerDebugBytesHost_;
-    std::vector<uint8_t> l2routerDebugBytesHost_;
-    std::vector<uint8_t> l3routerDebugBytesHost_;
-    std::vector<uint8_t> raygenDebugBytesHost_;
-
-
-
-    // Helper program sequences ----------------------------------------------
-    poplar::program::Sequence per_tile_writes_;
-    poplar::program::Sequence broadcastMatrices_;
-    poplar::program::Sequence zero_seq;
-
-    poplar::program::Sequence frameStep_;
-    // poplar::program::Sequence frame_;
-
-    // Router bookkeeping -----------------------------------------------------
-    static constexpr uint16_t kRouterDebugSize = 24;
-    // std::vector<uint16_t> allClusterIds_;
-
     poplar::Tensor L0RouterOut;
     poplar::Tensor L0RouterIn; 
     poplar::Tensor L1RouterOut;
@@ -159,6 +101,44 @@ private:
     poplar::Tensor raygenInput;
     poplar::Tensor zero_const;
     poplar::Tensor zero_constf;
+
+    std::vector<ipu_utils::StreamableTensor> local_tensors_;
+    std::vector<ipu_utils::StreamableTensor> neighbor_tensors_;
+    std::vector<ipu_utils::StreamableTensor> adj_tensors_;
+
+    ipu_utils::StreamableTensor exec_counts_{"exec_count"};
+    ipu_utils::StreamableTensor fb_read_all_{"fb_read_all"};
+    ipu_utils::StreamableTensor result_f32_read_{"result_f32_read"};
+    ipu_utils::StreamableTensor result_u16_read_{"result_u16_read"};
+    ipu_utils::StreamableTensor viewMatrix_{"view_matrix"};
+    ipu_utils::StreamableTensor projMatrix_{"proj_matrix"};
+    ipu_utils::StreamableTensor cameraCellInfo_{"camera_cell_info"};
+    ipu_utils::StreamableTensor l0routerDebugRead_{"l0_router_debug_bytes_read"};
+    ipu_utils::StreamableTensor l1routerDebugRead_{"l1_router_debug_bytes_read"};
+    ipu_utils::StreamableTensor l2routerDebugRead_{"l2_router_debug_bytes_read"};
+    ipu_utils::StreamableTensor l3routerDebugRead_{"l3_router_debug_bytes_read"};
+    ipu_utils::StreamableTensor raygenDebugRead_{"raygen_debug_bytes_read"};
+    ipu_utils::StreamableTensor finishedRaysRead_{"finished_rays_read"};
+    ipu_utils::StreamableTensor finishedWriteOffsets_{"finished_rays_write_offsets"};
+
+    // CPU‑side mirrors -------------------------------------------------------
+    int exec_counter_;
+    std::vector<float> hostViewMatrix_;
+    std::vector<float> hostProjMatrix_;
+    std::array<uint8_t, 4> hostCameraCellInfo_{{0,0,0,0}};
+    std::vector<uint8_t> l0routerDebugBytesHost_;
+    std::vector<uint8_t> l1routerDebugBytesHost_;
+    std::vector<uint8_t> l2routerDebugBytesHost_;
+    std::vector<uint8_t> l3routerDebugBytesHost_;
+    std::vector<uint8_t> raygenDebugBytesHost_;
+
+    // Helper program sequences ----------------------------------------------
+    poplar::program::Sequence per_tile_writes_;
+    poplar::program::Sequence broadcastMatrices_;
+    poplar::program::Sequence zero_seq;
+    poplar::program::Sequence frameStep_;
+    // poplar::program::Sequence frame_;
+
 };
 
 } // namespace ipu
