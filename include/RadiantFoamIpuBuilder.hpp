@@ -89,6 +89,7 @@ private:
     const std::string h5_file_;
     const int         tile_to_debug_;
     bool debug_;
+    unsigned substeps_ = 10;
 
     // Scene data -------------------------------------------------------------
     std::vector<std::vector<radfoam::geometry::LocalPoint>>   local_pts_;
@@ -117,6 +118,8 @@ private:
     ipu_utils::StreamableTensor l3routerDebugBytesRead_{"l3_router_debug_bytes_read"};
     ipu_utils::StreamableTensor raygenDebugBytesRead_{"raygen_debug_bytes_read"};
     ipu_utils::StreamableTensor finishedRaysRead_{"finished_rays_read"};
+    ipu_utils::StreamableTensor rtExecCounts_{"exec_count_rt"};   
+    ipu_utils::StreamableTensor finishedWriteOffsets_{"finished_rays_write_offsets"};
 
     // CPU‑side mirrors -------------------------------------------------------
     bool initialised_      = false;
@@ -131,11 +134,14 @@ private:
     std::vector<uint8_t> raygenDebugBytesHost_;
 
 
+
     // Helper program sequences ----------------------------------------------
     poplar::program::Sequence per_tile_writes_;
     poplar::program::Sequence broadcastMatrices_;
     poplar::program::Sequence zero_seq;
-    poplar::program::Sequence frame_;
+
+    poplar::program::Sequence frameStep_;
+    // poplar::program::Sequence frame_;
 
     // Router bookkeeping -----------------------------------------------------
     static constexpr uint16_t kRouterDebugSize = 24;

@@ -86,34 +86,40 @@ static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRay
 
     const size_t numFinishedRays = finishedRaysHost.size() / sizeof(FinishedRay);
     const FinishedRay* rays = reinterpret_cast<const FinishedRay*>(finishedRaysHost.data());
-    for (size_t i = 0; i < numFinishedRays; ++i) {
-        const FinishedRay& r = rays[i];
 
-        // Skip invalid rays
-        if (r.x == 0xFFFF || r.y == 0xFFFF) continue;
-        if (r.x >= kFullImageWidth || r.y >= kFullImageHeight) continue;
+    // const size_t kNumRayTracerTiles = 1024; defined in tile_config.hpp
+    const size_t  num_finished_ray_per_tile = numFinishedRays / kNumRayTracerTiles;
+    for(size_t tid = 0; tid<kNumRayTracerTiles; tid++) {
+      for (size_t i = 0; i < num_finished_ray_per_tile; ++i) {
+          const FinishedRay& r = rays[tid*num_finished_ray_per_tile+i];
 
-        // Update pixel color in persistent image
-        cv::Vec3b& pixel = rgb_img.at<cv::Vec3b>(r.y, r.x);
-        pixel[0] = r.b; // B
-        pixel[1] = r.g; // G
-        pixel[2] = r.r; // R
+          // Skip invalid rays
+          if (r.x == 0xFFFF) break;
+          if (r.x >= kFullImageWidth || r.y >= kFullImageHeight) continue;
 
-        // Convert t to HSV color
-        cv::Vec3b hsv = mapTtoHSV(r.t);
+          // Update pixel color in persistent image
+          cv::Vec3b& pixel = rgb_img.at<cv::Vec3b>(r.y, r.x);
+          pixel[0] = r.b; // B
+          pixel[1] = r.g; // G
+          pixel[2] = r.r; // R
 
-        // Convert HSV to BGR (OpenCV expects H,S,V format in 8-bit)
-        cv::Mat hsvMat(1, 1, CV_8UC3, hsv);
-        cv::Mat bgrMat;
-        cv::cvtColor(hsvMat, bgrMat, cv::COLOR_HSV2BGR);
+          // Convert t to HSV color
+          cv::Vec3b hsv = mapTtoHSV(r.t);
 
-        // Assign pixel color
-        depth_img.at<cv::Vec3b>(r.y, r.x) = bgrMat.at<cv::Vec3b>(0, 0);
+          // Convert HSV to BGR (OpenCV expects H,S,V format in 8-bit)
+          cv::Mat hsvMat(1, 1, CV_8UC3, hsv);
+          cv::Mat bgrMat;
+          cv::cvtColor(hsvMat, bgrMat, cv::COLOR_HSV2BGR);
 
-				// fmt::print("Ray {:3}: (x={}, y={}) RGB=({}, {}, {})\n",
-        //                i, r.x, r.y, r.r, r.g, r.b);
+          // Assign pixel color
+          depth_img.at<cv::Vec3b>(r.y, r.x) = bgrMat.at<cv::Vec3b>(0, 0);
+
+          // fmt::print("Ray {:3}: (x={}, y={}) RGB=({}, {}, {})\n",
+          //                i, r.x, r.y, r.r, r.g, r.b);
+      }
+
     }
-
+    
     if(mode == 0) 
       return rgb_img;
     else
@@ -213,7 +219,7 @@ int main(int argc, char** argv) {
   poplar::OptionFlags engineOptions = {};
   if (enableDebug) {
     logger()->info("Enabling Poplar auto-reporting (POPLAR_ENGINE_OPTIONS set)");
-		setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true", "autoReport.executionProfileProgramRunCount":"10","debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
+		setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true", "autoReport.executionProfileProgramRunCount":"4","debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
     engineOptions = {{"debug.instrument", "true"}};
   } else {
 		unsetenv("POPLAR_ENGINE_OPTIONS");
@@ -303,16 +309,16 @@ int main(int argc, char** argv) {
     auto execTime = std::chrono::duration<double>(endTime - startTime).count();
     logger()->info("IPU execution time: {}", execTime);
 
-    // startTime = std::chrono::steady_clock::now();
+    startTime = std::chrono::steady_clock::now();
 		*imagePtr = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
 		std::swap(imagePtr, imagePtrBuffered);
 		if (enableUI) hostProcessing.run(uiUpdateFunc);
     
 		state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
 
-    // endTime = std::chrono::steady_clock::now();
-    // execTime = std::chrono::duration<double>(endTime - startTime).count();
-    // logger()->info("UI execution time: {}", execTime);
+    endTime = std::chrono::steady_clock::now();
+    execTime = std::chrono::duration<double>(endTime - startTime).count();
+    logger()->info("UI execution time: {}", execTime);
 	} while (!enableUI || (uiServer && !state.stop));
 
 	if (enableUI) hostProcessing.waitForCompletion();

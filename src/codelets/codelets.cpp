@@ -51,18 +51,21 @@ public:
   poplar::Input<poplar::Vector<uint8_t>> neighbor_pts;
   poplar::Input<poplar::Vector<unsigned short>> adjacency;
   poplar::Input<unsigned short> tile_id;
-
   poplar::Input<poplar::Vector<uint8_t>> raysIn;
 
   // Outputs
   poplar::Output<poplar::Vector<uint8_t>> raysOut;
   poplar::Output<poplar::Vector<uint8_t>> finishedRays;
-
-  // Framebuffer (inout for debug / tracing)
-  poplar::InOut<poplar::Vector<uint8_t>> framebuffer;
-
+  // Debug outputs
   poplar::Output<float> result_float;
   poplar::Output<unsigned short> result_u16;
+
+  // InOut
+  poplar::InOut<poplar::Vector<uint8_t>> framebuffer;
+  poplar::InOut<unsigned>       exec_count;           // increments every sub-iteration
+  poplar::InOut<unsigned>       finishedWriteOffset;  // append pointer within finishedRays
+  // poplar::Input<unsigned short> substeps;             // e.g., 10
+
 
   [[poplar::constraint("elem(*local_pts)!=elem(*framebuffer)")]]
   bool compute() {
@@ -70,8 +73,18 @@ public:
     constexpr int LocalPointSize = sizeof(LocalPoint);
     constexpr int GenericPointSize = sizeof(GenericPoint); 
 
+    constexpr unsigned substeps = 20;
+    constexpr unsigned finishedRaysCap = kNumRays * 3;
+    unsigned exec_step_id = exec_count % substeps;
+    bool startOfFrame = (exec_step_id == 0);
+
     const uint16_t nLocalPts = local_pts.size() / LocalPointSize;
     const uint16_t nNeighborPts = neighbor_pts.size() / GenericPointSize;
+
+    if (startOfFrame) {
+      *finishedWriteOffset = 0;
+      invalidateRemainingFinishedRays(finishedRays, 0);
+    }
 
     // Prepare matrices and ray origin
     glm::mat4 invView = glm::make_mat4(view_matrix.data());
@@ -88,9 +101,10 @@ public:
       return glm::normalize(glm::vec3(invView * eyeRay));
     };
 
-    int out_ray_cntr = 0;
-    int finished_ray_cntr = 0;
-    int cell_cntr = 0;
+    unsigned base = finishedWriteOffset;
+    unsigned finished_ray_cntr = 0;
+    unsigned out_ray_cntr = 0;
+    unsigned cell_cntr = 0;
     bool debug = false;
 
     *result_u16 = 65535;
@@ -183,7 +197,7 @@ public:
         if (transmittance < 0.01f || nextIdx == -1 || nextIdx >= nLocalPts) {
           if (transmittance < 0.01f || nextIdx == -1) {
             // Ray finished
-            FinishedRay* finished_ray = reinterpret_cast<FinishedRay*>(finishedRays.data() + sizeof(FinishedRay) * finished_ray_cntr);
+            FinishedRay* finished_ray = reinterpret_cast<FinishedRay*>(finishedRays.data() + sizeof(FinishedRay) * (base + finished_ray_cntr));
             finished_ray->x = ray_in->x;
             finished_ray->y = ray_in->y;
             finished_ray->r = clampToU8(color.x);
@@ -231,7 +245,14 @@ public:
 
     // Invalidate unused slots
     invalidateRemainingRays(raysOut, out_ray_cntr);
-    invalidateRemainingFinishedRays(finishedRays, finished_ray_cntr);
+    // invalidateRemainingFinishedRays(finishedRays, finished_ray_cntr);
+
+    // Update append pointer (clamped)
+    unsigned newOffset = base + finished_ray_cntr;
+    if (newOffset > finishedRaysCap) newOffset = finishedRaysCap;
+    *finishedWriteOffset = newOffset;
+
+    *exec_count = exec_count + 1;
 
     return true;
   }
@@ -253,13 +274,17 @@ private:
   void invalidateRemainingRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) {
     for (int i = count; i < kNumRays; i++) {
       Ray* ray = reinterpret_cast<Ray*>(buffer.data() + sizeof(Ray) * i);
+      if(ray->x == 0xFFFF)
+        break;
       ray->x = 0xFFFF;
     }
   }
 
-  void invalidateRemainingFinishedRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) {
-    for (int i = count; i < kNumRays; i++) {
+  inline void invalidateRemainingFinishedRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) {
+    for (int i = count; i < kNumRays*3; i++) {
       FinishedRay* ray = reinterpret_cast<FinishedRay*>(buffer.data() + sizeof(FinishedRay) * i);
+      if(ray->x == 0xFFFF)
+        break;
       ray->x = 0xFFFF;
     }
   }
@@ -285,7 +310,6 @@ public:
   poplar::Output<poplar::Vector<uint8_t>> debugBytes;
 
   bool compute() {
-    *exec_count = exec_count+1;
     constexpr int RaySize = sizeof(Ray);  
     constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
     const uint16_t childClusterIds[4] = {0, 256, 512, 768};
@@ -345,7 +369,7 @@ public:
     };
 
     const int interval = 3;
-    const int nRowsPerFrame = 2;
+    const int nRowsPerFrame = 1;
     if(exec_count%interval == 0) {
       // Ray genRay{};
       // uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
@@ -435,6 +459,7 @@ public:
     dbg[8] = outCountC2;
     dbg[9] = outCountC3;
 
+    *exec_count = exec_count+1;
     return true;
   }
 };

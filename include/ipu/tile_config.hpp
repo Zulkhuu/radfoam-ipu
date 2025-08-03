@@ -5,8 +5,8 @@
 // -----------------------------------------------------------------------------
 // Full image dimensions (pixels)
 // -----------------------------------------------------------------------------
-constexpr std::size_t kFullImageWidth  = 640;
-constexpr std::size_t kFullImageHeight = 480;
+constexpr std::size_t kFullImageWidth  = 1280;
+constexpr std::size_t kFullImageHeight = 768;
 
 // -----------------------------------------------------------------------------
 // Tile grid configuration
