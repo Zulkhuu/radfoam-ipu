@@ -16,6 +16,7 @@ message(STATUS "Poplar version ${POPLAR_VERSION_MAJOR}.${POPLAR_VERSION_MINOR}.$
 find_package(Boost REQUIRED COMPONENTS program_options unit_test_framework)
 find_package(OpenCV REQUIRED)
 find_package(spdlog REQUIRED)
+find_package(OpenMP)
 find_package(HDF5 REQUIRED COMPONENTS C HL)
 
 include(FetchContent)
@@ -65,6 +66,7 @@ target_link_libraries(main
     ${PACKETCOMMS_LIBRARIES}
     ${VIDEOLIB_LIBRARIES}
     cxxopts
+    OpenMP::OpenMP_CXX
     spdlog::spdlog
     Boost::program_options
     Boost::unit_test_framework
@@ -74,6 +76,7 @@ target_link_libraries(main
 target_compile_definitions(main
   PRIVATE POPC_PREFIX="${PROJECT_SOURCE_DIR}"
 )
+target_compile_definitions(main PRIVATE USE_OPENMP=1)
 
 target_compile_features(main PRIVATE cxx_std_20)
 

@@ -48,85 +48,79 @@ using namespace radfoam::config;
 
 using ipu_utils::logger;
 
-// -----------------------------------------------------------------------------
-// Assemble full framebuffer → cv::Mat
-static cv::Mat AssembleFullImage(const std::vector<uint8_t>& tiles) {
-  cv::Mat img(kFullImageHeight, kFullImageWidth, CV_8UC3);
-
-  for (size_t ty = 0; ty < kNumRayTracerTilesY; ++ty) {
-    for (size_t tx = 0; tx < kNumRayTracerTilesX; ++tx) {
-      const size_t idx  = ty * kNumRayTracerTilesX + tx;
-      const uint8_t* src = tiles.data() + idx * kTileFramebufferSize;
-
-      for (size_t y = 0; y < kTileImageHeight; ++y) {
-        std::memcpy(img.ptr<uint8_t>(ty * kTileImageHeight + y) +
-										tx * kTileImageWidth * 3,
-                    src + y * kTileImageWidth * 3,
-                    kTileImageWidth * 3);
-      }
-    }
-  }
-  return img;
-}
-
-inline cv::Vec3b mapTtoHSV(float t) {
-    if (t < 0) t = 0;
-    if (t > 80) t = 80;
-
-    // Map to hue range (0-179)
-    float hue = (t / 80.0f) * 179.0f;
-
-    // Full saturation and value
-    return cv::Vec3b(static_cast<uint8_t>(hue), 255, 255);
-}
-
 // Assemble full image from finished rays buffer, persistent between frames
 static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRaysHost, int mode) {
-    static cv::Mat rgb_img(kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0)); 
-    static cv::Mat depth_img(kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0)); 
-    // Retains previous content across calls
+  // Persistent images (kept across frames)
+  static cv::Mat rgb_img   (kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0));
+  static cv::Mat depth_img (kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0));
 
-    const size_t numFinishedRays = finishedRaysHost.size() / sizeof(FinishedRay);
-    const FinishedRay* rays = reinterpret_cast<const FinishedRay*>(finishedRaysHost.data());
-
-    // const size_t kNumRayTracerTiles = 1024; defined in tile_config.hpp
-    const size_t  num_finished_ray_per_tile = numFinishedRays / kNumRayTracerTiles;
-    for(size_t tid = 0; tid<kNumRayTracerTiles; tid++) {
-      for (size_t i = 0; i < num_finished_ray_per_tile; ++i) {
-          const FinishedRay& r = rays[tid*num_finished_ray_per_tile+i];
-
-          // Skip invalid rays
-          if (r.x == 0xFFFF) break;
-          if (r.x >= kFullImageWidth || r.y >= kFullImageHeight) continue;
-
-          // Update pixel color in persistent image
-          cv::Vec3b& pixel = rgb_img.at<cv::Vec3b>(r.y, r.x);
-          pixel[0] = r.b; // B
-          pixel[1] = r.g; // G
-          pixel[2] = r.r; // R
-
-          // Convert t to HSV color
-          cv::Vec3b hsv = mapTtoHSV(r.t);
-
-          // Convert HSV to BGR (OpenCV expects H,S,V format in 8-bit)
-          cv::Mat hsvMat(1, 1, CV_8UC3, hsv);
-          cv::Mat bgrMat;
-          cv::cvtColor(hsvMat, bgrMat, cv::COLOR_HSV2BGR);
-
-          // Assign pixel color
-          depth_img.at<cv::Vec3b>(r.y, r.x) = bgrMat.at<cv::Vec3b>(0, 0);
-
-          // fmt::print("Ray {:3}: (x={}, y={}) RGB=({}, {}, {})\n",
-          //                i, r.x, r.y, r.r, r.g, r.b);
-      }
-
+  // ---- Build a small LUT once: t in [0,80] -> BGR ----
+  // Using OpenCV just 81 times at startup is fine; the hot path uses the LUT.
+  static std::array<cv::Vec3b, 81> T2BGR_LUT = []{
+    std::array<cv::Vec3b, 81> lut{};
+    for (int t = 0; t <= 80; ++t) {
+      const int hue = static_cast<int>(std::lround(t * (179.0 / 80.0))); // OpenCV H: 0..179
+      cv::Mat hsv(1, 1, CV_8UC3, cv::Scalar(hue, 255, 255));
+      cv::Mat bgr;
+      cv::cvtColor(hsv, bgr, cv::COLOR_HSV2BGR);
+      lut[t] = bgr.at<cv::Vec3b>(0, 0);
     }
-    
-    if(mode == 0) 
-      return rgb_img;
-    else
-      return depth_img;
+    return lut;
+  }();
+
+  const size_t numFinishedRays = finishedRaysHost.size() / sizeof(FinishedRay);
+  const FinishedRay* rays = reinterpret_cast<const FinishedRay*>(finishedRaysHost.data());
+
+  // Rays are laid out as [tile0 rays][tile1 rays] ... with a per-tile sentinel x==0xFFFF
+  const size_t num_finished_ray_per_tile = (kNumRayTracerTiles > 0)
+        ? (numFinishedRays / kNumRayTracerTiles)
+        : 0;
+
+  const int W = kFullImageWidth;
+  const int H = kFullImageHeight;
+  const size_t rgb_step   = rgb_img.step;   // bytes per row
+  const size_t depth_step = depth_img.step; // bytes per row
+  uchar* const rgb_data   = rgb_img.data;
+  uchar* const depth_data = depth_img.data;
+
+  // ---- Parallel over tiles (each thread processes whole tiles) ----
+  #pragma omp parallel for schedule(static)
+  for (ptrdiff_t tid = 0; tid < static_cast<ptrdiff_t>(kNumRayTracerTiles); ++tid) {
+    const FinishedRay* tileRays = rays + tid * num_finished_ray_per_tile;
+
+    for (size_t i = 0; i < num_finished_ray_per_tile; ++i) {
+      const FinishedRay& r = tileRays[i];
+
+      // sentinel: no more rays in this tile
+      if (r.x == 0xFFFF) break;
+
+      // bounds check (kept branchy for safety; remove if guaranteed valid)
+      if (r.x >= static_cast<uint16_t>(W) || r.y >= static_cast<uint16_t>(H)) continue;
+
+      // Write RGB
+      const size_t off_rgb = static_cast<size_t>(r.y) * rgb_step + static_cast<size_t>(r.x) * 3;
+      uchar* const dst_rgb = rgb_data + off_rgb;
+      dst_rgb[0] = r.b;
+      dst_rgb[1] = r.g;
+      dst_rgb[2] = r.r;
+
+      // Write depth color via LUT
+      int tt = static_cast<int>(std::lround(r.t));
+      if (tt < 0)   tt = 0;
+      if (tt > 80)  tt = 80;
+      const cv::Vec3b bgr = T2BGR_LUT[tt];
+
+      const size_t off_d = static_cast<size_t>(r.y) * depth_step + static_cast<size_t>(r.x) * 3;
+      uchar* const dst_d = depth_data + off_d;
+      dst_d[0] = bgr[0];
+      dst_d[1] = bgr[1];
+      dst_d[2] = bgr[2];
+    }
+  }
+
+  return (mode == 0) ? rgb_img : depth_img;
 }
+
 
 int main(int argc, char** argv) {
 
