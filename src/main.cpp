@@ -124,19 +124,19 @@ static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRay
 
 int main(int argc, char** argv) {
 
-	// glm::mat4 ViewMatrix(
+  // glm::mat4 ViewMatrix(
   //   glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),
   //   glm::vec4( 0.484514f, -0.874620f, -0.016920f, 0.000000f),
   //   glm::vec4(-0.874087f, -0.484810f,  0.030524f, 0.000000f),
   //   glm::vec4(-0.000000f, -0.000000f, -6.700000f, 1.000000f)
-	// );
+  // );
 
-	// glm::mat4 ViewMatrix(
+  // glm::mat4 ViewMatrix(
   //   glm::vec4(-0.034899458f,  0.000000000f, -0.999390781f, 0.000000000f),
   //   glm::vec4( 0.484514207f, -0.874619782f, -0.016919592f, 0.000000000f),
   //   glm::vec4(-0.874086976f, -0.484809548f,  0.030523760f, 0.000000000f),
   //   glm::vec4(-0.000000000f, -0.000000000f, -6.699999809f, 1.000000000f)
-	// );
+  // );
 
   glm::mat4 ViewMatrix(
       glm::vec4(-0.995107710f,  0.000000000f,  0.098795786f, 0.000000000f),
@@ -160,9 +160,9 @@ int main(int argc, char** argv) {
   // ------------------------------
   // Input Arguments
   // ------------------------------
-	cxxopts::Options options("radiantfoam_ipu", "RadiantFoam IPU Renderer");
+  cxxopts::Options options("radiantfoam_ipu", "RadiantFoam IPU Renderer");
 
-	options.add_options()
+  options.add_options()
     ("i,input", "Input HDF5 file", cxxopts::value<std::string>()->default_value("./data/garden.h5"))
     ("n,nruns", "Number of runs to execute 0=inf", cxxopts::value<int>()->default_value("0"))
     ("no-ui", "Disable UI server", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
@@ -170,34 +170,34 @@ int main(int argc, char** argv) {
     ("p,port", "UI port", cxxopts::value<int>()->default_value("5000"))
     ("h,help", "Print usage");
 
-	auto result = options.parse(argc, argv);
+  auto result = options.parse(argc, argv);
 
-	if (result.count("help")) {
-		std::cout << options.help() << std::endl;
-		return 0;
-	}
+  if (result.count("help")) {
+    std::cout << options.help() << std::endl;
+    return 0;
+  }
 
-	std::string inputFile = result["input"].as<std::string>();
-	int nRuns = result["nruns"].as<int>();
-	int vis_mode = 0;
-	bool enableUI = !result["no-ui"].as<bool>();
-	bool enableDebug = result["debug"].as<bool>();
-	int uiPort = result["port"].as<int>();
+  std::string inputFile = result["input"].as<std::string>();
+  int nRuns = result["nruns"].as<int>();
+  int vis_mode = 0;
+  bool enableUI = !result["no-ui"].as<bool>();
+  bool enableDebug = result["debug"].as<bool>();
+  int uiPort = result["port"].as<int>();
 
-	glm::mat4 inverseView = glm::inverse(ViewMatrix);
-	glm::vec3 cameraPos = glm::vec3(inverseView[3]);
+  glm::mat4 inverseView = glm::inverse(ViewMatrix);
+  glm::vec3 cameraPos = glm::vec3(inverseView[3]);
   
-	// KDTreeManager kdtree(inputFile);
+  // KDTreeManager kdtree(inputFile);
   // 
-	// auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
-	// fmt::print("Camera position ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
-	// 						cameraPos.x, cameraPos.y, cameraPos.z);
-	// fmt::print("Closest Point to Camera:\n"
-	// 						"  Cluster: {:>5}\n"
-	// 						"  Local  : {:>5}\n"
-	// 						"  Position: ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
-	// 						camera_cell.cluster_id, camera_cell.local_id, 
-	// 						camera_cell.x, camera_cell.y, camera_cell.z);
+  // auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
+  // fmt::print("Camera position ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
+  // 						cameraPos.x, cameraPos.y, cameraPos.z);
+  // fmt::print("Closest Point to Camera:\n"
+  // 						"  Cluster: {:>5}\n"
+  // 						"  Local  : {:>5}\n"
+  // 						"  Position: ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
+  // 						camera_cell.cluster_id, camera_cell.local_id, 
+  // 						camera_cell.x, camera_cell.y, camera_cell.z);
   radfoam::geometry::GenericPoint camera_cell{
      0.6503f, -1.2979f,  3.3524f, 
      static_cast<uint16_t>(779),   // cluster_id
@@ -210,12 +210,12 @@ int main(int argc, char** argv) {
   poplar::OptionFlags engineOptions = {};
   if (enableDebug) {
     logger()->info("Enabling Poplar auto-reporting (POPLAR_ENGINE_OPTIONS set)");
-		setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true", "autoReport.executionProfileProgramRunCount":"5","debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
+    setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true", "autoReport.executionProfileProgramRunCount":"5","debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
     setenv("PVTI_OPTIONS", R"({"enable":"true"})", 1);
     engineOptions = {{"debug.instrument", "true"}};
   } else {
-		unsetenv("POPLAR_ENGINE_OPTIONS");
-		unsetenv("PVTI_OPTIONS");
+    unsetenv("POPLAR_ENGINE_OPTIONS");
+    unsetenv("PVTI_OPTIONS");
     logger()->info("Poplar auto-reporting is NOT enabled");
     engineOptions.set("streamCallbacks.multiThreadMode", "collaborative");   // host side
     engineOptions.set("streamCallbacks.numWorkerThreads", "auto");
@@ -259,7 +259,7 @@ int main(int argc, char** argv) {
   InterfaceServer::State state;
   state.fov    = glm::radians(40.f);
 
-	if (enableUI && uiPort) {
+  if (enableUI && uiPort) {
     uiServer = std::make_unique<InterfaceServer>(uiPort);
     uiServer->start();
     uiServer->initialiseVideoStream(imagePtr->cols, imagePtr->rows);
@@ -269,12 +269,12 @@ int main(int argc, char** argv) {
   // ------------------------------	
   // Main Execution & UI Loop
   // ------------------------------
-	AsyncTask hostProcessing;
-	auto uiUpdateFunc = [&]() {
-		if (enableUI && uiServer) {
-			uiServer->sendPreviewImage(*imagePtrBuffered);
-		}
-	};
+  AsyncTask hostProcessing;
+  auto uiUpdateFunc = [&]() {
+    if (enableUI && uiServer) {
+      uiServer->sendPreviewImage(*imagePtrBuffered);
+    }
+  };
 
   builder.stopFlagHost_ = 1;
   std::thread ipuThread([&] {
@@ -282,22 +282,22 @@ int main(int argc, char** argv) {
   });
 
   int step=0;
-	do {
-		step++;
-		if(step==nRuns) {
+  do {
+    step++;
+    if(step==nRuns) {
       builder.stopFlagHost_ = 0;
       break;
     }
-		glm::mat4 inverseView = glm::inverse(ViewMatrix);
-		glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
-		glm::vec3 cameraPos = glm::vec3(inverseView[3]);
-		// auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
+    glm::mat4 inverseView = glm::inverse(ViewMatrix);
+    glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
+    glm::vec3 cameraPos = glm::vec3(inverseView[3]);
+    // auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
 
-		builder.updateViewMatrix(inverseView);
-		builder.updateProjectionMatrix(inverseProj);
-		builder.updateCameraCell(camera_cell);
+    builder.updateViewMatrix(inverseView);
+    builder.updateProjectionMatrix(inverseProj);
+    builder.updateCameraCell(camera_cell);
 
-		if (enableUI) {
+    if (enableUI) {
       hostProcessing.waitForCompletion();
       state = uiServer->consumeState();
       if (state.device == "rgb") {
@@ -308,18 +308,18 @@ int main(int argc, char** argv) {
     }
 
     auto startTime = std::chrono::steady_clock::now();
-		*imagePtr = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
-		std::swap(imagePtr, imagePtrBuffered);
-		if (enableUI) hostProcessing.run(uiUpdateFunc);
+    *imagePtr = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
+    std::swap(imagePtr, imagePtrBuffered);
+    if (enableUI) hostProcessing.run(uiUpdateFunc);
     
-		state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
+    state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
 
     logger()->info("UI execution time: {}", std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16)); 
-	} while (!enableUI || (uiServer && !state.stop));
+  } while (!enableUI || (uiServer && !state.stop));
 
-	if (enableUI) hostProcessing.waitForCompletion();
+  if (enableUI) hostProcessing.waitForCompletion();
 
   ipuThread.join();
 
