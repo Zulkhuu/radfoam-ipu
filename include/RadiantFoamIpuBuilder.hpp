@@ -55,7 +55,8 @@ public:
     std::vector<uint8_t>  framebuffer_host;   ///< RGB888 for every tile
     std::vector<float>    result_f32_host;    ///< Scratch debug channel
     std::vector<uint16_t> result_u16_host;    ///< Scratch debug channel
-    std::vector<unsigned> debug_chains;       ///< Tiles to print in readAllTiles()
+
+    unsigned stopFlagHost_;
 
 private:
     // ───────────── helper sections used by build() ─────────────
@@ -118,6 +119,10 @@ private:
     ipu_utils::StreamableTensor raygenDebugRead_{"raygen_debug_bytes_read"};
     ipu_utils::StreamableTensor finishedRaysRead_{"finished_rays_read"};
     ipu_utils::StreamableTensor finishedWriteOffsets_{"finished_rays_write_offsets"};
+
+    poplar::Tensor inStreamFinishedRays;
+    ipu_utils::StreamableTensor stopFlag_{"stopFlag"};
+    poplar::DataStream inStream, stopFlagStream;
 
     // CPU‑side mirrors -------------------------------------------------------
     int exec_counter_;

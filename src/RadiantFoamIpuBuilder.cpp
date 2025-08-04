@@ -48,29 +48,36 @@ void RadiantFoamIpuBuilder::updateCameraCell(const GenericPoint& cell) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  build() – graph construction (called exactly once)
 // ─────────────────────────────────────────────────────────────────────────────
-void RadiantFoamIpuBuilder::build(poplar::Graph& graph, const poplar::Target&) {
+void RadiantFoamIpuBuilder::build(poplar::Graph& g, const poplar::Target&) {
     RF_LOG("Building RadiantFoam graph");
 
     loadScenePartitions();
-    registerCodeletsAndOps(graph);
-    allocateGlobalTensors(graph);
+    registerCodeletsAndOps(g);
+    allocateGlobalTensors(g);
 
-    poplar::ComputeSet cs = graph.addComputeSet("RayTraceCS");
+    poplar::ComputeSet cs = g.addComputeSet("RayTraceCS");
 
-    buildRayTracers(graph, cs);
-    buildRayRoutersL0(graph, cs);
-    buildRayRoutersL1(graph, cs);
-    buildRayRoutersL2(graph, cs);
-    buildRayRoutersL3(graph, cs);
-    buildRayGenerator(graph, cs);
-    buildDataExchange(graph);
-    setupHostStreams(graph);
+    buildRayTracers(g, cs);
+    buildRayRoutersL0(g, cs);
+    buildRayRoutersL1(g, cs);
+    buildRayRoutersL2(g, cs);
+    buildRayRoutersL3(g, cs);
+    buildRayGenerator(g, cs);
+    buildDataExchange(g);
+    setupHostStreams(g);
 
     poplar::program::Sequence frame_;
     frame_.add(poplar::program::Repeat(kSubsteps, frameStep_));
-    frame_.add(finishedRaysRead_.buildRead(graph, true));
+    frame_.add(poplar::program::Copy(inStreamFinishedRays, inStream));
     getPrograms().add("frame", frame_);
 
+    stopFlag_.buildTensor(g, poplar::UNSIGNED_INT, {});
+    g.setTileMapping(stopFlag_.get(), 0);
+    g.setInitialValue(stopFlag_.get(), poplar::ArrayRef<unsigned>({1}));
+    auto condProgram = stopFlag_.buildWrite(g, true);
+    // auto condProgram = poplar::program::Copy(stopFlagStream, stopFlag_);
+    auto frameLoop = poplar::program::RepeatWhileTrue(condProgram, stopFlag_.get(), frame_);
+    getPrograms().add("frame_loop", frameLoop);
 }
 
 // ----------------------------------------------------------------------------
@@ -85,10 +92,12 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
             fmt::format("frame_{:03d}/broadcast_matrices", exec_counter_));
         eng.run(getPrograms().getOrdinals().at("write_camera_cell_info"),
             fmt::format("frame_{:03d}/write_camera_cell_info", exec_counter_));
+
+        eng.run(getPrograms().getOrdinals().at("frame_loop"));
     }
 
-    eng.run(getPrograms().getOrdinals().at("frame"),
-            fmt::format("frame_{:03d}", exec_counter_));
+    // eng.run(getPrograms().getOrdinals().at("frame"),
+    //         fmt::format("frame_{:03d}", exec_counter_));
 
     // if(debug_)
     //     readAllTiles(eng);
@@ -138,7 +147,7 @@ void RadiantFoamIpuBuilder::allocateGlobalTensors(poplar::Graph& g) {
     poputil::mapTensorLinearlyWithOffset(g, fb_read_all_.get().reshape({kNumRayTracerTiles, kTileFramebufferSize}), 0);
     
     const size_t kFinishedRayBytesPerTile = kNumRays * kFinishedFactor * sizeof(FinishedRay);
-    finishedRaysRead_.buildTensor(g,  poplar::UNSIGNED_CHAR, {kNumRayTracerTiles * kFinishedRayBytesPerTile});
+    // finishedRaysRead_.buildTensor(g,  poplar::UNSIGNED_CHAR, {kNumRayTracerTiles * kFinishedRayBytesPerTile});
 
     exec_counts_.buildTensor(g, poplar::UNSIGNED_INT, {kNumRayTracerTiles + 1});
     for (std::size_t tid = 0; tid < kNumRayTracerTiles; ++tid) {
@@ -160,6 +169,18 @@ void RadiantFoamIpuBuilder::allocateGlobalTensors(poplar::Graph& g) {
     projMatrix_.buildTensor(g, poplar::FLOAT, {4,4});
     g.setTileMapping(projMatrix_.get(), 0);
     broadcastMatrices_.add(projMatrix_.buildWrite(g, true));
+
+    inStreamFinishedRays = g.addVariable(poplar::UNSIGNED_CHAR, {kNumRayTracerTiles * kFinishedRayBytesPerTile}, "instream-finished-rays");
+    poplar::OptionFlags inOpts = {
+        {"bufferingDepth", "2"},
+        {"splitLimit", std::to_string(100 * 1024 * 1024)} // 100 MiB
+    };
+    inStream =  g.addDeviceToHostFIFO(
+        "read-finished-rays-stream",
+        poplar::UNSIGNED_CHAR,
+        kNumRayTracerTiles * kFinishedRayBytesPerTile,
+        inOpts);
+
 }
 
 void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet& cs) {
@@ -230,7 +251,9 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
                             .reshape({kTileFramebufferSize});
         g.connect(v["framebuffer"], fb_slice);
 
-        auto finished_slice = finishedRaysRead_.get().slice(
+        // auto finished_slice = finishedRaysRead_.get().slice(
+        //     tid * kFinishedRayBytesPerTile, (tid + 1) * kFinishedRayBytesPerTile);
+        auto finished_slice = inStreamFinishedRays.slice(
             tid * kFinishedRayBytesPerTile, (tid + 1) * kFinishedRayBytesPerTile);
         g.setTileMapping(finished_slice, tid);
         g.connect(v["finishedRays"], finished_slice);
@@ -626,7 +649,7 @@ void RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph& g) {
   constexpr size_t   kRayIOBytesPerTile  = kNumRays * sizeof(Ray);
   const     size_t   kRouterPerTileBuffer = kRayIOBytesPerTile * 5; // [parent | child0..3]
 
-  poplar::program::Sequence seq;
+  poplar::program::Sequence seq(DebugContext{"DataExchangeSeq"});
 
   auto childBlock = [&](poplar::Tensor &buf, uint16_t rid) -> poplar::Tensor {
     const size_t base = static_cast<size_t>(rid) * kRouterPerTileBuffer;
@@ -857,7 +880,9 @@ void RadiantFoamIpuBuilder::connectHostStreams(poplar::Engine& eng) {
     fb_read_all_.connectReadStream(eng, framebuffer_host.data());
     result_f32_read_.connectReadStream(eng, result_f32_host.data());
     result_u16_read_.connectReadStream(eng, result_u16_host.data());
-    finishedRaysRead_.connectReadStream(eng, finishedRaysHost_.data());
+    // finishedRaysRead_.connectReadStream(eng, finishedRaysHost_.data());
+    eng.connectStream("read-finished-rays-stream", finishedRaysHost_.data(), finishedRaysHost_.data() + finishedRaysHost_.size());
+
     l0routerDebugRead_.connectReadStream(eng, l0routerDebugBytesHost_.data());
     l1routerDebugRead_.connectReadStream(eng, l1routerDebugBytesHost_.data());
     l2routerDebugRead_.connectReadStream(eng, l2routerDebugBytesHost_.data());
@@ -866,6 +891,8 @@ void RadiantFoamIpuBuilder::connectHostStreams(poplar::Engine& eng) {
     viewMatrix_.connectWriteStream(eng, hostViewMatrix_.data());
     projMatrix_.connectWriteStream(eng, hostProjMatrix_.data());
     cameraCellInfo_.connectWriteStream(eng, hostCameraCellInfo_.data());
+
+    stopFlag_.connectWriteStream(eng, &stopFlagHost_);
 }
 
 // ----------------------------------------------------------------------------

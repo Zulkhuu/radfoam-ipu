@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <future>
 
 #include <cxxopts.hpp>
 #include <spdlog/fmt/fmt.h>
@@ -127,8 +128,6 @@ static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRay
       return depth_img;
 }
 
-
-
 int main(int argc, char** argv) {
 
 	// glm::mat4 ViewMatrix(
@@ -217,11 +216,19 @@ int main(int argc, char** argv) {
   poplar::OptionFlags engineOptions = {};
   if (enableDebug) {
     logger()->info("Enabling Poplar auto-reporting (POPLAR_ENGINE_OPTIONS set)");
-		setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true", "autoReport.executionProfileProgramRunCount":"4","debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
+		setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true", "autoReport.executionProfileProgramRunCount":"5","debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
+    setenv("PVTI_OPTIONS", R"({"enable":"true"})", 1);
     engineOptions = {{"debug.instrument", "true"}};
   } else {
 		unsetenv("POPLAR_ENGINE_OPTIONS");
+		unsetenv("PVTI_OPTIONS");
     logger()->info("Poplar auto-reporting is NOT enabled");
+    engineOptions.set("streamCallbacks.multiThreadMode", "collaborative");   // host side
+    engineOptions.set("streamCallbacks.numWorkerThreads", "auto");
+    engineOptions.set("streamCallbacks.numaAware", "true");
+    engineOptions.set("debug.instrument",           "false");
+    engineOptions.set("debug.verify",               "false");
+    engineOptions.set("target.deterministicWorkers","false");
   }
   // ------------------------------
   // Build and Configure IPU Graph
@@ -275,15 +282,21 @@ int main(int argc, char** argv) {
 		}
 	};
 
-	int step=0;
+  builder.stopFlagHost_ = 1;
+  std::thread ipuThread([&] {
+    mgr.execute(builder);
+  });
+
+  int step=0;
 	do {
-		// ViewMatrix[2][2] += 2;
-		// ProjectionMatrix[2][2] += 1;
 		step++;
-		if(step==nRuns) break;
+		if(step==nRuns) {
+      builder.stopFlagHost_ = 0;
+      break;
+    }
 		glm::mat4 inverseView = glm::inverse(ViewMatrix);
 		glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
-		// glm::vec3 cameraPos = glm::vec3(inverseView[3]);
+		glm::vec3 cameraPos = glm::vec3(inverseView[3]);
 		// auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
 
 		builder.updateViewMatrix(inverseView);
@@ -301,24 +314,20 @@ int main(int argc, char** argv) {
     }
 
     auto startTime = std::chrono::steady_clock::now();
-		mgr.execute(builder);
-    auto endTime = std::chrono::steady_clock::now();
-    auto execTime = std::chrono::duration<double>(endTime - startTime).count();
-    logger()->info("IPU execution time: {}", execTime);
-
-    startTime = std::chrono::steady_clock::now();
 		*imagePtr = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
 		std::swap(imagePtr, imagePtrBuffered);
 		if (enableUI) hostProcessing.run(uiUpdateFunc);
     
 		state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
 
-    endTime = std::chrono::steady_clock::now();
-    execTime = std::chrono::duration<double>(endTime - startTime).count();
-    logger()->info("UI execution time: {}", execTime);
+    logger()->info("UI execution time: {}", std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(16)); 
 	} while (!enableUI || (uiServer && !state.stop));
 
 	if (enableUI) hostProcessing.waitForCompletion();
+
+  ipuThread.join();
 
   // cv::imwrite("framebuffer_full.png", AssembleFullImage(builder.framebuffer_host));
   cv::imwrite("framebuffer_full.png", AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode));

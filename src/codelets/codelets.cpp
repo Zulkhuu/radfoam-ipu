@@ -56,7 +56,7 @@ public:
 
   // Outputs
   poplar::Output<poplar::Vector<uint8_t>> raysOut;
-  poplar::Output<poplar::Vector<uint8_t>> finishedRays;
+  poplar::InOut<poplar::Vector<uint8_t>> finishedRays;
   // Debug outputs
   poplar::Output<float> result_float;
   poplar::Output<unsigned short> result_u16;
@@ -281,7 +281,7 @@ private:
     }
   }
 
-  inline void invalidateRemainingFinishedRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) {
+  inline void invalidateRemainingFinishedRays(poplar::InOut<poplar::Vector<uint8_t>>& buffer, int count) {
     for (int i = count; i < kNumRays*3; i++) {
       FinishedRay* ray = reinterpret_cast<FinishedRay*>(buffer.data() + sizeof(FinishedRay) * i);
       if(ray->x == 0xFFFF)
@@ -369,65 +369,67 @@ public:
       return count;
     };
 
-    const int interval = 3;
-    const int nRowsPerFrame = 1;
-    if(exec_count%interval == 0) {
-      // Ray genRay{};
-      // uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
-      // uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
+    int mode = 1;
+    if(mode == 0) { // Single ray test
+      Ray genRay{};
+      genRay.x = 343;
+      genRay.y = 428;
+      genRay.r = 0.0f;
+      genRay.g = 0.0f;
+      genRay.b = 0.0f;
+      genRay.t = 0.0f;
+      genRay.transmittance = 1.0f;
+      genRay.next_cluster = cluster_id;
+      genRay.next_local   = local_id;
+      routeRay(&genRay);
+    }
+    if(mode == 1) { // Row scan
+      const int interval = 3;
+      const int nRowsPerFrame = 1;
+      if(exec_count%interval == 0) {
+        for(uint16_t x=0; x<kFullImageWidth; x++) {
+          for(uint16_t y=0; y<nRowsPerFrame; y++) {
+            Ray genRay{};
 
-      // genRay.x = 343;
-      // genRay.y = 428;
-      // genRay.r = 0.0f;
-      // genRay.g = 0.0f;
-      // genRay.b = 0.0f;
-      // genRay.t = 0.0f;
-      // genRay.transmittance = 1.0f;
-      // genRay.next_cluster = cluster_id;
-      // genRay.next_local   = local_id;
-      // routeRay(&genRay);
+            genRay.x = x; //(x+(exec_count/interval)*3)%kFullImageWidth;
+            genRay.y = (y+(exec_count/interval)*nRowsPerFrame)%kFullImageHeight;
+            genRay.r = 0.0f;
+            genRay.g = 0.0f;
+            genRay.b = 0.0f;
+            genRay.t = 0.0f;
+            genRay.transmittance = 1.0f;
+            genRay.next_cluster = cluster_id;
+            genRay.next_local   = local_id;
 
-      for(uint16_t x=0; x<kFullImageWidth; x++) {
-        for(uint16_t y=0; y<nRowsPerFrame; y++) {
-          Ray genRay{};
-          uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
-          uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
-
-          genRay.x = x; //(x+(exec_count/interval)*3)%kFullImageWidth;
-          genRay.y = (y+(exec_count/interval)*nRowsPerFrame)%kFullImageHeight;
-          genRay.r = 0.0f;
-          genRay.g = 0.0f;
-          genRay.b = 0.0f;
-          genRay.t = 0.0f;
-          genRay.transmittance = 1.0f;
-          genRay.next_cluster = cluster_id;
-          genRay.next_local   = local_id;
-
-          routeRay(&genRay);
+            routeRay(&genRay);
+          }
         }
-      }
+      } 
+    }
+    if(mode == 2) {
+      const int interval = 3;
+      const int nx = 40;
+      const int ny = 30;
+      if(exec_count%interval == 0) {
+        for(uint16_t x=0; x<nx; x++) {
+          for(uint16_t y=0; y<ny; y++) {
+            Ray genRay{};
+            genRay.x = x*16 + exec_count%16;
+            genRay.y = y*16 + (exec_count/16)%16;
+            genRay.r = 0.0f;
+            genRay.g = 0.0f;
+            genRay.b = 0.0f;
+            genRay.t = 0.0f;
+            genRay.transmittance = 1.0f;
+            genRay.next_cluster = cluster_id;
+            genRay.next_local   = local_id;
 
-      // for(uint16_t x=310; x<350; x++) {
-      //   for(uint16_t y=390; y<420; y++) {
-      //     Ray genRay{};
-      //     uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
-      //     uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
+            routeRay(&genRay);
+          }
+        }
+      } 
 
-      //     genRay.x = x;
-      //     genRay.y = y;
-      //     genRay.r = 0.0f;
-      //     genRay.g = 0.0f;
-      //     genRay.b = 0.0f;
-      //     genRay.t = 0.0f;
-      //     genRay.transmittance = 1.0f;
-      //     genRay.next_cluster = cluster_id;
-      //     genRay.next_local   = local_id;
-
-      //     routeRay(&genRay);
-      //   }
-      // }
-
-    } 
+    }
 
     // Route each child and capture their input counts
     inCountC0 = routeChildRays(childRaysIn0);
