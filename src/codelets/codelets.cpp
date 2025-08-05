@@ -70,6 +70,11 @@ public:
 
   [[poplar::constraint("elem(*local_pts)!=elem(*framebuffer)")]]
   bool compute() {
+    // const Ray* ray_in = readStructAt<Ray>(raysIn, 0);
+    // if (ray_in->x == 0xFFFF) {
+    //   *exec_count = exec_count + 1;
+    //   return true; 
+    // }
     constexpr int RaySize = sizeof(Ray);
     constexpr int LocalPointSize = sizeof(LocalPoint);
     constexpr int GenericPointSize = sizeof(GenericPoint); 
@@ -291,8 +296,6 @@ private:
   }
 };
 
-
-
 class RayGen : public poplar::Vertex {
 public:
   poplar::Input<poplar::Vector<uint8_t>> childRaysIn0;
@@ -313,22 +316,14 @@ public:
   bool compute() {
     constexpr int RaySize = sizeof(Ray);  
     constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
-    const uint16_t childClusterIds[4] = {0, 256, 512, 768};
-    const int lvl = 4;
-    uint8_t shift = lvl * 2;
-    uint16_t inCountC0 = 0, inCountC1 = 0, inCountC2 = 0, inCountC3 = 0;
+    constexpr uint8_t shift = 8; // lvl 4*2
     uint16_t outCountC0 = 0, outCountC1 = 0, outCountC2 = 0, outCountC3 = 0;
-
     uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
     uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
     // Helper: Determine target child
-    auto findChildForCluster = [&](uint16_t clusterId) -> int {
-      for (int i = 0; i < 4; ++i) {
-        if ((clusterId >> 8) == (childClusterIds[i] >> 8))
-          return i;
-      }
-      return -1;
+    auto findChildForCluster = [&](uint16_t cid) __attribute__((always_inline)) -> unsigned {
+        return (cid >> shift) & 0x3;
     };
 
     // Helper: Route a ray
@@ -357,10 +352,9 @@ public:
       } 
     };
 
-    auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) -> uint16_t {
+    auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) __attribute__((always_inline)) -> uint16_t {
       uint16_t count = 0;
-      const int numChildRays = childIn.size() / RaySize;
-      for (int i = 0; i < numChildRays; ++i) {
+      for (int i = 0; i < kNumRays; ++i) {
         const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * RaySize);
         if (ray->x == INVALID_RAY_ID) break;
         count++;
@@ -385,7 +379,7 @@ public:
     }
     if(mode == 1) { // Row scan
       const int interval = 3;
-      const int nRowsPerFrame = 1;
+      const int nRowsPerFrame = 2;
       if(exec_count%interval == 0) {
         for(uint16_t x=0; x<kFullImageWidth; x++) {
           for(uint16_t y=0; y<nRowsPerFrame; y++) {
@@ -432,12 +426,12 @@ public:
     }
 
     // Route each child and capture their input counts
-    inCountC0 = routeChildRays(childRaysIn0);
-    inCountC1 = routeChildRays(childRaysIn1);
-    inCountC2 = routeChildRays(childRaysIn2);
-    inCountC3 = routeChildRays(childRaysIn3);
+    uint16_t inCountC0 = routeChildRays(childRaysIn0);
+    uint16_t inCountC1 = routeChildRays(childRaysIn1);
+    uint16_t inCountC2 = routeChildRays(childRaysIn2);
+    uint16_t inCountC3 = routeChildRays(childRaysIn3);
 
-    auto invalidateRemaining = [&](poplar::Output<poplar::Vector<uint8_t>>& out, uint16_t count) {
+    auto invalidateRemaining = [&](poplar::Output<poplar::Vector<uint8_t>>& out, uint16_t count) __attribute__((always_inline)) {
       for (uint16_t i = count; i < kNumRays; ++i) {
         Ray* ray = reinterpret_cast<Ray*>(out.data() + sizeof(Ray) * i);
         if(ray->x == 0xFFFF)
@@ -492,29 +486,19 @@ public:
   poplar::Output<poplar::Vector<uint8_t>> debugBytes;
 
   bool compute() {
-    const uint8_t lvl = *level;
-    uint8_t shift = lvl * 2;
-    constexpr int RaySize = sizeof(Ray);
+    uint8_t shift = *level * 2;
     constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
-    const int kNumRays = parentRaysIn.size() / RaySize;
+    constexpr int RaySize = sizeof(Ray);
+    const uint16_t myChildPrefix = childClusterIds[0] >> (shift + 2);
+    uint16_t outCountParent = 0, outCountC0 = 0, outCountC1 = 0, outCountC2 = 0, outCountC3 = 0;
 
-    // --- Counts ---
-    uint16_t inCountParent = 0;
-    uint16_t inCountC0 = 0, inCountC1 = 0, inCountC2 = 0, inCountC3 = 0;
-    uint16_t outCountParent = 0;
-    uint16_t outCountC0 = 0, outCountC1 = 0, outCountC2 = 0, outCountC3 = 0;
-
-    // Helper: Determine which child a cluster ID belongs to
-    auto findChildForCluster = [&](uint16_t clusterId) -> int {
-      for (int i = 0; i < 4; ++i) {
-        if ((childClusterIds[i] >> shift) == (clusterId >> shift))
-            return i;
-      }
-      return -1;
+    auto findChildForCluster = [&](uint16_t cid) __attribute__((always_inline)) -> unsigned {
+        unsigned idx  = (cid >> shift) & 0x3;
+        unsigned good = ((cid >> (shift + 2)) == myChildPrefix);
+        return good ? idx : -1;
     };
 
-    // Helper: Route a ray
-    auto routeRay = [&](const Ray* ray) {
+    auto routeRay = [&](const Ray* ray)  __attribute__((always_inline)) {
       int targetChild = findChildForCluster(ray->next_cluster);
       if (targetChild == 0) {
         if (outCountC0 < kNumRays) {
@@ -544,22 +528,10 @@ public:
       }
     };
 
-    // Process parent rays
-    {
-      const int numParentRays = parentRaysIn.size() / RaySize;
-      for (int i = 0; i < numParentRays; ++i) {
-        const Ray* ray = reinterpret_cast<const Ray*>(parentRaysIn.data() + i * RaySize);
-        if (ray->x == INVALID_RAY_ID) break;
-        inCountParent++;
-        routeRay(ray);
-      }
-    }
-
     // New routeChildRays: count + route, return count
-    auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) -> uint16_t {
+    auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) __attribute__((always_inline)) -> uint16_t {
       uint16_t count = 0;
-      const int numChildRays = childIn.size() / RaySize;
-      for (int i = 0; i < numChildRays; ++i) {
+      for (int i = 0; i < kNumRays; ++i) {
         const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * RaySize);
         if (ray->x == INVALID_RAY_ID) break;
         count++;
@@ -569,19 +541,21 @@ public:
     };
 
     // Route each child and capture their input counts
-    inCountC0 = routeChildRays(childRaysIn0);
-    inCountC1 = routeChildRays(childRaysIn1);
-    inCountC2 = routeChildRays(childRaysIn2);
-    inCountC3 = routeChildRays(childRaysIn3);
+    uint16_t inCountParent = routeChildRays(parentRaysIn);
+    uint16_t inCountC0 = routeChildRays(childRaysIn0);
+    uint16_t inCountC1 = routeChildRays(childRaysIn1);
+    uint16_t inCountC2 = routeChildRays(childRaysIn2);
+    uint16_t inCountC3 = routeChildRays(childRaysIn3);
 
     // Invalidate remaining rays
-    auto invalidateRemaining = [&](poplar::Output<poplar::Vector<uint8_t>>& out, uint16_t count) {
+    auto invalidateRemaining = [&](poplar::Output<poplar::Vector<uint8_t>>& out, uint16_t count) __attribute__((always_inline)) {
       for (uint16_t i = count; i < kNumRays; i++) {
         Ray* ray = reinterpret_cast<Ray*>(out.data() + i * RaySize);
         if (ray->x == INVALID_RAY_ID) break;
         ray->x = INVALID_RAY_ID;
       }
     };
+
     invalidateRemaining(childRaysOut0, outCountC0);
     invalidateRemaining(childRaysOut1, outCountC1);
     invalidateRemaining(childRaysOut2, outCountC2);
@@ -600,9 +574,6 @@ public:
     dbg[7] = outCountC1;
     dbg[8] = outCountC2;
     dbg[9] = outCountC3;
-
-    dbg[10] = 0; // spare
-    dbg[11] = 0; // spare
 
     return true;
   }
