@@ -438,9 +438,11 @@ public:
     inCountC3 = routeChildRays(childRaysIn3);
 
     auto invalidateRemaining = [&](poplar::Output<poplar::Vector<uint8_t>>& out, uint16_t count) {
-      uint16_t invalidRay = INVALID_RAY_ID;
       for (uint16_t i = count; i < kNumRays; ++i) {
-        *reinterpret_cast<uint16_t*>(out.data() + i * RaySize) = invalidRay;
+        Ray* ray = reinterpret_cast<Ray*>(out.data() + sizeof(Ray) * i);
+        if(ray->x == 0xFFFF)
+          break;
+        ray->x = 0xFFFF;
       }
     };
 
@@ -574,9 +576,10 @@ public:
 
     // Invalidate remaining rays
     auto invalidateRemaining = [&](poplar::Output<poplar::Vector<uint8_t>>& out, uint16_t count) {
-      uint16_t invalidRay = INVALID_RAY_ID;
       for (uint16_t i = count; i < kNumRays; i++) {
-        *reinterpret_cast<uint16_t*>(out.data() + i * RaySize) = invalidRay;
+        Ray* ray = reinterpret_cast<Ray*>(out.data() + i * RaySize);
+        if (ray->x == INVALID_RAY_ID) break;
+        ray->x = INVALID_RAY_ID;
       }
     };
     invalidateRemaining(childRaysOut0, outCountC0);
