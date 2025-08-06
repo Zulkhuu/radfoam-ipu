@@ -4,6 +4,7 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <geometry/primitives.hpp>
 #include <ipu/rf_config.hpp>
+#include <ipu_builtins.h>
 
 using namespace radfoam::geometry;
 using namespace radfoam::config;
@@ -22,13 +23,6 @@ using namespace radfoam::config;
 //     glm::vec4(0.000000f, 0.000000f, -0.200200f,  0.000000f)
 // );
 
-// inline __attribute__((always_inline))
-// const LocalPoint* readLocalPointAt(const poplar::Input<poplar::Vector<uint8_t>>& buffer, std::size_t index) {
-//     constexpr std::size_t stride = sizeof(LocalPoint);
-//     const uint8_t* base = buffer.data() + index * stride;
-//     return reinterpret_cast<const LocalPoint*>(base);
-// }
-
 template <typename T>
 inline __attribute__((always_inline))
 const T* readStructAt(const poplar::Input<poplar::Vector<uint8_t>>& buffer, std::size_t index) {
@@ -39,7 +33,8 @@ const T* readStructAt(const poplar::Input<poplar::Vector<uint8_t>>& buffer, std:
 
 inline __attribute__((always_inline))
 uint8_t clampToU8(float v) {
-    return static_cast<uint8_t>(std::fmax(0.0f, std::fmin(255.0f, std::round(v * 255.0f))));
+    return static_cast<uint8_t>(__builtin_ipu_max(0.0f, __builtin_ipu_min(255.0f, std::round(v * 255.0f))));
+    // return static_cast<uint8_t>(__builtin_ipu_clamp())
 }
 
 class RayTrace : public poplar::Vertex {
@@ -65,8 +60,6 @@ public:
   poplar::InOut<poplar::Vector<uint8_t>> framebuffer;
   poplar::InOut<unsigned>       exec_count;           // increments every sub-iteration
   poplar::InOut<unsigned>       finishedWriteOffset;  // append pointer within finishedRays
-  // poplar::Input<unsigned short> substeps;             // e.g., 10
-
 
   [[poplar::constraint("elem(*local_pts)!=elem(*framebuffer)")]]
   bool compute() {
@@ -181,15 +174,10 @@ public:
           }
         }
 
-        // // Guard for stuck rays
-        // if (steps > 1050) {
-        //   nextIdx = -1;
-        // }
-
         // Accumulate color
         // float delta = __builtin_fmaxf(0.0f, closestT - t0);
         float delta = closestT - t0;
-        float alpha = 1.0f - expf(-cur_cell->density * delta);
+        float alpha = 1.0f - __builtin_ipu_exp(-cur_cell->density * delta);
         // color += transmittance * alpha *
         //          glm::vec3(cur_cell->r / 255.0f, cur_cell->g / 255.0f, cur_cell->b / 255.0f);
         color.x += transmittance * alpha * (cur_cell->r/255.0f);
@@ -197,7 +185,7 @@ public:
         color.z += transmittance * alpha * (cur_cell->b/255.0f);
 
         transmittance *= (1.0f - alpha);
-        t0 = __builtin_fmaxf(t0, closestT);
+        t0 = __builtin_ipu_max(t0, closestT);
 
         // Termination conditions
         if (transmittance < 0.01f || nextIdx == -1 || nextIdx >= nLocalPts) {
@@ -266,7 +254,7 @@ public:
 private:
   void writeFinishedRay(poplar::Output<poplar::Vector<uint8_t>>& buffer,
                         int& counter, uint16_t x, uint16_t y,
-                        const glm::vec3& color, float t) {
+                        const glm::vec3& color, float t)  __attribute__((always_inline)) {
     FinishedRay* ray = reinterpret_cast<FinishedRay*>(buffer.data() + sizeof(FinishedRay) * counter);
     ray->x = x;
     ray->y = y;
@@ -277,7 +265,12 @@ private:
     counter++;
   }
 
-  void invalidateRemainingRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) {
+  void invalidateRemainingRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) __attribute__((always_inline)) {
+    //  Ray *r = reinterpret_cast<Ray*>(buffer.data() + sizeof(Ray) * count);
+    //  while(r->x!=0xFFFF && ){
+    //   r->x = 0xFFFF; 
+    //   ++r; 
+    // }
     for (int i = count; i < kNumRays; i++) {
       Ray* ray = reinterpret_cast<Ray*>(buffer.data() + sizeof(Ray) * i);
       if(ray->x == 0xFFFF)
@@ -286,7 +279,7 @@ private:
     }
   }
 
-  inline void invalidateRemainingFinishedRays(poplar::InOut<poplar::Vector<uint8_t>>& buffer, int count) {
+  inline void invalidateRemainingFinishedRays(poplar::InOut<poplar::Vector<uint8_t>>& buffer, int count) __attribute__((always_inline)) {
     for (int i = count; i < kNumRays*3; i++) {
       FinishedRay* ray = reinterpret_cast<FinishedRay*>(buffer.data() + sizeof(FinishedRay) * i);
       if(ray->x == 0xFFFF)
@@ -463,6 +456,17 @@ public:
   }
 };
 
+template <unsigned Port>
+inline __attribute__((always_inline))
+void emit(const Ray &r, unsigned &cnt,
+          poplar::Output<poplar::Vector<uint8_t>>* const (&outPorts)[5])
+{
+    // Port is a compile-time constant, so the expression below
+    // becomes a constant address + a run-time offset.
+    std::memcpy(outPorts[Port]->data() + cnt * sizeof(Ray), &r, sizeof(Ray));
+    ++cnt;
+}
+
 class RayRouter : public poplar::Vertex {
 public:
   // Incoming rays
@@ -489,42 +493,59 @@ public:
     uint8_t shift = *level * 2;
     constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
     constexpr int RaySize = sizeof(Ray);
+    constexpr unsigned PARENT = 4;            // index 4 = parent lane
     const uint16_t myChildPrefix = childClusterIds[0] >> (shift + 2);
-    uint16_t outCountParent = 0, outCountC0 = 0, outCountC1 = 0, outCountC2 = 0, outCountC3 = 0;
-
-    auto findChildForCluster = [&](uint16_t cid) __attribute__((always_inline)) -> unsigned {
-        unsigned idx  = (cid >> shift) & 0x3;
-        unsigned good = ((cid >> (shift + 2)) == myChildPrefix);
-        return good ? idx : -1;
+    // uint16_t outCountParent = 0, outCountC0 = 0, outCountC1 = 0, outCountC2 = 0, outCountC3 = 0;
+    unsigned outCnt[5] = {0,0,0,0,0}; 
+    poplar::Output<poplar::Vector<uint8_t>>* outPorts[5] = {
+        &childRaysOut0, &childRaysOut1, &childRaysOut2,
+        &childRaysOut3, &parentRaysOut
     };
 
-    auto routeRay = [&](const Ray* ray)  __attribute__((always_inline)) {
-      int targetChild = findChildForCluster(ray->next_cluster);
-      if (targetChild == 0) {
-        if (outCountC0 < kNumRays) {
-          std::memcpy(childRaysOut0.data() + outCountC0 * RaySize, ray, RaySize);
-          outCountC0++;
-        }
-      } else if (targetChild == 1) {
-        if (outCountC1 < kNumRays) {
-          std::memcpy(childRaysOut1.data() + outCountC1 * RaySize, ray, RaySize);
-          outCountC1++;
-        }
-      } else if (targetChild == 2) {
-        if (outCountC2 < kNumRays) {
-          std::memcpy(childRaysOut2.data() + outCountC2 * RaySize, ray, RaySize);
-          outCountC2++;
-        }
-      } else if (targetChild == 3) {
-        if (outCountC3 < kNumRays) {
-          std::memcpy(childRaysOut3.data() + outCountC3 * RaySize, ray, RaySize);
-          outCountC3++;
-        }
-      } else {
-        if (outCountParent < kNumRays) {
-          std::memcpy(parentRaysOut.data() + outCountParent * RaySize, ray, RaySize);
-          outCountParent++;
-        }
+    auto findChildForCluster = [&](uint16_t cid) __attribute__((always_inline)) -> unsigned {
+        unsigned childIdx  = (cid >> shift) & 0x3;
+        unsigned good = ((cid >> (shift + 2)) == myChildPrefix);
+        return good ? childIdx : PARENT;
+    };
+
+    // auto routeRay = [&](const Ray* ray)  __attribute__((always_inline)) {
+    //   int targetChild = findChildForCluster(ray->next_cluster);
+    //   if (targetChild == 0) {
+    //     if (outCountC0 < kNumRays) {
+    //       std::memcpy(childRaysOut0.data() + outCountC0 * RaySize, ray, RaySize);
+    //       outCountC0++;
+    //     }
+    //   } else if (targetChild == 1) {
+    //     if (outCountC1 < kNumRays) {
+    //       std::memcpy(childRaysOut1.data() + outCountC1 * RaySize, ray, RaySize);
+    //       outCountC1++;
+    //     }
+    //   } else if (targetChild == 2) {
+    //     if (outCountC2 < kNumRays) {
+    //       std::memcpy(childRaysOut2.data() + outCountC2 * RaySize, ray, RaySize);
+    //       outCountC2++;
+    //     }
+    //   } else if (targetChild == 3) {
+    //     if (outCountC3 < kNumRays) {
+    //       std::memcpy(childRaysOut3.data() + outCountC3 * RaySize, ray, RaySize);
+    //       outCountC3++;
+    //     }
+    //   } else {
+    //     if (outCountParent < kNumRays) {
+    //       std::memcpy(parentRaysOut.data() + outCountParent * RaySize, ray, RaySize);
+    //       outCountParent++;
+    //     }
+    //   }
+    // };
+    
+    auto routeRay = [&](const Ray* pr) __attribute__((always_inline)) {
+      unsigned p = findChildForCluster(pr->next_cluster);
+      switch (p) {
+        case 0: emit<0>(*pr, outCnt[0], outPorts); break;
+        case 1: emit<1>(*pr, outCnt[1], outPorts); break;
+        case 2: emit<2>(*pr, outCnt[2], outPorts); break;
+        case 3: emit<3>(*pr, outCnt[3], outPorts); break;
+        default: emit<4>(*pr, outCnt[4], outPorts); break;
       }
     };
 
@@ -556,11 +577,11 @@ public:
       }
     };
 
-    invalidateRemaining(childRaysOut0, outCountC0);
-    invalidateRemaining(childRaysOut1, outCountC1);
-    invalidateRemaining(childRaysOut2, outCountC2);
-    invalidateRemaining(childRaysOut3, outCountC3);
-    invalidateRemaining(parentRaysOut, outCountParent);
+    invalidateRemaining(childRaysOut0, outCnt[0]);
+    invalidateRemaining(childRaysOut1, outCnt[1]);
+    invalidateRemaining(childRaysOut2, outCnt[2]);
+    invalidateRemaining(childRaysOut3, outCnt[3]);
+    invalidateRemaining(parentRaysOut, outCnt[PARENT]);
 
     // Fill debugBytes (10 counts = 20 bytes)
     uint16_t* dbg = reinterpret_cast<uint16_t*>(debugBytes.data());
@@ -569,11 +590,11 @@ public:
     dbg[2] = inCountC1;
     dbg[3] = inCountC2;
     dbg[4] = inCountC3;
-    dbg[5] = outCountParent;
-    dbg[6] = outCountC0;
-    dbg[7] = outCountC1;
-    dbg[8] = outCountC2;
-    dbg[9] = outCountC3;
+    dbg[5] = outCnt[PARENT];
+    dbg[6] = outCnt[0];
+    dbg[7] = outCnt[1];
+    dbg[8] = outCnt[2];
+    dbg[9] = outCnt[3];
 
     return true;
   }

@@ -75,6 +75,7 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& g, const poplar::Target&) {
     g.setTileMapping(stopFlag_.get(), 0);
     g.setInitialValue(stopFlag_.get(), poplar::ArrayRef<unsigned>({1}));
     auto condProgram = stopFlag_.buildWrite(g, true);
+    poplar::program::Sequence condProgram2;
     // auto condProgram = poplar::program::Copy(stopFlagStream, stopFlag_);
     auto frameLoop = poplar::program::RepeatWhileTrue(condProgram, stopFlag_.get(), frame_);
     getPrograms().add("frame_loop", frameLoop);
@@ -130,7 +131,7 @@ void RadiantFoamIpuBuilder::registerCodeletsAndOps(poplar::Graph& g) {
     const std::string incPath     = std::string(POPC_PREFIX) + "/include/";
     const std::string glmPath     = std::string(POPC_PREFIX) + "/external/glm/";
     g.addCodelets(codeletFile, poplar::CodeletFileType::Auto,
-                  "-O3 -I " + incPath + " -I " + glmPath);
+                  "-O3 -finline-functions -funroll-loops -I " + incPath + " -I " + glmPath);
     popops::addCodelets(g);
 }
 

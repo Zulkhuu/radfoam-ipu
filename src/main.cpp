@@ -48,18 +48,14 @@ using namespace radfoam::config;
 
 using ipu_utils::logger;
 
-// Assemble full image from finished rays buffer, persistent between frames
-static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRaysHost, int mode) {
-  // Persistent images (kept across frames)
+static std::pair<cv::Mat, size_t> AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRaysHost, int mode) {
   static cv::Mat rgb_img   (kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0));
   static cv::Mat depth_img (kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0));
 
-  // ---- Build a small LUT once: t in [0,80] -> BGR ----
-  // Using OpenCV just 81 times at startup is fine; the hot path uses the LUT.
   static std::array<cv::Vec3b, 81> T2BGR_LUT = []{
     std::array<cv::Vec3b, 81> lut{};
     for (int t = 0; t <= 80; ++t) {
-      const int hue = static_cast<int>(std::lround(t * (179.0 / 80.0))); // OpenCV H: 0..179
+      const int hue = static_cast<int>(std::lround(t * (179.0 / 80.0)));
       cv::Mat hsv(1, 1, CV_8UC3, cv::Scalar(hue, 255, 255));
       cv::Mat bgr;
       cv::cvtColor(hsv, bgr, cv::COLOR_HSV2BGR);
@@ -70,20 +66,19 @@ static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRay
 
   const size_t numFinishedRays = finishedRaysHost.size() / sizeof(FinishedRay);
   const FinishedRay* rays = reinterpret_cast<const FinishedRay*>(finishedRaysHost.data());
-
-  // Rays are laid out as [tile0 rays][tile1 rays] ... with a per-tile sentinel x==0xFFFF
   const size_t num_finished_ray_per_tile = (kNumRayTracerTiles > 0)
         ? (numFinishedRays / kNumRayTracerTiles)
         : 0;
 
   const int W = kFullImageWidth;
   const int H = kFullImageHeight;
-  const size_t rgb_step   = rgb_img.step;   // bytes per row
-  const size_t depth_step = depth_img.step; // bytes per row
+  const size_t rgb_step   = rgb_img.step;
+  const size_t depth_step = depth_img.step;
   uchar* const rgb_data   = rgb_img.data;
   uchar* const depth_data = depth_img.data;
 
-  // ---- Parallel over tiles (each thread processes whole tiles) ----
+  std::atomic<size_t> updatedPixels{0};
+
   #pragma omp parallel for schedule(static)
   for (ptrdiff_t tid = 0; tid < static_cast<ptrdiff_t>(kNumRayTracerTiles); ++tid) {
     const FinishedRay* tileRays = rays + tid * num_finished_ray_per_tile;
@@ -91,20 +86,15 @@ static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRay
     for (size_t i = 0; i < num_finished_ray_per_tile; ++i) {
       const FinishedRay& r = tileRays[i];
 
-      // sentinel: no more rays in this tile
       if (r.x == 0xFFFF) break;
-
-      // bounds check (kept branchy for safety; remove if guaranteed valid)
       if (r.x >= static_cast<uint16_t>(W) || r.y >= static_cast<uint16_t>(H)) continue;
 
-      // Write RGB
       const size_t off_rgb = static_cast<size_t>(r.y) * rgb_step + static_cast<size_t>(r.x) * 3;
       uchar* const dst_rgb = rgb_data + off_rgb;
       dst_rgb[0] = r.b;
       dst_rgb[1] = r.g;
       dst_rgb[2] = r.r;
 
-      // Write depth color via LUT
       int tt = static_cast<int>(std::lround(r.t));
       if (tt < 0)   tt = 0;
       if (tt > 80)  tt = 80;
@@ -115,12 +105,21 @@ static cv::Mat AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRay
       dst_d[0] = bgr[0];
       dst_d[1] = bgr[1];
       dst_d[2] = bgr[2];
+
+      updatedPixels.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
-  return (mode == 0) ? rgb_img : depth_img;
+  return {(mode == 0) ? rgb_img : depth_img, updatedPixels.load()};
 }
 
+size_t CountNonZeroPixels(const cv::Mat& img) {
+    // Convert to grayscale mask (any nonzero channel -> 255)
+    cv::Mat gray, mask;
+    cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+    cv::threshold(gray, mask, 0, 255, cv::THRESH_BINARY);
+    return static_cast<size_t>(cv::countNonZero(mask));
+}
 
 int main(int argc, char** argv) {
 
@@ -265,7 +264,7 @@ int main(int argc, char** argv) {
     uiServer->initialiseVideoStream(imagePtr->cols, imagePtr->rows);
     uiServer->updateFov(state.fov);
   }
-
+  
   // ------------------------------	
   // Main Execution & UI Loop
   // ------------------------------
@@ -275,6 +274,11 @@ int main(int argc, char** argv) {
       uiServer->sendPreviewImage(*imagePtrBuffered);
     }
   };
+  
+  std::cout << "IPU process started" << std::endl;
+  auto startTime = std::chrono::steady_clock::now();
+  const size_t totalPixels = kFullImageWidth * kFullImageHeight;
+  bool fullImageUpdated = false;
 
   builder.stopFlagHost_ = 1;
   std::thread ipuThread([&] {
@@ -307,16 +311,28 @@ int main(int argc, char** argv) {
       }
     }
 
-    auto startTime = std::chrono::steady_clock::now();
-    *imagePtr = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
+    auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
+    *imagePtr = imageMat;
+
     std::swap(imagePtr, imagePtrBuffered);
     if (enableUI) hostProcessing.run(uiUpdateFunc);
     
     state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
 
-    logger()->info("UI execution time: {}", std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count());
+    size_t nonZeroCount = CountNonZeroPixels(*imagePtr);
+    if(!fullImageUpdated) {
+      std::cout << "Updated pixels: " << updatedCount << " Non zero: " << nonZeroCount << std::endl;
+      if (nonZeroCount >= totalPixels*0.9995) {
+        auto now = std::chrono::steady_clock::now();
+        double elapsedSec = std::chrono::duration<double>(now - startTime).count();
+        std::cout << "Full image updated in " << elapsedSec << " seconds." << std::endl;
+        fullImageUpdated = true;
+        builder.stopFlagHost_ = 0;
+        break;
+      }
+    }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(16)); 
+    std::this_thread::sleep_for(std::chrono::milliseconds(32)); 
   } while (!enableUI || (uiServer && !state.stop));
 
   if (enableUI) hostProcessing.waitForCompletion();
@@ -324,7 +340,8 @@ int main(int argc, char** argv) {
   ipuThread.join();
 
   // cv::imwrite("framebuffer_full.png", AssembleFullImage(builder.framebuffer_host));
-  cv::imwrite("framebuffer_full.png", AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode));
+  auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
+  cv::imwrite("framebuffer_full.png", imageMat);
 
   return 0;
 }
