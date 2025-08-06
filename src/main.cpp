@@ -197,7 +197,7 @@ int main(int argc, char** argv) {
   // 						"  Position: ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
   // 						camera_cell.cluster_id, camera_cell.local_id, 
   // 						camera_cell.x, camera_cell.y, camera_cell.z);
-
+  
   radfoam::geometry::GenericPoint camera_cell{
      0.6503f, -1.2979f,  3.3524f, 
      static_cast<uint16_t>(779),   // cluster_id

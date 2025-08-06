@@ -20,20 +20,6 @@ struct Ray {
   uint16_t next_local;
 };
 
-// static const glm::mat4 View2(
-//     glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),
-//     glm::vec4( 0.484514f, -0.874620f, -0.016920f, 0.000000f),
-//     glm::vec4(-0.874087f, -0.484810f,  0.030524f, 0.000000f),
-//     glm::vec4(-0.000000f, -0.000000f, -6.700000f, 1.000000f)
-// );
-
-// static const glm::mat4 Proj2(
-//     glm::vec4(1.299038f, 0.000000f,  0.000000f,  0.000000f),
-//     glm::vec4(0.000000f, 1.732051f,  0.000000f,  0.000000f),
-//     glm::vec4(0.000000f, 0.000000f, -1.002002f, -1.000000f),
-//     glm::vec4(0.000000f, 0.000000f, -0.200200f,  0.000000f)
-// );
-
 template <typename T>
 inline __attribute__((always_inline))
 const T* readStructAt(const poplar::Input<poplar::Vector<uint8_t>>& buffer, std::size_t index) {
@@ -45,9 +31,20 @@ const T* readStructAt(const poplar::Input<poplar::Vector<uint8_t>>& buffer, std:
 inline __attribute__((always_inline))
 uint8_t clampToU8(float v) {
     return static_cast<uint8_t>(__builtin_ipu_max(0.0f, __builtin_ipu_min(255.0f, std::round(v * 255.0f))));
-    // return static_cast<uint8_t>(__builtin_ipu_clamp())
 }
 
+constexpr uint16_t kLeadMask   = 0xFC00u;   // 11111 00000000000₂
+constexpr unsigned kShift = 10;  
+
+[[gnu::always_inline]] inline uint8_t getLead6(uint16_t v) { 
+  return v >> kShift; 
+}
+
+[[gnu::always_inline]] inline uint16_t setLead6(const uint16_t &v, uint8_t x) {
+    return (v & ~kLeadMask) | ((x & 0x3F) << kShift); 
+}
+
+[[gnu::always_inline]] inline uint16_t data10(uint16_t v) { return v & ~kLeadMask; }
 
 class RayTrace : public poplar::Vertex {
 public:
@@ -73,7 +70,8 @@ public:
   poplar::InOut<unsigned>       exec_count;           // increments every sub-iteration
   poplar::InOut<unsigned>       finishedWriteOffset;  // append pointer within finishedRays
 
-  [[poplar::constraint("elem(*local_pts)!=elem(*framebuffer)")]]
+  // [[poplar::constraint("elem(*local_pts)!=elem(*finishedRays)")]]
+  // [[poplar::constraint("elem(*local_pts)!=elem(*raysOut)")]]
   bool compute() {
     // const Ray* ray_in = readStructAt<Ray>(raysIn, 0);
     // if (ray_in->x == 0xFFFF) {
@@ -126,7 +124,9 @@ public:
       if (ray_in->x == 0xFFFF) break; // End of rays
 
       // Compute ray direction in world space
-      glm::vec3 rayDir = computeRayDir(ray_in->x, ray_in->y);
+      uint16_t x_data = data10(ray_in->x); // & ~kLeadMask;
+      uint8_t n_passed_clusters = getLead6(ray_in->x);
+      glm::vec3 rayDir = computeRayDir(x_data, ray_in->y);
 
       // Initialize accumulation
       glm::vec3 color(ray_in->r, ray_in->g, ray_in->b);
@@ -148,8 +148,12 @@ public:
 
         if(debug) {
           cell_cntr++;
-          framebuffer[2 * cell_cntr]     = static_cast<uint8_t>((current >> 8) & 0xFF);
-          framebuffer[2 * cell_cntr + 1] = static_cast<uint8_t>(current & 0xFF);
+          framebuffer[6 * cell_cntr]     = static_cast<uint8_t>((ray_in->x >> 8) & 0xFF);
+          framebuffer[6 * cell_cntr + 1] = static_cast<uint8_t>(ray_in->x & 0xFF);
+          framebuffer[6 * cell_cntr + 2] = static_cast<uint8_t>((ray_in->y >> 8) & 0xFF);
+          framebuffer[6 * cell_cntr + 3] = static_cast<uint8_t>(ray_in->y & 0xFF);
+          framebuffer[6 * cell_cntr + 4] = static_cast<uint8_t>((current >> 8) & 0xFF);
+          framebuffer[6 * cell_cntr + 5] = static_cast<uint8_t>(current & 0xFF);
         }
 
         // Traverse neighbors
@@ -205,7 +209,7 @@ public:
           if (transmittance < 0.01f || nextIdx == -1) {
             // Ray finished
             FinishedRay* finished_ray = reinterpret_cast<FinishedRay*>(finishedRays.data() + sizeof(FinishedRay) * (base + finished_ray_cntr));
-            finished_ray->x = ray_in->x;
+            finished_ray->x = x_data;
             finished_ray->y = ray_in->y;
             finished_ray->r = clampToU8(color.x);
             finished_ray->g = clampToU8(color.y);
@@ -226,7 +230,10 @@ public:
             ray_out->next_local   = nbrPt->local_id;
             transmittance = __builtin_ipu_max(0.0f, __builtin_ipu_min(1.0f, transmittance));
             ray_out->transmittance = __builtin_ipu_f32tof16(transmittance);
-            ray_out->x = ray_in->x;
+            if(n_passed_clusters ==8 || n_passed_clusters == 16)
+              ray_out->x = setLead6(x_data, n_passed_clusters);
+            else
+              ray_out->x = setLead6(x_data, n_passed_clusters+1);
             ray_out->y = ray_in->y;
             ray_out->t = __builtin_ipu_f32tof16(t0);
             ray_out->r = color.x;
@@ -360,16 +367,17 @@ public:
         if (ray->x == INVALID_RAY_ID) break;
         count++;
         routeRay(ray);
+
       }
       return count;
     };
 
-    int mode = 1;
+    int mode = 3;
     if(mode == 0) { // Single ray test
       if(exec_count == 0) {
         Ray genRay{};
-        genRay.x = 78;
-        genRay.y = 28;
+        genRay.x = 304;
+        genRay.y = 288;
         genRay.r = 0.0f;
         genRay.g = 0.0f;
         genRay.b = 0.0f;
@@ -425,7 +433,29 @@ public:
           }
         }
       } 
+    }
+    if(mode == 3) {
+      const int interval = 5;
+      const int nx = 40;
+      const int ny = 30;
+      if(exec_count%interval == 0) {
+        for(uint16_t x=0; x<nx; x++) {
+          for(uint16_t y=0; y<ny; y++) {
+            Ray genRay{};
+            genRay.x = x*16 + ((exec_count/interval)%4)*4 ;
+            genRay.y = y*16 + (((exec_count/interval)/4)%4)*4;
+            genRay.r = 0.0f;
+            genRay.g = 0.0f;
+            genRay.b = 0.0f;
+            genRay.t = 0.0f;
+            genRay.transmittance = 1.0f;
+            genRay.next_cluster = cluster_id;
+            genRay.next_local   = local_id;
 
+            routeRay(&genRay);
+          }
+        }
+      } 
     }
 
     // Route each child and capture their input counts
@@ -518,46 +548,46 @@ public:
         return good ? childIdx : PARENT;
     };
 
-    // auto routeRay = [&](const Ray* ray)  __attribute__((always_inline)) {
-    //   int targetChild = findChildForCluster(ray->next_cluster);
-    //   if (targetChild == 0) {
-    //     if (outCountC0 < kNumRays) {
-    //       std::memcpy(childRaysOut0.data() + outCountC0 * RaySize, ray, RaySize);
-    //       outCountC0++;
-    //     }
-    //   } else if (targetChild == 1) {
-    //     if (outCountC1 < kNumRays) {
-    //       std::memcpy(childRaysOut1.data() + outCountC1 * RaySize, ray, RaySize);
-    //       outCountC1++;
-    //     }
-    //   } else if (targetChild == 2) {
-    //     if (outCountC2 < kNumRays) {
-    //       std::memcpy(childRaysOut2.data() + outCountC2 * RaySize, ray, RaySize);
-    //       outCountC2++;
-    //     }
-    //   } else if (targetChild == 3) {
-    //     if (outCountC3 < kNumRays) {
-    //       std::memcpy(childRaysOut3.data() + outCountC3 * RaySize, ray, RaySize);
-    //       outCountC3++;
-    //     }
-    //   } else {
-    //     if (outCountParent < kNumRays) {
-    //       std::memcpy(parentRaysOut.data() + outCountParent * RaySize, ray, RaySize);
-    //       outCountParent++;
-    //     }
-    //   }
-    // };
-    
-    auto routeRay = [&](const Ray* pr) __attribute__((always_inline)) {
-      unsigned p = findChildForCluster(pr->next_cluster);
-      switch (p) {
-        case 0: emit<0>(*pr, outCnt[0], outPorts); break;
-        case 1: emit<1>(*pr, outCnt[1], outPorts); break;
-        case 2: emit<2>(*pr, outCnt[2], outPorts); break;
-        case 3: emit<3>(*pr, outCnt[3], outPorts); break;
-        default: emit<4>(*pr, outCnt[4], outPorts); break;
+    auto routeRay = [&](const Ray* ray)  __attribute__((always_inline)) {
+      int targetChild = findChildForCluster(ray->next_cluster);
+      if (targetChild == 0) {
+        if (outCnt[0] < kNumRays) {
+          std::memcpy(childRaysOut0.data() + outCnt[0] * RaySize, ray, RaySize);
+          outCnt[0]++;
+        }
+      } else if (targetChild == 1) {
+        if (outCnt[1] < kNumRays) {
+          std::memcpy(childRaysOut1.data() + outCnt[1] * RaySize, ray, RaySize);
+          outCnt[1]++;
+        }
+      } else if (targetChild == 2) {
+        if (outCnt[2] < kNumRays) {
+          std::memcpy(childRaysOut2.data() + outCnt[2] * RaySize, ray, RaySize);
+          outCnt[2]++;
+        }
+      } else if (targetChild == 3) {
+        if (outCnt[3] < kNumRays) {
+          std::memcpy(childRaysOut3.data() + outCnt[3] * RaySize, ray, RaySize);
+          outCnt[3]++;
+        }
+      } else {
+        if (outCnt[4] < kNumRays) {
+          std::memcpy(parentRaysOut.data() + outCnt[4] * RaySize, ray, RaySize);
+          outCnt[4]++;
+        }
       }
     };
+    
+    // auto routeRay = [&](const Ray* pr) __attribute__((always_inline)) {
+    //   unsigned p = findChildForCluster(pr->next_cluster);
+    //   switch (p) {
+    //     case 0: emit<0>(*pr, outCnt[0], outPorts); break;
+    //     case 1: emit<1>(*pr, outCnt[1], outPorts); break;
+    //     case 2: emit<2>(*pr, outCnt[2], outPorts); break;
+    //     case 3: emit<3>(*pr, outCnt[3], outPorts); break;
+    //     default: emit<4>(*pr, outCnt[4], outPorts); break;
+    //   }
+    // };
 
     // New routeChildRays: count + route, return count
     auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) __attribute__((always_inline)) -> uint16_t {
@@ -566,7 +596,54 @@ public:
         const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * RaySize);
         if (ray->x == INVALID_RAY_ID) break;
         count++;
-        routeRay(ray);
+        uint8_t lead  = getLead6(ray->x);
+        int lane = findChildForCluster(ray->next_cluster);
+        if (lead == 8 && outCnt[lane]+3 < kNumRays) {
+
+          uint16_t xData = data10(ray->x);
+          uint16_t y = ray->y;
+          uint8_t next_lead = lead+1;
+          uint16_t xnext = setLead6(xData+2, next_lead);
+          uint16_t x = setLead6(xData, next_lead);
+
+          Ray tmp;
+          tmp = *ray;  
+          tmp.x = x; // (x, y)
+          routeRay(&tmp); 
+          
+          tmp.y = y + 2;   // (x , y+1)
+          routeRay(&tmp);
+
+          tmp.x = xnext;   // (x+1, y )
+          tmp.y = y;
+          routeRay(&tmp);
+
+          tmp.y = y + 2;   // (x+1 , y+1)
+          routeRay(&tmp);
+        } else if (lead == 16 && outCnt[lane]+3 < kNumRays) {
+          uint16_t xData = data10(ray->x);
+          uint16_t y = ray->y;
+          uint8_t next_lead = lead+1;
+          uint16_t xnext = setLead6(xData+1, next_lead);
+          uint16_t x = setLead6(xData, next_lead);
+
+          Ray tmp;
+          tmp = *ray;  
+          tmp.x = x; // (x, y)
+          routeRay(&tmp); 
+          
+          tmp.y = y + 1;   // (x , y+1)
+          routeRay(&tmp);
+
+          tmp.x = xnext;   // (x+1, y )
+          tmp.y = y;
+          routeRay(&tmp);
+
+          tmp.y = y + 1;   // (x+1 , y+1)
+          routeRay(&tmp);
+        } else {
+          routeRay(ray); 
+        }
       }
       return count;
     };

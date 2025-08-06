@@ -915,6 +915,8 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
 
     RF_LOG("================ Frame {} =================================================", exec_counter_);
     int overall_cntr = 0;
+    constexpr uint16_t kLeadMask   = 0xF800u;   // 11111 00000000000₂
+    constexpr unsigned kShift = 11;
     for (int tid = 0; tid < 1024; ++tid) {
         const size_t offset = static_cast<size_t>(tid) * kTileFramebufferSize;
         uint8_t cnt = framebuffer_host[offset];
@@ -926,16 +928,22 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
 
             // Iterate through points written in framebuffer
             for (uint8_t i = 1; i <= cnt; ++i) {
-                uint16_t pt_idx = (framebuffer_host[offset + i * 2] << 8) |
-                                framebuffer_host[offset + i * 2 + 1];
+                uint16_t x = (framebuffer_host[offset + i * 6] << 8) |
+                                framebuffer_host[offset + i * 6 + 1];
+                uint16_t y = (framebuffer_host[offset + i * 6 + 2] << 8) |
+                                framebuffer_host[offset + i * 6 + 3];
+                auto x_data = x & ~kLeadMask;
+                auto x_cluster_cnt = (x & kLeadMask) >> kShift;
+                uint16_t pt_idx = (framebuffer_host[offset + i * 6 + 4] << 8) |
+                                framebuffer_host[offset + i * 6 + 5];
 
                 if (pt_idx < local_pts_[tid].size()) {
                     const auto &pt = local_pts_[tid][pt_idx];
-                    fmt::print("[{}] {}: {:4} → ({:8.6f}, {:8.6f}, {:8.6f})\n",
-                            overall_cntr, i, pt_idx, pt.x, pt.y, pt.z);
+                    fmt::print("[{}] ({}, {}) {}: {:4} → ({:8.6f}, {:8.6f}, {:8.6f})\n",
+                            i, x_data, y, x_cluster_cnt, pt_idx, pt.x, pt.y, pt.z);
                 } else {
-                    fmt::print("[{}] {}: {:4} → (INVALID INDEX)\n",
-                            overall_cntr, i, pt_idx);
+                    fmt::print("[{}]: {:4} → (INVALID INDEX)\n",
+                            i, pt_idx);
                 }
 
                 ++overall_cntr;
