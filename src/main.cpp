@@ -197,11 +197,17 @@ int main(int argc, char** argv) {
   // 						"  Position: ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
   // 						camera_cell.cluster_id, camera_cell.local_id, 
   // 						camera_cell.x, camera_cell.y, camera_cell.z);
+
   radfoam::geometry::GenericPoint camera_cell{
      0.6503f, -1.2979f,  3.3524f, 
      static_cast<uint16_t>(779),   // cluster_id
      static_cast<uint16_t>(3532)   // local_id
   };
+  // radfoam::geometry::GenericPoint camera_cell{
+  //    -6.6959f, -0.1134f,  0.2045f, 
+  //    static_cast<uint16_t>(60),   // cluster_id
+  //    static_cast<uint16_t>(2476)   // local_id
+  // };
 
   // ------------------------------
   // Poplar Engine Options
@@ -280,10 +286,10 @@ int main(int argc, char** argv) {
   const size_t totalPixels = kFullImageWidth * kFullImageHeight;
   bool fullImageUpdated = false;
 
-  builder.stopFlagHost_ = 1;
-  std::thread ipuThread([&] {
-    mgr.execute(builder);
-  });
+  // builder.stopFlagHost_ = 1;
+  // std::thread ipuThread([&] {
+  //   mgr.execute(builder);
+  // });
 
   int step=0;
   do {
@@ -311,6 +317,7 @@ int main(int argc, char** argv) {
       }
     }
 
+    mgr.execute(builder);
     auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
     *imagePtr = imageMat;
 
@@ -337,7 +344,7 @@ int main(int argc, char** argv) {
 
   if (enableUI) hostProcessing.waitForCompletion();
 
-  ipuThread.join();
+  // ipuThread.join();
 
   // cv::imwrite("framebuffer_full.png", AssembleFullImage(builder.framebuffer_host));
   auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);

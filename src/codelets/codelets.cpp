@@ -4,10 +4,21 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <geometry/primitives.hpp>
 #include <ipu/rf_config.hpp>
+#include <ipudef.h>
 #include <ipu_builtins.h>
 
-using namespace radfoam::geometry;
 using namespace radfoam::config;
+using radfoam::geometry::LocalPoint;
+using radfoam::geometry::GenericPoint;
+using radfoam::geometry::FinishedRay;
+
+struct Ray {
+  uint16_t x, y;
+  half t, transmittance;
+  float r, g, b;
+  uint16_t next_cluster; 
+  uint16_t next_local;
+};
 
 // static const glm::mat4 View2(
 //     glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),
@@ -36,6 +47,7 @@ uint8_t clampToU8(float v) {
     return static_cast<uint8_t>(__builtin_ipu_max(0.0f, __builtin_ipu_min(255.0f, std::round(v * 255.0f))));
     // return static_cast<uint8_t>(__builtin_ipu_clamp())
 }
+
 
 class RayTrace : public poplar::Vertex {
 public:
@@ -72,8 +84,8 @@ public:
     constexpr int LocalPointSize = sizeof(LocalPoint);
     constexpr int GenericPointSize = sizeof(GenericPoint); 
 
-    constexpr unsigned substeps = 20;
-    constexpr unsigned finishedRaysCap = kNumRays * 3;
+    constexpr unsigned substeps = 1;
+    constexpr unsigned finishedRaysCap = kNumRays * kFinishedFactor;
     unsigned exec_step_id = exec_count % substeps;
     bool startOfFrame = (exec_step_id == 0);
 
@@ -118,8 +130,8 @@ public:
 
       // Initialize accumulation
       glm::vec3 color(ray_in->r, ray_in->g, ray_in->b);
-      float transmittance = ray_in->transmittance;
-      float t0 = ray_in->t;
+      float transmittance = __builtin_ipu_f16tof32(ray_in->transmittance);
+      float t0 = __builtin_ipu_f16tof32(ray_in->t);
 
       int current = ray_in->next_local;
       int steps = 0;
@@ -168,21 +180,22 @@ public:
           if (dotND <= 0.0f) continue;
 
           float t = glm::dot(faceOrigin - rayOrigin, faceNormal) / dotND;
-          if (t > 0 && t < closestT  && t >= t0) {
+          if (t > 0 && t < closestT ) {
             closestT = t;
             nextIdx = neighborIdx;
           }
         }
 
         // Accumulate color
-        // float delta = __builtin_fmaxf(0.0f, closestT - t0);
         float delta = closestT - t0;
         float alpha = 1.0f - __builtin_ipu_exp(-cur_cell->density * delta);
         // color += transmittance * alpha *
         //          glm::vec3(cur_cell->r / 255.0f, cur_cell->g / 255.0f, cur_cell->b / 255.0f);
-        color.x += transmittance * alpha * (cur_cell->r/255.0f);
-        color.y += transmittance * alpha * (cur_cell->g/255.0f);
-        color.z += transmittance * alpha * (cur_cell->b/255.0f);
+        auto ta = transmittance * alpha;
+        color.x += ta * (cur_cell->r/255.0f);
+        color.y += ta * (cur_cell->g/255.0f);
+        color.z += ta * (cur_cell->b/255.0f);
+
 
         transmittance *= (1.0f - alpha);
         t0 = __builtin_ipu_max(t0, closestT);
@@ -211,10 +224,11 @@ public:
             Ray* ray_out = reinterpret_cast<Ray*>(raysOut.data()+sizeof(Ray)*out_ray_cntr);
             ray_out->next_cluster = nbrPt->cluster_id;
             ray_out->next_local   = nbrPt->local_id;
-            ray_out->transmittance = transmittance;
+            transmittance = __builtin_ipu_max(0.0f, __builtin_ipu_min(1.0f, transmittance));
+            ray_out->transmittance = __builtin_ipu_f32tof16(transmittance);
             ray_out->x = ray_in->x;
             ray_out->y = ray_in->y;
-            ray_out->t = t0;
+            ray_out->t = __builtin_ipu_f32tof16(t0);
             ray_out->r = color.x;
             ray_out->g = color.y;
             ray_out->b = color.z;
@@ -227,7 +241,6 @@ public:
         }
 
         ++steps;
-        t0 = __builtin_fmaxf(t0, closestT);
         current = nextIdx;
       }
 
@@ -266,11 +279,6 @@ private:
   }
 
   void invalidateRemainingRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) __attribute__((always_inline)) {
-    //  Ray *r = reinterpret_cast<Ray*>(buffer.data() + sizeof(Ray) * count);
-    //  while(r->x!=0xFFFF && ){
-    //   r->x = 0xFFFF; 
-    //   ++r; 
-    // }
     for (int i = count; i < kNumRays; i++) {
       Ray* ray = reinterpret_cast<Ray*>(buffer.data() + sizeof(Ray) * i);
       if(ray->x == 0xFFFF)
@@ -280,7 +288,7 @@ private:
   }
 
   inline void invalidateRemainingFinishedRays(poplar::InOut<poplar::Vector<uint8_t>>& buffer, int count) __attribute__((always_inline)) {
-    for (int i = count; i < kNumRays*3; i++) {
+    for (int i = count; i < kNumRays * kFinishedFactor; i++) {
       FinishedRay* ray = reinterpret_cast<FinishedRay*>(buffer.data() + sizeof(FinishedRay) * i);
       if(ray->x == 0xFFFF)
         break;
@@ -358,17 +366,19 @@ public:
 
     int mode = 1;
     if(mode == 0) { // Single ray test
-      Ray genRay{};
-      genRay.x = 343;
-      genRay.y = 428;
-      genRay.r = 0.0f;
-      genRay.g = 0.0f;
-      genRay.b = 0.0f;
-      genRay.t = 0.0f;
-      genRay.transmittance = 1.0f;
-      genRay.next_cluster = cluster_id;
-      genRay.next_local   = local_id;
-      routeRay(&genRay);
+      if(exec_count == 0) {
+        Ray genRay{};
+        genRay.x = 78;
+        genRay.y = 28;
+        genRay.r = 0.0f;
+        genRay.g = 0.0f;
+        genRay.b = 0.0f;
+        genRay.t = 0.0f;
+        genRay.transmittance = 1.0f;
+        genRay.next_cluster = cluster_id;
+        genRay.next_local   = local_id;
+        routeRay(&genRay);
+      }
     }
     if(mode == 1) { // Row scan
       const int interval = 3;
@@ -383,8 +393,8 @@ public:
             genRay.r = 0.0f;
             genRay.g = 0.0f;
             genRay.b = 0.0f;
-            genRay.t = 0.0f;
-            genRay.transmittance = 1.0f;
+            genRay.t = 0.0;
+            genRay.transmittance = 1.0;
             genRay.next_cluster = cluster_id;
             genRay.next_local   = local_id;
 

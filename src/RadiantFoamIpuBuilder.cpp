@@ -67,7 +67,9 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& g, const poplar::Target&) {
     setupHostStreams(g);
 
     poplar::program::Sequence frame_;
-    frame_.add(poplar::program::Repeat(kSubsteps, frameStep_));
+    // frame_.add(poplar::program::Repeat(kSubsteps, frameStep_));
+    frame_.add(poplar::program::Execute(cs));
+    frame_.add(data_exchange_seq);
     frame_.add(poplar::program::Copy(inStreamFinishedRays, inStream));
     getPrograms().add("frame", frame_);
 
@@ -75,10 +77,10 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& g, const poplar::Target&) {
     g.setTileMapping(stopFlag_.get(), 0);
     g.setInitialValue(stopFlag_.get(), poplar::ArrayRef<unsigned>({1}));
     auto condProgram = stopFlag_.buildWrite(g, true);
-    poplar::program::Sequence condProgram2;
+    // poplar::program::Sequence condProgram2;
     // auto condProgram = poplar::program::Copy(stopFlagStream, stopFlag_);
-    auto frameLoop = poplar::program::RepeatWhileTrue(condProgram, stopFlag_.get(), frame_);
-    getPrograms().add("frame_loop", frameLoop);
+    // auto frameLoop = poplar::program::RepeatWhileTrue(condProgram, stopFlag_.get(), frame_);
+    // getPrograms().add("frame_loop", frameLoop);
 }
 
 // ----------------------------------------------------------------------------
@@ -88,20 +90,22 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
     if (exec_counter_ == 0) {
         connectHostStreams(eng);
 
-        eng.run(getPrograms().getOrdinals().at("write_scene_data"));
+        eng.run(getPrograms().getOrdinals().at("write_scene_data"),
+            fmt::format("frame_{:03d}/write_scene_data", exec_counter_));
         eng.run(getPrograms().getOrdinals().at("broadcast_matrices"),
             fmt::format("frame_{:03d}/broadcast_matrices", exec_counter_));
         eng.run(getPrograms().getOrdinals().at("write_camera_cell_info"),
             fmt::format("frame_{:03d}/write_camera_cell_info", exec_counter_));
 
-        eng.run(getPrograms().getOrdinals().at("frame_loop"));
+        // eng.run(getPrograms().getOrdinals().at("frame_loop"));
     }
 
-    // eng.run(getPrograms().getOrdinals().at("frame"),
-    //         fmt::format("frame_{:03d}", exec_counter_));
+    eng.run(getPrograms().getOrdinals().at("frame"),
+            fmt::format("frame_{:03d}", exec_counter_));
+    
+    // readAllTiles(eng);
 
     // if(debug_)
-    //     readAllTiles(eng);
 
     exec_counter_++;
 }
@@ -650,7 +654,7 @@ void RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph& g) {
   constexpr size_t   kRayIOBytesPerTile  = kNumRays * sizeof(Ray);
   const     size_t   kRouterPerTileBuffer = kRayIOBytesPerTile * 5; // [parent | child0..3]
 
-  poplar::program::Sequence seq(DebugContext{"DataExchangeSeq"});
+  data_exchange_seq = poplar::program::Sequence(DebugContext{"DataExchangeSeq"});
 
   auto childBlock = [&](poplar::Tensor &buf, uint16_t rid) -> poplar::Tensor {
     const size_t base = static_cast<size_t>(rid) * kRouterPerTileBuffer;
@@ -674,7 +678,7 @@ void RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph& g) {
       srcAll.push_back(childBlock(L0RouterOut, l0)); // 4×bytes
       dstAll.push_back(rayTracerInputRays_.slice(baseRT, baseRT + kChildrenPerRouter * kRayIOBytesPerTile));
     }
-    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+    data_exchange_seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
                                   /*dontOutline*/true, DebugContext{"DX/L0->RT/down"}));
 
     srcAll.clear(); dstAll.clear();
@@ -683,7 +687,7 @@ void RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph& g) {
       srcAll.push_back(rayTracerOutputRays_.slice(baseRT, baseRT + kChildrenPerRouter * kRayIOBytesPerTile));
       dstAll.push_back(childBlock(L0RouterIn, l0)); // 4×bytes
     }
-    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+    data_exchange_seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
                                   /*dontOutline*/true, DebugContext{"DX/RT->L0/up"}));
   }
 
@@ -710,7 +714,7 @@ void RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph& g) {
       srcAll.push_back(poplar::concat(l0Parents));
       dstAll.push_back(l1ChildInBlock);
     }
-    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+    data_exchange_seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
                                   true, DebugContext{"DX/L0->L1/down"}));
 
     // UP
@@ -727,7 +731,7 @@ void RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph& g) {
       srcAll.push_back(l1ChildOutBlock);
       dstAll.push_back(poplar::concat(l0ParentsIn));
     }
-    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+    data_exchange_seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
                                   true, DebugContext{"DX/L1->L0/up"}));
   }
 
@@ -751,7 +755,7 @@ void RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph& g) {
       srcAll.push_back(poplar::concat(l1Parents));
       dstAll.push_back(l2ChildInBlock);
     }
-    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+    data_exchange_seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
                                   true, DebugContext{"DX/L1->L2/down"}));
 
     // UP
@@ -768,7 +772,7 @@ void RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph& g) {
       srcAll.push_back(l2ChildOutBlock);
       dstAll.push_back(poplar::concat(l1ParentsIn));
     }
-    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+    data_exchange_seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
                                   true, DebugContext{"DX/L2->L1/up"}));
   }
 
@@ -792,7 +796,7 @@ void RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph& g) {
       srcAll.push_back(poplar::concat(l2Parents));
       dstAll.push_back(l3ChildInBlock);
     }
-    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+    data_exchange_seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
                                   true, DebugContext{"DX/L2->L3/down"}));
 
     // UP
@@ -809,7 +813,7 @@ void RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph& g) {
       srcAll.push_back(l3ChildOutBlock);
       dstAll.push_back(poplar::concat(l2ParentsIn));
     }
-    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+    data_exchange_seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
                                   true, DebugContext{"DX/L3->L2/up"}));
   }
 
@@ -826,7 +830,7 @@ void RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph& g) {
       srcAll.push_back(raygenOutput.slice(base, base + kRayIOBytesPerTile)); // RG child out (index = l3)
       dstAll.push_back(parentSlot(L3RouterIn, l3));                          // L3 parentIn
     }
-    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+    data_exchange_seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
                                   true, DebugContext{"DX/RG->L3/down"}));
 
     // UP (L3 parentOut -> RG childIn)
@@ -836,14 +840,14 @@ void RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph& g) {
       srcAll.push_back(parentSlot(L3RouterOut, l3));                         // L3 parentOut
       dstAll.push_back(raygenInput.slice(base, base + kRayIOBytesPerTile));  // RG child in (index = l3)
     }
-    seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
+    data_exchange_seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
                                   true, DebugContext{"DX/L3->RG/up"}));
   }
 
   // Register the program (use this if you still call it by name from execute())
     //   getPrograms().add("DataExchange", seq);
 
-  frameStep_.add(seq);
+  frameStep_.add(data_exchange_seq);
 }
 
 void RadiantFoamIpuBuilder::setupHostStreams(poplar::Graph& g) {
