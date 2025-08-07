@@ -147,13 +147,15 @@ public:
         uint16_t end   = cur_cell->adj_end;
 
         if(debug) {
-          cell_cntr++;
-          framebuffer[6 * cell_cntr]     = static_cast<uint8_t>((ray_in->x >> 8) & 0xFF);
-          framebuffer[6 * cell_cntr + 1] = static_cast<uint8_t>(ray_in->x & 0xFF);
-          framebuffer[6 * cell_cntr + 2] = static_cast<uint8_t>((ray_in->y >> 8) & 0xFF);
-          framebuffer[6 * cell_cntr + 3] = static_cast<uint8_t>(ray_in->y & 0xFF);
-          framebuffer[6 * cell_cntr + 4] = static_cast<uint8_t>((current >> 8) & 0xFF);
-          framebuffer[6 * cell_cntr + 5] = static_cast<uint8_t>(current & 0xFF);
+          if(6 * (cell_cntr + 1) + 5 < framebuffer.size()) {
+            cell_cntr++;
+            framebuffer[6 * cell_cntr]     = static_cast<uint8_t>((ray_in->x >> 8) & 0xFF);
+            framebuffer[6 * cell_cntr + 1] = static_cast<uint8_t>(ray_in->x & 0xFF);
+            framebuffer[6 * cell_cntr + 2] = static_cast<uint8_t>((ray_in->y >> 8) & 0xFF);
+            framebuffer[6 * cell_cntr + 3] = static_cast<uint8_t>(ray_in->y & 0xFF);
+            framebuffer[6 * cell_cntr + 4] = static_cast<uint8_t>((current >> 8) & 0xFF);
+            framebuffer[6 * cell_cntr + 5] = static_cast<uint8_t>(current & 0xFF);
+          }
         }
 
         // Traverse neighbors
@@ -230,7 +232,7 @@ public:
             ray_out->next_local   = nbrPt->local_id;
             transmittance = __builtin_ipu_max(0.0f, __builtin_ipu_min(1.0f, transmittance));
             ray_out->transmittance = __builtin_ipu_f32tof16(transmittance);
-            if(n_passed_clusters ==8 || n_passed_clusters == 16)
+            if(n_passed_clusters == 5 || n_passed_clusters == 10 || n_passed_clusters == 15)
               ray_out->x = setLead6(x_data, n_passed_clusters);
             else
               ray_out->x = setLead6(x_data, n_passed_clusters+1);
@@ -435,15 +437,15 @@ public:
       } 
     }
     if(mode == 3) {
-      const int interval = 5;
+      const int interval = 15;
       const int nx = 40;
       const int ny = 30;
-      if(exec_count%interval == 0) {
+      if(exec_count == 0) {
         for(uint16_t x=0; x<nx; x++) {
           for(uint16_t y=0; y<ny; y++) {
             Ray genRay{};
-            genRay.x = x*16 + ((exec_count/interval)%4)*4 ;
-            genRay.y = y*16 + (((exec_count/interval)/4)%4)*4;
+            genRay.x = x*16; // + ((exec_count/interval)%4)*4 ;
+            genRay.y = y*16; // + (((exec_count/interval)/4)%4)*4;
             genRay.r = 0.0f;
             genRay.g = 0.0f;
             genRay.b = 0.0f;
@@ -589,6 +591,7 @@ public:
     //   }
     // };
 
+    
     // New routeChildRays: count + route, return count
     auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) __attribute__((always_inline)) -> uint16_t {
       uint16_t count = 0;
@@ -596,54 +599,47 @@ public:
         const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * RaySize);
         if (ray->x == INVALID_RAY_ID) break;
         count++;
-        uint8_t lead  = getLead6(ray->x);
+
+        uint16_t x10   = data10(ray->x);
+        uint16_t y16   = ray->y;
+        uint8_t  lead  = getLead6(ray->x);
         int lane = findChildForCluster(ray->next_cluster);
-        if (lead == 8 && outCnt[lane]+3 < kNumRays) {
 
-          uint16_t xData = data10(ray->x);
-          uint16_t y = ray->y;
-          uint8_t next_lead = lead+1;
-          uint16_t xnext = setLead6(xData+2, next_lead);
-          uint16_t x = setLead6(xData, next_lead);
-
-          Ray tmp;
-          tmp = *ray;  
-          tmp.x = x; // (x, y)
-          routeRay(&tmp); 
-          
-          tmp.y = y + 2;   // (x , y+1)
-          routeRay(&tmp);
-
-          tmp.x = xnext;   // (x+1, y )
-          tmp.y = y;
-          routeRay(&tmp);
-
-          tmp.y = y + 2;   // (x+1 , y+1)
-          routeRay(&tmp);
-        } else if (lead == 16 && outCnt[lane]+3 < kNumRays) {
-          uint16_t xData = data10(ray->x);
-          uint16_t y = ray->y;
-          uint8_t next_lead = lead+1;
-          uint16_t xnext = setLead6(xData+1, next_lead);
-          uint16_t x = setLead6(xData, next_lead);
-
-          Ray tmp;
-          tmp = *ray;  
-          tmp.x = x; // (x, y)
-          routeRay(&tmp); 
-          
-          tmp.y = y + 1;   // (x , y+1)
-          routeRay(&tmp);
-
-          tmp.x = xnext;   // (x+1, y )
-          tmp.y = y;
-          routeRay(&tmp);
-
-          tmp.y = y + 1;   // (x+1 , y+1)
-          routeRay(&tmp);
-        } else {
-          routeRay(ray); 
+        auto spawn = [&](uint16_t xx, uint16_t yy) {
+          Ray t = *ray;
+          t.x = xx;
+          t.y = yy;
+          routeRay(&t);
+        };
+        // ------------------------------------------------------- stage 1 : lead 5
+        if (level==0 && lane!=PARENT && lead==5) {
+            // add (+2, 0) (+0,+2) (+2,+2)
+          if (outCnt[lane] < kNumRays-4) {
+            spawn(setLead6(x10,6), y16      );
+            spawn(setLead6(x10+2,6), y16      );   // east
+            spawn(setLead6(x10  ,6), y16+2    );   // south
+            spawn(setLead6(x10+2,6), y16+2    );   // south-east
+          }
         }
+
+        // ------------------------------------------------------- stage 2 : lead 10
+        else if (level==0 && lane!=PARENT && lead==10) {
+            // add (+1, 0)  ( copies it to the hole in each 2-col stripe )
+          if (outCnt[lane] < kNumRays-4) {
+            spawn(setLead6(x10, 11), y16      );
+            spawn(setLead6(x10+1, 11), y16      );
+          }
+        }
+
+        // ------------------------------------------------------- stage 3 : lead 15
+        // else if (level==0 && lane!=PARENT && lead==15) {
+        //     // add ( 0,+1 )   ( copies it to the hole in each 2-row stripe )
+        //     spawn(setLead6(x10  ,16), y16    );
+        //     spawn(setLead6(x10  ,16), y16+1    );
+        // }
+        else 
+          // always forward the current ray itself
+          routeRay(ray);
       }
       return count;
     };

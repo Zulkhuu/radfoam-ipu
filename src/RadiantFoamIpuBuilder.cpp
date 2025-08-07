@@ -103,7 +103,7 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
     eng.run(getPrograms().getOrdinals().at("frame"),
             fmt::format("frame_{:03d}", exec_counter_));
     
-    // readAllTiles(eng);
+    readAllTiles(eng);
 
     // if(debug_)
 
@@ -915,110 +915,87 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
 
     RF_LOG("================ Frame {} =================================================", exec_counter_);
     int overall_cntr = 0;
-    constexpr uint16_t kLeadMask   = 0xF800u;   // 11111 00000000000₂
-    constexpr unsigned kShift = 11;
-    for (int tid = 0; tid < 1024; ++tid) {
-        const size_t offset = static_cast<size_t>(tid) * kTileFramebufferSize;
-        uint8_t cnt = framebuffer_host[offset];
+    constexpr uint16_t kLeadMask   = 0xFC00u;   // 11111 00000000000₂
+    constexpr unsigned kShift = 10;
 
-        if (cnt > 0) {
-            // Print summary for this tile
-            RF_LOG("Tile {} result f32: {:.9f}, u16: {}", tid,
-                result_f32_host[tid], result_u16_host[tid]);
+    // Cell tracking
+    // for (int tid = 0; tid < 1024; ++tid) {
+    //     const size_t offset = static_cast<size_t>(tid) * kTileFramebufferSize;
+    //     uint8_t cnt = framebuffer_host[offset];
 
-            // Iterate through points written in framebuffer
-            for (uint8_t i = 1; i <= cnt; ++i) {
-                uint16_t x = (framebuffer_host[offset + i * 6] << 8) |
-                                framebuffer_host[offset + i * 6 + 1];
-                uint16_t y = (framebuffer_host[offset + i * 6 + 2] << 8) |
-                                framebuffer_host[offset + i * 6 + 3];
-                auto x_data = x & ~kLeadMask;
-                auto x_cluster_cnt = (x & kLeadMask) >> kShift;
-                uint16_t pt_idx = (framebuffer_host[offset + i * 6 + 4] << 8) |
-                                framebuffer_host[offset + i * 6 + 5];
+    //     if (cnt > 0) {
+    //         // Print summary for this tile
+    //         RF_LOG("Tile {} result f32: {:.9f}, u16: {}", tid,
+    //             result_f32_host[tid], result_u16_host[tid]);
 
-                if (pt_idx < local_pts_[tid].size()) {
-                    const auto &pt = local_pts_[tid][pt_idx];
-                    fmt::print("[{}] ({}, {}) {}: {:4} → ({:8.6f}, {:8.6f}, {:8.6f})\n",
-                            i, x_data, y, x_cluster_cnt, pt_idx, pt.x, pt.y, pt.z);
-                } else {
-                    fmt::print("[{}]: {:4} → (INVALID INDEX)\n",
-                            i, pt_idx);
-                }
+    //         // Iterate through points written in framebuffer
+    //         for (uint8_t i = 1; i <= cnt; ++i) {
+    //             uint16_t x = (framebuffer_host[offset + i * 6] << 8) |
+    //                             framebuffer_host[offset + i * 6 + 1];
+    //             uint16_t y = (framebuffer_host[offset + i * 6 + 2] << 8) |
+    //                             framebuffer_host[offset + i * 6 + 3];
+    //             auto x_data = x & ~kLeadMask;
+    //             auto x_cluster_cnt = (x & kLeadMask) >> kShift;
+    //             uint16_t pt_idx = (framebuffer_host[offset + i * 6 + 4] << 8) |
+    //                             framebuffer_host[offset + i * 6 + 5];
 
-                ++overall_cntr;
+    //             if (pt_idx < local_pts_[tid].size()) {
+    //                 const auto &pt = local_pts_[tid][pt_idx];
+    //                 fmt::print("[{}] ({}, {}) {}: {:4} → ({:8.6f}, {:8.6f}, {:8.6f})\n",
+    //                         i, x_data, y, x_cluster_cnt, pt_idx, pt.x, pt.y, pt.z);
+    //             } else {
+    //                 fmt::print("[{}]: {:4} → (INVALID INDEX)\n",
+    //                         i, pt_idx);
+    //             }
+
+    //             ++overall_cntr;
+    //         }
+    //     }
+    // }
+
+    // -----------------------------------------------------------------------------
+    //  Router-lane saturation test
+    // -----------------------------------------------------------------------------
+    constexpr std::uint16_t kWarnCap        = 500;  // threshold
+    constexpr int           kWordsPerRouter = 10;    // 0..4 = IN  / 5..9 = OUT
+
+    auto dumpRouters =
+        [&](const char                       *lvl,
+            const std::vector<std::uint8_t>  &dbg,
+            std::size_t                       numRouters)
+    {
+        for (std::size_t rid = 0; rid < numRouters; ++rid)
+        {
+            const std::uint8_t *base = &dbg[rid * kRouterDebugSize];
+
+            std::array<std::uint16_t, kWordsPerRouter> w{};
+            for (std::size_t i = 0; i < kWordsPerRouter; ++i)
+            {
+                /* build little-endian 16-bit word   byte0 = LSB, byte1 = MSB */
+                w[i] = static_cast<std::uint16_t>(base[2*i])         |
+                    (static_cast<std::uint16_t>(base[2*i + 1]) << 8);
+            }
+
+            bool over = std::any_of(w.begin(), w.end(),
+                                    [](std::uint16_t v){ return v > kWarnCap; });
+
+            if (over)
+            {
+                fmt::print("{} router {:4}: "
+                    "IP {:4}  {:4}  {:4}  {:4} {:4}\t"
+                    "OP {:4}  {:4}  {:4}  {:4} {:4}\n",
+                    lvl, rid,
+                    w[0], w[1], w[2], w[3], w[4],
+                    w[5], w[6], w[7], w[8], w[9]);
             }
         }
-    }
-
-    // {
-    //     auto targetrouters = {2, 3};
-    //     for(const auto& targetRouter : targetrouters) {
-    //         fmt::print("L3 router {:4}:", targetRouter);
-
-    //         const uint8_t* base = &l3routerDebugBytesHost_[targetRouter * kRouterDebugSize];
-
-    //         for (size_t i = 0; i < kRouterDebugSize; i += 2) {
-    //             uint16_t val = static_cast<uint16_t>(base[i]) |
-    //                         (static_cast<uint16_t>(base[i + 1]) << 8);
-
-    //             fmt::print("{:5} ", val);
-    //             if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
-    //         }
-    //         fmt::print("\n");
-    //     }
-    // }
-    // {
-    //     auto targetrouters = {8, 11, 13};
-    //     for(const auto& targetRouter : targetrouters) {
-    //         fmt::print("L2 router {:4}:", targetRouter);
-
-    //         const uint8_t* base = &l2routerDebugBytesHost_[targetRouter * kRouterDebugSize];
-
-    //         for (size_t i = 0; i < kRouterDebugSize; i += 2) {
-    //             uint16_t val = static_cast<uint16_t>(base[i]) |
-    //                         (static_cast<uint16_t>(base[i + 1]) << 8);
-
-    //             fmt::print("{:5} ", val);
-    //             if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
-    //         }
-    //         fmt::print("\n");
-    //     }
-    // }
-    // {
-    //     auto targetrouters = {32, 33, 45, 53};
-    //     for(const auto& targetRouter : targetrouters) {
-    //         fmt::print("L1 router {:4}:", targetRouter);
-
-    //         const uint8_t* base = &l1routerDebugBytesHost_[targetRouter * kRouterDebugSize];
-
-    //         for (size_t i = 0; i < kRouterDebugSize; i += 2) {
-    //             uint16_t val = static_cast<uint16_t>(base[i]) |
-    //                         (static_cast<uint16_t>(base[i + 1]) << 8);
-
-    //             fmt::print("{:5} ", val);
-    //             if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
-    //         }
-    //         fmt::print("\n");
-    //     }
-    // }
-    // {
-    //     auto targetrouters = {130, 131, 134, 176, 177, 182, 214};
-    //     for(const auto& targetRouter : targetrouters) {
-    //         fmt::print("L0 router {:4}:", targetRouter);
-
-    //         const uint8_t* base = &l0routerDebugBytesHost_[targetRouter * kRouterDebugSize];
-
-    //         for (size_t i = 0; i < kRouterDebugSize; i += 2) {
-    //             uint16_t val = static_cast<uint16_t>(base[i]) |
-    //                         (static_cast<uint16_t>(base[i + 1]) << 8);
-
-    //             fmt::print("{:5} ", val);
-    //             if ((i / 2 + 1) % 5 == 0) fmt::print("|"); // newline every 8 values
-    //         }
-    //         fmt::print("\n");
-    //     }
-    // }
+    };
+    // call once per level ----------------------------------------------------------
+    dumpRouters("L0", l0routerDebugBytesHost_, kNumL0RouterTiles);
+    dumpRouters("L1", l1routerDebugBytesHost_, kNumL1RouterTiles);
+    dumpRouters("L2", l2routerDebugBytesHost_, kNumL2RouterTiles);
+    dumpRouters("L3", l3routerDebugBytesHost_, kNumL3RouterTiles);
+    dumpRouters("RG",  raygenDebugBytesHost_,  1);   
 
 }
 
