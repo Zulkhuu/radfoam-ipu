@@ -406,6 +406,17 @@ void RadiantFoamIpuBuilder::buildRayRoutersL0(poplar::Graph& g, poplar::ComputeS
         g.setTileMapping(levelConst, tile);
         g.connect(v["level"], levelConst);
 
+        const auto kNumWorkers = 6;
+        auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedCounts");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedOffsets");
+        auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
+        g.setTileMapping(sharedCounts, tile);
+        g.setTileMapping(sharedOffsets, tile);
+        g.setTileMapping(readyFlags, tile);
+        g.connect(v["sharedCounts"], sharedCounts);
+        g.connect(v["sharedOffsets"], sharedOffsets);
+        g.connect(v["readyFlags"], readyFlags);
+
         auto dbgSlice = l0routerDebugRead_.get()
                          .slice({router_id,0},{router_id+1,kRouterDebugSize})
                          .reshape({kRouterDebugSize});
@@ -480,6 +491,17 @@ void RadiantFoamIpuBuilder::buildRayRoutersL1(poplar::Graph& g, poplar::ComputeS
         auto levelConst = g.addConstant(poplar::UNSIGNED_CHAR, {}, 1);
         g.setTileMapping(levelConst, tile);
         g.connect(v["level"], levelConst);
+
+        const auto kNumWorkers = 6;
+        auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedCounts");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedOffsets");
+        auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
+        g.setTileMapping(sharedCounts, tile);
+        g.setTileMapping(sharedOffsets, tile);
+        g.setTileMapping(readyFlags, tile);
+        g.connect(v["sharedCounts"], sharedCounts);
+        g.connect(v["sharedOffsets"], sharedOffsets);
+        g.connect(v["readyFlags"], readyFlags);
 
         auto dbgSlice = l1routerDebugRead_.get()
                          .slice({router_id,0},{router_id+1,kRouterDebugSize})
@@ -559,6 +581,17 @@ void RadiantFoamIpuBuilder::buildRayRoutersL2(poplar::Graph& g, poplar::ComputeS
         auto levelConst = g.addConstant(poplar::UNSIGNED_CHAR, {}, 2);
         g.setTileMapping(levelConst, tile);
         g.connect(v["level"], levelConst);
+
+        const auto kNumWorkers = 6;
+        auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedCounts");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedOffsets");
+        auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
+        g.setTileMapping(sharedCounts, tile);
+        g.setTileMapping(sharedOffsets, tile);
+        g.setTileMapping(readyFlags, tile);
+        g.connect(v["sharedCounts"], sharedCounts);
+        g.connect(v["sharedOffsets"], sharedOffsets);
+        g.connect(v["readyFlags"], readyFlags);
 
         auto dbgSlice = l2routerDebugRead_.get()
                          .slice({router_id,0},{router_id+1,kRouterDebugSize})
@@ -644,6 +677,19 @@ void RadiantFoamIpuBuilder::buildRayRoutersL3(poplar::Graph& g, poplar::ComputeS
             .slice({router_id, 0}, {router_id+1, kRouterDebugSize})
             .reshape({kRouterDebugSize});
         g.connect(v["debugBytes"], dbgSlice);
+
+        const auto kNumWorkers = 6;
+        auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedCounts");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedOffsets");
+        auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
+        g.setTileMapping(sharedCounts, tile);
+        g.setTileMapping(sharedOffsets, tile);
+        g.setTileMapping(readyFlags, tile);
+        g.connect(v["sharedCounts"], sharedCounts);
+        g.connect(v["sharedOffsets"], sharedOffsets);
+        g.connect(v["readyFlags"], readyFlags);
+
+
 
         g.setTileMapping(v, tile);
     }
@@ -956,7 +1002,7 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
     // -----------------------------------------------------------------------------
     //  Router-lane saturation test
     // -----------------------------------------------------------------------------
-    constexpr std::uint16_t kWarnCap        = 1500;  // threshold
+    constexpr std::uint16_t kWarnCap        = 0;  // threshold
     constexpr int           kWordsPerRouter = 10;    // 0..4 = IN  / 5..9 = OUT
 
     auto dumpRouters =
