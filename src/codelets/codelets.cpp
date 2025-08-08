@@ -12,7 +12,7 @@ using radfoam::geometry::LocalPoint;
 using radfoam::geometry::GenericPoint;
 using radfoam::geometry::FinishedRay;
 
-struct Ray {
+struct alignas(4) Ray {
   uint16_t x, y;
   half t, transmittance;
   float r, g, b;
@@ -535,17 +535,66 @@ public:
   uint16_t myChildPrefix;
   uint8_t shift;
 
+  // ---- Forbid any Input -> Output aliasing (5 x 5 = 25) ----
+  [[poplar::constraint("elem(*parentRaysIn)!=elem(*parentRaysOut)")]]
+  [[poplar::constraint("elem(*parentRaysIn)!=elem(*childRaysOut0)")]]
+  [[poplar::constraint("elem(*parentRaysIn)!=elem(*childRaysOut1)")]]
+  [[poplar::constraint("elem(*parentRaysIn)!=elem(*childRaysOut2)")]]
+  [[poplar::constraint("elem(*parentRaysIn)!=elem(*childRaysOut3)")]]
+  [[poplar::constraint("elem(*childRaysIn0)!=elem(*parentRaysOut)")]]
+  [[poplar::constraint("elem(*childRaysIn0)!=elem(*childRaysOut0)")]]
+  [[poplar::constraint("elem(*childRaysIn0)!=elem(*childRaysOut1)")]]
+  [[poplar::constraint("elem(*childRaysIn0)!=elem(*childRaysOut2)")]]
+  [[poplar::constraint("elem(*childRaysIn0)!=elem(*childRaysOut3)")]]
+  [[poplar::constraint("elem(*childRaysIn1)!=elem(*parentRaysOut)")]]
+  [[poplar::constraint("elem(*childRaysIn1)!=elem(*childRaysOut0)")]]
+  [[poplar::constraint("elem(*childRaysIn1)!=elem(*childRaysOut1)")]]
+  [[poplar::constraint("elem(*childRaysIn1)!=elem(*childRaysOut2)")]]
+  [[poplar::constraint("elem(*childRaysIn1)!=elem(*childRaysOut3)")]]
+  [[poplar::constraint("elem(*childRaysIn2)!=elem(*parentRaysOut)")]]
+  [[poplar::constraint("elem(*childRaysIn2)!=elem(*childRaysOut0)")]]
+  [[poplar::constraint("elem(*childRaysIn2)!=elem(*childRaysOut1)")]]
+  [[poplar::constraint("elem(*childRaysIn2)!=elem(*childRaysOut2)")]]
+  [[poplar::constraint("elem(*childRaysIn2)!=elem(*childRaysOut3)")]]
+  [[poplar::constraint("elem(*childRaysIn3)!=elem(*parentRaysOut)")]]
+  [[poplar::constraint("elem(*childRaysIn3)!=elem(*childRaysOut0)")]]
+  [[poplar::constraint("elem(*childRaysIn3)!=elem(*childRaysOut1)")]]
+  [[poplar::constraint("elem(*childRaysIn3)!=elem(*childRaysOut2)")]]
+  [[poplar::constraint("elem(*childRaysIn3)!=elem(*childRaysOut3)")]]
+
+
+  // ---- Forbid any Output -> Output aliasing (C(5,2) = 10) ----
+  [[poplar::constraint("elem(*parentRaysOut)!=elem(*childRaysOut0)")]]
+  [[poplar::constraint("elem(*parentRaysOut)!=elem(*childRaysOut1)")]]
+  [[poplar::constraint("elem(*parentRaysOut)!=elem(*childRaysOut2)")]]
+  [[poplar::constraint("elem(*parentRaysOut)!=elem(*childRaysOut3)")]]
+  [[poplar::constraint("elem(*childRaysOut0)!=elem(*childRaysOut1)")]]
+  [[poplar::constraint("elem(*childRaysOut0)!=elem(*childRaysOut2)")]]
+  [[poplar::constraint("elem(*childRaysOut0)!=elem(*childRaysOut3)")]]
+  [[poplar::constraint("elem(*childRaysOut1)!=elem(*childRaysOut2)")]]
+  [[poplar::constraint("elem(*childRaysOut1)!=elem(*childRaysOut3)")]]
+  [[poplar::constraint("elem(*childRaysOut2)!=elem(*childRaysOut3)")]]
+
   bool compute(unsigned workerId) {
     shift = *level * 2;
     myChildPrefix = childClusterIds[0] >> (shift + 2);
+    const unsigned NW = poplar::MultiVertex::numWorkers();
+
+    // optional: clean start each iteration
+    if (workerId == 0) {
+      volatile unsigned* f = readyFlags.data();
+      for (unsigned i=0;i<NW;++i) f[i] = 0;
+    }
+    barrier(0, workerId);
     
-    readyFlags[workerId] = 0;
+    // readyFlags[workerId] = 0;
     countRays(workerId);
+    barrier(/*phase=*/1, workerId);  // countRays(workerId);
 
-    waitForAllWorkersReady();
-
-    readyFlags[0] = 0;   
+    // waitForAllWorkersReady();
+  
     unsigned outCnt2[kNumLanes] = {0,0,0,0,0};
+    // readyFlags[0] = 0;
     if(workerId == 0) {
       for(int i=0; i<kNumWorkers; i++) {
         for(int lane=0; lane<kNumLanes; lane++) {
@@ -553,15 +602,27 @@ public:
         }
       }
       computeWriteOffsets();
-      readyFlags[0] = 1;
+      // readyFlags[workerId] = 1;
     }
+    // waitForAllWorkersReady();
+    barrier(/*phase=*/2, workerId);  
 
-    waitForAllWorkersReady();
+    // volatile unsigned* flags = readyFlags.data();
+    // while (true) {
+    //   bool all = true;
+    //   for (unsigned i=0;i<kNumWorkers;++i) 
+    //     if (flags[i] != 1) { 
+    //       all=false; break; 
+    //     }
+    //   if (all) break;
+    //   asm volatile("" ::: "memory");
+    // }
 
     // readyFlags[workerId] = 0;
-    // routeRays(workerId);
-
+    routeRays(workerId);
+    barrier(/*phase=*/3, workerId);  
     // waitForAllWorkersReady();
+
     if(workerId == 0) {
       unsigned inCnt[5] = {0,0,0,0,0};
       unsigned outCnt[5] = {0,0,0,0,0}; 
@@ -594,11 +655,11 @@ public:
       };
 
       // Route each child and capture their input counts
-      inCnt[0] = routeChildRays(childRaysIn0);
-      inCnt[1] = routeChildRays(childRaysIn1);
-      inCnt[2] = routeChildRays(childRaysIn2);
-      inCnt[3] = routeChildRays(childRaysIn3);
-      inCnt[4] = routeChildRays(parentRaysIn);
+      // inCnt[0] = routeChildRays(childRaysIn0);
+      // inCnt[1] = routeChildRays(childRaysIn1);
+      // inCnt[2] = routeChildRays(childRaysIn2);
+      // inCnt[3] = routeChildRays(childRaysIn3);
+      // inCnt[4] = routeChildRays(parentRaysIn);
 
       invalidateRemainingRays(childRaysOut0, outCnt2[0]);
       invalidateRemainingRays(childRaysOut1, outCnt2[1]);
@@ -624,25 +685,11 @@ public:
     return true;
   }
 private:
-  unsigned countChildRays(const poplar::Output<poplar::Vector<uint8_t>>& child) {
-    uint16_t count = 0;
-    for (int i = 0; i < kNumRays; ++i) {
-      const Ray* ray = reinterpret_cast<const Ray*>(child.data() + i * sizeof(Ray));
-      if (ray->x == INVALID_RAY_ID) break;
-      count++;
-    }
-    return count;
-  }
 
   void routeRays(unsigned workerId) {
     //------------------------------------------------------------------
     //  1.  Local state
     //------------------------------------------------------------------
-    // const unsigned *offsets = sharedOffsets.data(); 
-    // auto baseOf = [&](unsigned lane) -> unsigned {
-    //     // return (workerId == 0) ? 0 : inc[(workerId - 1) * kNumLanes + lane];
-    //     return offsets[workerId * kNumLanes + lane];
-    // };
     unsigned  wrCtr[kNumLanes] = {0,0,0,0,0};             // per-lane counter
 
     const poplar::Input<poplar::Vector<uint8_t>> *inBuf[kNumLanes] = {
@@ -660,15 +707,15 @@ private:
       // indices: workerId, workerId+kNumWorkers, …
       for (unsigned idx = workerId; idx < kNumRays; idx += kNumWorkers) {
         const Ray *ray = reinterpret_cast<const Ray*>(inBuf[lane]->data() + idx * sizeof(Ray));
-        if (ray->x == INVALID_RAY_ID) continue;
+        if (ray->x == INVALID_RAY_ID) break;
 
         unsigned dst = findChildForCluster(ray->next_cluster);  // 0..4
-        const unsigned start = sharedOffsets[getSharedIdx(workerId, dst)];
-        // const unsigned end   = start + sharedCounts[getSharedIdx(workerId, dst)]; 
-
-        // absolute write slot = start offset + local counter
+        const unsigned wi = getSharedIdx(workerId, dst);
+        const unsigned start = sharedOffsets[wi];
+        const unsigned plannedEnd = start + sharedCounts[wi];
+        const unsigned end   = plannedEnd < kNumRays ? plannedEnd : kNumRays;
         unsigned slot = start + wrCtr[dst];
-        if(slot < kNumRays) {
+        if(slot < end) {
           std::memcpy(outBuf[dst]->data() + slot * sizeof(Ray), ray, sizeof(Ray));
           wrCtr[dst]++;
         }
@@ -691,7 +738,7 @@ private:
     //   }
     // }
     
-    readyFlags[workerId] = 1;
+    // readyFlags[workerId] = 1;
   }
 
   [[gnu::always_inline]]
@@ -702,6 +749,20 @@ private:
         continue;
       ray->x = INVALID_RAY_ID;
     }
+  }
+
+  [[gnu::always_inline]]
+  void barrier(unsigned phase, unsigned workerId) {
+    volatile unsigned* flags = readyFlags.data();
+    const unsigned NW = poplar::MultiVertex::numWorkers();
+    flags[workerId] = phase;
+    asm volatile("" ::: "memory");
+    while (true) {
+      bool all = true;
+      for (unsigned i = 0; i < NW; ++i) if (flags[i] != phase) { all = false; break; }
+      if (all) break;
+    }
+    asm volatile("" ::: "memory");
   }
 
   [[gnu::always_inline]]
@@ -759,10 +820,9 @@ private:
     // Visit every lane
     for (unsigned lane = 0; lane < kNumLanes; ++lane) {
       const auto &buf  = *inputs[lane];
-      const unsigned N  = buf.size() / sizeof(Ray);
 
       // Strided loop: workerId, workerId+kNumWorkers, …
-      for (unsigned i = workerId; i < N; i += kNumWorkers) {
+      for (unsigned i = workerId; i < kNumRays; i += kNumWorkers) {
         const Ray *ray = reinterpret_cast<const Ray *>(buf.data() + i * sizeof(Ray));
         if (ray->x == INVALID_RAY_ID) break;        // empty slot
 
@@ -771,7 +831,7 @@ private:
       }
     }
 
-    readyFlags[workerId] = 1;
+    // readyFlags[workerId] = 1;
   }
 
 };
