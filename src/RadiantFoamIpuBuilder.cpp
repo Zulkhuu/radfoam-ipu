@@ -956,7 +956,7 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
     // -----------------------------------------------------------------------------
     //  Router-lane saturation test
     // -----------------------------------------------------------------------------
-    constexpr std::uint16_t kWarnCap        = 500;  // threshold
+    constexpr std::uint16_t kWarnCap        = 1500;  // threshold
     constexpr int           kWordsPerRouter = 10;    // 0..4 = IN  / 5..9 = OUT
 
     auto dumpRouters =
@@ -982,8 +982,8 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
             if (over)
             {
                 fmt::print("{} router {:4}: "
-                    "IP {:4}  {:4}  {:4}  {:4} {:4}\t"
-                    "OP {:4}  {:4}  {:4}  {:4} {:4}\n",
+                    "In: {:4}  {:4}  {:4}  {:4} {:4}\t"
+                    "Out: {:4}  {:4}  {:4}  {:4} {:4}\n",
                     lvl, rid,
                     w[0], w[1], w[2], w[3], w[4],
                     w[5], w[6], w[7], w[8], w[9]);

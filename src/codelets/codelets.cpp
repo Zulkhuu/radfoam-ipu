@@ -20,31 +20,32 @@ struct Ray {
   uint16_t next_local;
 };
 
+inline constexpr uint16_t kLeadMask   = 0xFC00u;   // 11111 00000000000₂
+inline constexpr uint8_t kShift = 10;  
+inline constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
+
 template <typename T>
-inline __attribute__((always_inline))
-const T* readStructAt(const poplar::Input<poplar::Vector<uint8_t>>& buffer, std::size_t index) {
-    constexpr std::size_t stride = sizeof(T);
-    const uint8_t* base = buffer.data() + index * stride;
-    return reinterpret_cast<const T*>(base);
+[[gnu::always_inline]] inline const T* readStructAt(const poplar::Input<poplar::Vector<uint8_t>>& buffer, std::size_t index) {
+  constexpr std::size_t stride = sizeof(T);
+  const uint8_t* base = buffer.data() + index * stride;
+  return reinterpret_cast<const T*>(base);
 }
 
-inline __attribute__((always_inline))
-uint8_t clampToU8(float v) {
-    return static_cast<uint8_t>(__builtin_ipu_max(0.0f, __builtin_ipu_min(255.0f, std::round(v * 255.0f))));
+[[gnu::always_inline]] inline uint8_t clampToU8(float v) {
+  return static_cast<uint8_t>(__builtin_ipu_max(0.0f, __builtin_ipu_min(255.0f, std::round(v * 255.0f))));
 }
-
-constexpr uint16_t kLeadMask   = 0xFC00u;   // 11111 00000000000₂
-constexpr unsigned kShift = 10;  
 
 [[gnu::always_inline]] inline uint8_t getLead6(uint16_t v) { 
   return v >> kShift; 
 }
 
 [[gnu::always_inline]] inline uint16_t setLead6(const uint16_t &v, uint8_t x) {
-    return (v & ~kLeadMask) | ((x & 0x3F) << kShift); 
+  return (v & ~kLeadMask) | ((x & 0x3F) << kShift); 
 }
 
-[[gnu::always_inline]] inline uint16_t data10(uint16_t v) { return v & ~kLeadMask; }
+[[gnu::always_inline]] inline uint16_t data10(uint16_t v) {
+  return v & ~kLeadMask; 
+}
 
 class RayTrace : public poplar::Vertex {
 public:
@@ -67,28 +68,19 @@ public:
 
   // InOut
   poplar::InOut<poplar::Vector<uint8_t>> framebuffer;
-  poplar::InOut<unsigned>       exec_count;           // increments every sub-iteration
-  poplar::InOut<unsigned>       finishedWriteOffset;  // append pointer within finishedRays
+  poplar::InOut<unsigned>       exec_count;          
+  poplar::InOut<unsigned>       finishedWriteOffset; 
 
   // [[poplar::constraint("elem(*local_pts)!=elem(*finishedRays)")]]
   // [[poplar::constraint("elem(*local_pts)!=elem(*raysOut)")]]
   bool compute() {
-    // const Ray* ray_in = readStructAt<Ray>(raysIn, 0);
-    // if (ray_in->x == 0xFFFF) {
-    //   *exec_count = exec_count + 1;
-    //   return true; 
-    // }
-    constexpr int RaySize = sizeof(Ray);
-    constexpr int LocalPointSize = sizeof(LocalPoint);
-    constexpr int GenericPointSize = sizeof(GenericPoint); 
-
     constexpr unsigned substeps = 1;
     constexpr unsigned finishedRaysCap = kNumRays * kFinishedFactor;
     unsigned exec_step_id = exec_count % substeps;
     bool startOfFrame = (exec_step_id == 0);
 
-    const uint16_t nLocalPts = local_pts.size() / LocalPointSize;
-    const uint16_t nNeighborPts = neighbor_pts.size() / GenericPointSize;
+    const uint16_t nLocalPts = local_pts.size() / sizeof(LocalPoint);
+    const uint16_t nNeighborPts = neighbor_pts.size() / sizeof(GenericPoint);
 
     if (startOfFrame) {
       *finishedWriteOffset = 0;
@@ -99,16 +91,6 @@ public:
     glm::mat4 invView = glm::make_mat4(view_matrix.data());
     glm::mat4 invProj = glm::make_mat4(projection_matrix.data());
     glm::vec3 rayOrigin = glm::vec3(invView[3]);
-
-    auto computeRayDir = [&](uint16_t x, uint16_t y) __attribute__((always_inline)) -> glm::vec3 {
-      float ndcX = (2.0f * x) / kFullImageWidth - 1.0f;
-      float ndcY = 1.0f - (2.0f * y) / kFullImageHeight;
-      glm::vec4 clipRay(ndcX, ndcY, -1.0f, 1.0f);
-      glm::vec4 eyeRay = invProj * clipRay;
-      eyeRay.z = -1.0f;
-      eyeRay.w = 0.0f;
-      return glm::normalize(glm::vec3(invView * eyeRay));
-    };
 
     unsigned base = finishedWriteOffset;
     unsigned finished_ray_cntr = 0;
@@ -121,12 +103,12 @@ public:
     // Loop over input rays
     for (int ray_index = 0; ray_index < kNumRays; ++ray_index) {
       const Ray* ray_in = readStructAt<Ray>(raysIn, ray_index);
-      if (ray_in->x == 0xFFFF) break; // End of rays
+      if (ray_in->x == INVALID_RAY_ID) break; // End of rays
 
       // Compute ray direction in world space
-      uint16_t x_data = data10(ray_in->x); // & ~kLeadMask;
+      uint16_t x_data = data10(ray_in->x); 
       uint8_t n_passed_clusters = getLead6(ray_in->x);
-      glm::vec3 rayDir = computeRayDir(x_data, ray_in->y);
+      glm::vec3 rayDir = computeRayDir(x_data, ray_in->y, invProj, invView);
 
       // Initialize accumulation
       glm::vec3 color(ray_in->r, ray_in->g, ray_in->b);
@@ -274,9 +256,10 @@ public:
   }
 
 private:
+  [[gnu::always_inline]]
   void writeFinishedRay(poplar::Output<poplar::Vector<uint8_t>>& buffer,
                         int& counter, uint16_t x, uint16_t y,
-                        const glm::vec3& color, float t)  __attribute__((always_inline)) {
+                        const glm::vec3& color, float t) {
     FinishedRay* ray = reinterpret_cast<FinishedRay*>(buffer.data() + sizeof(FinishedRay) * counter);
     ray->x = x;
     ray->y = y;
@@ -287,21 +270,34 @@ private:
     counter++;
   }
 
-  void invalidateRemainingRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) __attribute__((always_inline)) {
-    for (int i = count; i < kNumRays; i++) {
+  [[gnu::always_inline]]
+  glm::vec3 computeRayDir(uint16_t x, uint16_t y, glm::mat4& invProj, glm::mat4& invView) {
+    float ndcX = (2.0f * x) / kFullImageWidth - 1.0f;
+    float ndcY = 1.0f - (2.0f * y) / kFullImageHeight;
+    glm::vec4 clipRay(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 eyeRay = invProj * clipRay;
+    eyeRay.z = -1.0f;
+    eyeRay.w = 0.0f;
+    return glm::normalize(glm::vec3(invView * eyeRay));
+  };
+
+  [[gnu::always_inline]]
+  void invalidateRemainingRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) {
+    for (int i = count; i < buffer.size()/sizeof(Ray); i++) {
       Ray* ray = reinterpret_cast<Ray*>(buffer.data() + sizeof(Ray) * i);
-      if(ray->x == 0xFFFF)
+      if(ray->x == INVALID_RAY_ID)
         break;
-      ray->x = 0xFFFF;
+      ray->x = INVALID_RAY_ID;
     }
   }
 
-  inline void invalidateRemainingFinishedRays(poplar::InOut<poplar::Vector<uint8_t>>& buffer, int count) __attribute__((always_inline)) {
-    for (int i = count; i < kNumRays * kFinishedFactor; i++) {
+  [[gnu::always_inline]]
+  inline void invalidateRemainingFinishedRays(poplar::InOut<poplar::Vector<uint8_t>>& buffer, int count) {
+    for (int i = count; i < buffer.size()/sizeof(FinishedRay); i++) {
       FinishedRay* ray = reinterpret_cast<FinishedRay*>(buffer.data() + sizeof(FinishedRay) * i);
-      if(ray->x == 0xFFFF)
+      if(ray->x == INVALID_RAY_ID)
         break;
-      ray->x = 0xFFFF;
+      ray->x = INVALID_RAY_ID;
     }
   }
 };
@@ -320,12 +316,9 @@ public:
 
   poplar::InOut<unsigned> exec_count; 
   poplar::Input<poplar::Vector<uint8_t>> camera_cell_info;
-
   poplar::Output<poplar::Vector<uint8_t>> debugBytes;
 
   bool compute() {
-    constexpr int RaySize = sizeof(Ray);  
-    constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
     constexpr uint8_t shift = 8; // lvl 4*2
     uint16_t outCountC0 = 0, outCountC1 = 0, outCountC2 = 0, outCountC3 = 0;
     uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
@@ -341,22 +334,22 @@ public:
       int targetChild = findChildForCluster(ray->next_cluster);
       if (targetChild == 0) {
         if (outCountC0 < kNumRays) {
-          std::memcpy(childRaysOut0.data() + outCountC0 * RaySize, ray, RaySize);
+          std::memcpy(childRaysOut0.data() + outCountC0 * sizeof(Ray), ray, sizeof(Ray));
           outCountC0++;
         }
       } else if (targetChild == 1) {
         if (outCountC1 < kNumRays) {
-          std::memcpy(childRaysOut1.data() + outCountC1 * RaySize, ray, RaySize);
+          std::memcpy(childRaysOut1.data() + outCountC1 * sizeof(Ray), ray, sizeof(Ray));
           outCountC1++;
         }
       } else if (targetChild == 2) {
         if (outCountC2 < kNumRays) {
-          std::memcpy(childRaysOut2.data() + outCountC2 * RaySize, ray, RaySize);
+          std::memcpy(childRaysOut2.data() + outCountC2 * sizeof(Ray), ray, sizeof(Ray));
           outCountC2++;
         }
       } else if (targetChild == 3) {
         if (outCountC3 < kNumRays) {
-          std::memcpy(childRaysOut3.data() + outCountC3 * RaySize, ray, RaySize);
+          std::memcpy(childRaysOut3.data() + outCountC3 * sizeof(Ray), ray, sizeof(Ray));
           outCountC3++;
         }
       } 
@@ -365,7 +358,7 @@ public:
     auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) __attribute__((always_inline)) -> uint16_t {
       uint16_t count = 0;
       for (int i = 0; i < kNumRays; ++i) {
-        const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * RaySize);
+        const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * sizeof(Ray));
         if (ray->x == INVALID_RAY_ID) break;
         count++;
         routeRay(ray);
@@ -374,7 +367,7 @@ public:
       return count;
     };
 
-    int mode = 3;
+    int mode = 1;
     if(mode == 0) { // Single ray test
       if(exec_count == 0) {
         Ray genRay{};
@@ -469,9 +462,9 @@ public:
     auto invalidateRemaining = [&](poplar::Output<poplar::Vector<uint8_t>>& out, uint16_t count) __attribute__((always_inline)) {
       for (uint16_t i = count; i < kNumRays; ++i) {
         Ray* ray = reinterpret_cast<Ray*>(out.data() + sizeof(Ray) * i);
-        if(ray->x == 0xFFFF)
+        if(ray->x == INVALID_RAY_ID)
           break;
-        ray->x = 0xFFFF;
+        ray->x = INVALID_RAY_ID;
       }
     };
 
@@ -499,8 +492,8 @@ public:
 };
 
 template <unsigned Port>
-inline __attribute__((always_inline))
-void emit(const Ray &r, unsigned &cnt,
+[[gnu::always_inline]] 
+inline void emit(const Ray &r, unsigned &cnt,
           poplar::Output<poplar::Vector<uint8_t>>* const (&outPorts)[5])
 {
     // Port is a compile-time constant, so the expression below
@@ -509,7 +502,7 @@ void emit(const Ray &r, unsigned &cnt,
     ++cnt;
 }
 
-class RayRouter : public poplar::Vertex {
+class RayRouter : public poplar::MultiVertex {
 public:
   // Incoming rays
   poplar::Input<poplar::Vector<uint8_t>> parentRaysIn;
@@ -526,19 +519,19 @@ public:
   poplar::Output<poplar::Vector<uint8_t>> childRaysOut3;
 
   // ID mapping to know which cluster IDs belong to which child
-  poplar::Input<poplar::Vector<unsigned short>> childClusterIds; // 4 IDs
+  poplar::Input<poplar::Vector<unsigned short>> childClusterIds;
   poplar::Input<uint8_t> level;
 
   poplar::Output<poplar::Vector<uint8_t>> debugBytes;
 
-  bool compute() {
+  bool compute(unsigned workerId) {
     uint8_t shift = *level * 2;
-    constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
-    constexpr int RaySize = sizeof(Ray);
-    constexpr unsigned PARENT = 4;            // index 4 = parent lane
+    constexpr unsigned PARENT = 4;
     const uint16_t myChildPrefix = childClusterIds[0] >> (shift + 2);
-    // uint16_t outCountParent = 0, outCountC0 = 0, outCountC1 = 0, outCountC2 = 0, outCountC3 = 0;
+    
+    unsigned inCnt[5] = {0,0,0,0,0};
     unsigned outCnt[5] = {0,0,0,0,0}; 
+
     poplar::Output<poplar::Vector<uint8_t>>* outPorts[5] = {
         &childRaysOut0, &childRaysOut1, &childRaysOut2,
         &childRaysOut3, &parentRaysOut
@@ -546,133 +539,71 @@ public:
 
     auto findChildForCluster = [&](uint16_t cid) __attribute__((always_inline)) -> unsigned {
         unsigned childIdx  = (cid >> shift) & 0x3;
-        unsigned good = ((cid >> (shift + 2)) == myChildPrefix);
-        return good ? childIdx : PARENT;
+        bool isChild = ((cid >> (shift + 2)) == myChildPrefix);
+        return isChild ? childIdx : PARENT;
     };
 
     auto routeRay = [&](const Ray* ray)  __attribute__((always_inline)) {
       int targetChild = findChildForCluster(ray->next_cluster);
       if (targetChild == 0) {
         if (outCnt[0] < kNumRays) {
-          std::memcpy(childRaysOut0.data() + outCnt[0] * RaySize, ray, RaySize);
+          std::memcpy(childRaysOut0.data() + outCnt[0] * sizeof(Ray), ray, sizeof(Ray));
           outCnt[0]++;
         }
       } else if (targetChild == 1) {
         if (outCnt[1] < kNumRays) {
-          std::memcpy(childRaysOut1.data() + outCnt[1] * RaySize, ray, RaySize);
+          std::memcpy(childRaysOut1.data() + outCnt[1] * sizeof(Ray), ray, sizeof(Ray));
           outCnt[1]++;
         }
       } else if (targetChild == 2) {
         if (outCnt[2] < kNumRays) {
-          std::memcpy(childRaysOut2.data() + outCnt[2] * RaySize, ray, RaySize);
+          std::memcpy(childRaysOut2.data() + outCnt[2] * sizeof(Ray), ray, sizeof(Ray));
           outCnt[2]++;
         }
       } else if (targetChild == 3) {
         if (outCnt[3] < kNumRays) {
-          std::memcpy(childRaysOut3.data() + outCnt[3] * RaySize, ray, RaySize);
+          std::memcpy(childRaysOut3.data() + outCnt[3] * sizeof(Ray), ray, sizeof(Ray));
           outCnt[3]++;
         }
       } else {
         if (outCnt[4] < kNumRays) {
-          std::memcpy(parentRaysOut.data() + outCnt[4] * RaySize, ray, RaySize);
+          std::memcpy(parentRaysOut.data() + outCnt[4] * sizeof(Ray), ray, sizeof(Ray));
           outCnt[4]++;
         }
       }
     };
-    
-    // auto routeRay = [&](const Ray* pr) __attribute__((always_inline)) {
-    //   unsigned p = findChildForCluster(pr->next_cluster);
-    //   switch (p) {
-    //     case 0: emit<0>(*pr, outCnt[0], outPorts); break;
-    //     case 1: emit<1>(*pr, outCnt[1], outPorts); break;
-    //     case 2: emit<2>(*pr, outCnt[2], outPorts); break;
-    //     case 3: emit<3>(*pr, outCnt[3], outPorts); break;
-    //     default: emit<4>(*pr, outCnt[4], outPorts); break;
-    //   }
-    // };
-
-    
-    // New routeChildRays: count + route, return count
+        
     auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) __attribute__((always_inline)) -> uint16_t {
       uint16_t count = 0;
       for (int i = 0; i < kNumRays; ++i) {
-        const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * RaySize);
+        const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * sizeof(Ray));
         if (ray->x == INVALID_RAY_ID) break;
         count++;
-
-        uint16_t x10   = data10(ray->x);
-        uint16_t y16   = ray->y;
-        uint8_t  lead  = getLead6(ray->x);
-        int lane = findChildForCluster(ray->next_cluster);
-
-        auto spawn = [&](uint16_t xx, uint16_t yy) {
-          Ray t = *ray;
-          t.x = xx;
-          t.y = yy;
-          routeRay(&t);
-        };
-        // ------------------------------------------------------- stage 1 : lead 5
-        if (level==0 && lane!=PARENT && lead==5) {
-            // add (+2, 0) (+0,+2) (+2,+2)
-          if (outCnt[lane] < kNumRays-4) {
-            spawn(setLead6(x10,6), y16      );
-            spawn(setLead6(x10+2,6), y16      );   // east
-            spawn(setLead6(x10  ,6), y16+2    );   // south
-            spawn(setLead6(x10+2,6), y16+2    );   // south-east
-          }
-        }
-
-        // ------------------------------------------------------- stage 2 : lead 10
-        else if (level==0 && lane!=PARENT && lead==10) {
-            // add (+1, 0)  ( copies it to the hole in each 2-col stripe )
-          if (outCnt[lane] < kNumRays-4) {
-            spawn(setLead6(x10, 11), y16      );
-            spawn(setLead6(x10+1, 11), y16      );
-          }
-        }
-
-        // ------------------------------------------------------- stage 3 : lead 15
-        // else if (level==0 && lane!=PARENT && lead==15) {
-        //     // add ( 0,+1 )   ( copies it to the hole in each 2-row stripe )
-        //     spawn(setLead6(x10  ,16), y16    );
-        //     spawn(setLead6(x10  ,16), y16+1    );
-        // }
-        else 
-          // always forward the current ray itself
-          routeRay(ray);
+        routeRay(ray);
       }
       return count;
     };
 
     // Route each child and capture their input counts
-    uint16_t inCountParent = routeChildRays(parentRaysIn);
-    uint16_t inCountC0 = routeChildRays(childRaysIn0);
-    uint16_t inCountC1 = routeChildRays(childRaysIn1);
-    uint16_t inCountC2 = routeChildRays(childRaysIn2);
-    uint16_t inCountC3 = routeChildRays(childRaysIn3);
+    inCnt[0] = routeChildRays(childRaysIn0);
+    inCnt[1] = routeChildRays(childRaysIn1);
+    inCnt[2] = routeChildRays(childRaysIn2);
+    inCnt[3] = routeChildRays(childRaysIn3);
+    inCnt[4] = routeChildRays(parentRaysIn);
 
-    // Invalidate remaining rays
-    auto invalidateRemaining = [&](poplar::Output<poplar::Vector<uint8_t>>& out, uint16_t count) __attribute__((always_inline)) {
-      for (uint16_t i = count; i < kNumRays; i++) {
-        Ray* ray = reinterpret_cast<Ray*>(out.data() + i * RaySize);
-        if (ray->x == INVALID_RAY_ID) break;
-        ray->x = INVALID_RAY_ID;
-      }
-    };
-
-    invalidateRemaining(childRaysOut0, outCnt[0]);
-    invalidateRemaining(childRaysOut1, outCnt[1]);
-    invalidateRemaining(childRaysOut2, outCnt[2]);
-    invalidateRemaining(childRaysOut3, outCnt[3]);
-    invalidateRemaining(parentRaysOut, outCnt[PARENT]);
+    invalidateRemainingRays(childRaysOut0, outCnt[0]);
+    invalidateRemainingRays(childRaysOut1, outCnt[1]);
+    invalidateRemainingRays(childRaysOut2, outCnt[2]);
+    invalidateRemainingRays(childRaysOut3, outCnt[3]);
+    invalidateRemainingRays(parentRaysOut, outCnt[4]);
 
     // Fill debugBytes (10 counts = 20 bytes)
     uint16_t* dbg = reinterpret_cast<uint16_t*>(debugBytes.data());
-    dbg[0] = inCountParent;
-    dbg[1] = inCountC0;
-    dbg[2] = inCountC1;
-    dbg[3] = inCountC2;
-    dbg[4] = inCountC3;
+    dbg[0] = inCnt[PARENT];
+    dbg[1] = inCnt[0];
+    dbg[2] = inCnt[1];
+    dbg[3] = inCnt[2];
+    dbg[4] = inCnt[3];
     dbg[5] = outCnt[PARENT];
     dbg[6] = outCnt[0];
     dbg[7] = outCnt[1];
@@ -681,7 +612,16 @@ public:
 
     return true;
   }
-
+private:
+  [[gnu::always_inline]]
+  void invalidateRemainingRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) {
+    for (int i = count; i < buffer.size()/sizeof(Ray); i++) {
+      Ray* ray = reinterpret_cast<Ray*>(buffer.data() + sizeof(Ray) * i);
+      if(ray->x == INVALID_RAY_ID)
+        break;
+      ray->x = INVALID_RAY_ID;
+    }
+  }
 };
 
 

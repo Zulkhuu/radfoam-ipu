@@ -215,7 +215,7 @@ int main(int argc, char** argv) {
   poplar::OptionFlags engineOptions = {};
   if (enableDebug) {
     logger()->info("Enabling Poplar auto-reporting (POPLAR_ENGINE_OPTIONS set)");
-    setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true", "autoReport.executionProfileProgramRunCount":"5","debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
+    setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true", "autoReport.executionProfileProgramRunCount":"10","debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
     setenv("PVTI_OPTIONS", R"({"enable":"true"})", 1);
     engineOptions = {{"debug.instrument", "true"}};
   } else {
