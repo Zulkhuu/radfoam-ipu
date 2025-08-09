@@ -79,7 +79,7 @@ private:
     // Construction‑time constants
     const std::string h5_file_;
     bool debug_;
-    static constexpr int kSubsteps = 1;
+    static constexpr int kSubsteps = 20;
     static constexpr int kRouterDebugSize = 24;
 
     // Scene data -------------------------------------------------------------

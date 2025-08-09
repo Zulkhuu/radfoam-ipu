@@ -80,8 +80,8 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& g, const poplar::Target&) {
     auto condProgram = stopFlag_.buildWrite(g, true);
     // poplar::program::Sequence condProgram2;
     // auto condProgram = poplar::program::Copy(stopFlagStream, stopFlag_);
-    // auto frameLoop = poplar::program::RepeatWhileTrue(condProgram, stopFlag_.get(), frame_);
-    // getPrograms().add("frame_loop", frameLoop);
+    auto frameLoop = poplar::program::RepeatWhileTrue(condProgram, stopFlag_.get(), frame_);
+    getPrograms().add("frame_loop", frameLoop);
 }
 
 // ----------------------------------------------------------------------------
@@ -98,13 +98,13 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
         eng.run(getPrograms().getOrdinals().at("write_camera_cell_info"),
             fmt::format("frame_{:03d}/write_camera_cell_info", exec_counter_));
 
-        // eng.run(getPrograms().getOrdinals().at("frame_loop"));
+        eng.run(getPrograms().getOrdinals().at("frame_loop"));
     }
 
-    eng.run(getPrograms().getOrdinals().at("frame"),
-            fmt::format("frame_{:03d}", exec_counter_));
+    // eng.run(getPrograms().getOrdinals().at("frame"),
+    //         fmt::format("frame_{:03d}", exec_counter_));
     
-    readAllTiles(eng);
+    // readAllTiles(eng);
 
     // if(debug_)
 
@@ -1128,6 +1128,14 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
 
             if (over || lvl == "RG")
             {
+              if(lvl == "RG" && w[9] != 0)
+                fmt::print("{} router {:4}: "
+                    "In: {:4}  {:4}  {:4}  {:4} {:4}\t"
+                    "Out: {:4}  {:4}  {:4}  {:4} {:4}====================================================\n",
+                    lvl, rid,
+                    w[0], w[1], w[2], w[3], w[4],
+                    w[5], w[6], w[7], w[8], w[9]);
+              else 
                 fmt::print("{} router {:4}: "
                     "In: {:4}  {:4}  {:4}  {:4} {:4}\t"
                     "Out: {:4}  {:4}  {:4}  {:4} {:4}\n",

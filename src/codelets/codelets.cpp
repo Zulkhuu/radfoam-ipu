@@ -74,7 +74,7 @@ public:
   // [[poplar::constraint("elem(*local_pts)!=elem(*finishedRays)")]]
   // [[poplar::constraint("elem(*local_pts)!=elem(*raysOut)")]]
   bool compute() {
-    constexpr unsigned substeps = 1;
+    constexpr unsigned substeps = 20;
     constexpr unsigned finishedRaysCap = kNumRays * kFinishedFactor;
     unsigned exec_step_id = exec_count % substeps;
     bool startOfFrame = (exec_step_id == 0);
@@ -382,24 +382,24 @@ public:
     }
 
     // ── 3) fill remaining with generated rays (simple column scan), queue rest
-    const bool genThisFrame = ((*exec_count % 2) == 0);
+    const bool genThisFrame = ((*exec_count % 3) == 0);
     if (genThisFrame) {
-      const unsigned nColsPerFrame = 5;
-      const unsigned colBase = ((*exec_count)/2) * nColsPerFrame;
+      const unsigned nColsPerFrame = 4;
+      const unsigned colBase = ((*exec_count)/3) * nColsPerFrame;
 
       // Don’t generate more than remaining output capacity + queue free slots
       unsigned budget = (C - outCnt) + qFree(head, tail);
 
+      Ray g{};
+      g.r = g.g = g.b = 0.0f;
+      g.t = __builtin_ipu_f32tof16(0.0f);
+      g.transmittance = __builtin_ipu_f32tof16(1.0f);
+      g.next_cluster = cluster_id;
+      g.next_local   = local_id;
       for (uint16_t cx = 0; cx < nColsPerFrame && budget; ++cx) {
         const uint16_t x = (colBase + cx) % kFullImageWidth;
         for (uint16_t y = 0; y < kFullImageHeight && budget; ++y) {
-          Ray g{};
           g.x = x; g.y = y;
-          g.r = g.g = g.b = 0.0f;
-          g.t = __builtin_ipu_f32tof16(0.0f);
-          g.transmittance = __builtin_ipu_f32tof16(1.0f);
-          g.next_cluster = cluster_id;
-          g.next_local   = local_id;
 
           if (emit(g, outCnt)) { ++genEmitted; }
           else if (qPush(g))   { ++genQueued;  }
