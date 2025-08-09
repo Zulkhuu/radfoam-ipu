@@ -408,7 +408,7 @@ void RadiantFoamIpuBuilder::buildRayRoutersL0(poplar::Graph& g, poplar::ComputeS
 
         const auto kNumWorkers = 6;
         auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedCounts");
-        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedOffsets");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5 + 2*kNumWorkers}, "sharedOffsets");
         auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
         g.setTileMapping(sharedCounts, tile);
         g.setTileMapping(sharedOffsets, tile);
@@ -494,7 +494,7 @@ void RadiantFoamIpuBuilder::buildRayRoutersL1(poplar::Graph& g, poplar::ComputeS
 
         const auto kNumWorkers = 6;
         auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedCounts");
-        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedOffsets");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5 + 2*kNumWorkers}, "sharedOffsets");
         auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
         g.setTileMapping(sharedCounts, tile);
         g.setTileMapping(sharedOffsets, tile);
@@ -584,7 +584,7 @@ void RadiantFoamIpuBuilder::buildRayRoutersL2(poplar::Graph& g, poplar::ComputeS
 
         const auto kNumWorkers = 6;
         auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedCounts");
-        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedOffsets");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5 + 2*kNumWorkers}, "sharedOffsets");
         auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
         g.setTileMapping(sharedCounts, tile);
         g.setTileMapping(sharedOffsets, tile);
@@ -680,7 +680,7 @@ void RadiantFoamIpuBuilder::buildRayRoutersL3(poplar::Graph& g, poplar::ComputeS
 
         const auto kNumWorkers = 6;
         auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedCounts");
-        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedOffsets");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5 + 2*kNumWorkers}, "sharedOffsets");
         auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
         g.setTileMapping(sharedCounts, tile);
         g.setTileMapping(sharedOffsets, tile);

@@ -105,6 +105,15 @@ public:
       const Ray* ray_in = readStructAt<Ray>(raysIn, ray_index);
       if (ray_in->x == INVALID_RAY_ID) break; // End of rays
 
+      if (ray_in->next_cluster != *tile_id) { // Check spillover rays
+        if (out_ray_cntr < kNumRays) {
+          Ray* ro = reinterpret_cast<Ray*>(raysOut.data() + sizeof(Ray) * out_ray_cntr);
+          std::memcpy(ro, ray_in, sizeof(Ray));
+          ++out_ray_cntr;
+        }
+        continue;
+      }
+
       // Compute ray direction in world space
       uint16_t x_data = data10(ray_in->x); 
       uint8_t n_passed_clusters = getLead6(ray_in->x);
@@ -367,7 +376,7 @@ public:
       return count;
     };
 
-    int mode = 1;
+    int mode = 2;
     if(mode == 0) { // Single ray test
       if(exec_count == 0) {
         Ray genRay{};
@@ -408,14 +417,13 @@ public:
     }
     if(mode == 2) {
       const int interval = 3;
-      const int nx = 40;
-      const int ny = 30;
+      const int nColsPerFrame = 5;
       if(exec_count%interval == 0) {
-        for(uint16_t x=0; x<nx; x++) {
-          for(uint16_t y=0; y<ny; y++) {
+        for(uint16_t x=0; x<nColsPerFrame; x++) {
+          for(uint16_t y=0; y<kFullImageHeight; y++) {
             Ray genRay{};
-            genRay.x = x*16 + exec_count%16;
-            genRay.y = y*16 + (exec_count/16)%16;
+            genRay.x = (x+(exec_count/interval)*nColsPerFrame)%kFullImageWidth;
+            genRay.y = y;
             genRay.r = 0.0f;
             genRay.g = 0.0f;
             genRay.b = 0.0f;
@@ -603,13 +611,44 @@ public:
     barrier(/*phase=*/3, workerId);  
 
     if(workerId == 0) {
-      unsigned outCnt[5] = {0,0,0,0,0}; 
+      const unsigned NW = poplar::MultiVertex::numWorkers();
+      const unsigned C  = kNumRays;
+      poplar::Output<poplar::Vector<uint8_t>> *outBuf[kNumLanes] = {
+          &childRaysOut0, &childRaysOut1, &childRaysOut2, &childRaysOut3, &parentRaysOut};
+          
+      // totals per lane (small loops, cheap)
+      unsigned tot[kNumLanes] = {0,0,0,0,0};
+      for (unsigned lane = 0; lane < kNumLanes; ++lane)
+        for (unsigned w = 0; w < NW; ++w)
+          tot[lane] += sharedCounts[getSharedIdx(w, lane)];
 
-      // invalidateRemainingRays(childRaysOut0, outCnt2[0]);
-      // invalidateRemainingRays(childRaysOut1, outCnt2[1]);
-      // invalidateRemainingRays(childRaysOut2, outCnt2[2]);
-      // invalidateRemainingRays(childRaysOut3, outCnt2[3]);
-      // invalidateRemainingRays(parentRaysOut, outCnt2[4]);
+      unsigned base[kNumLanes], freeCap[kNumLanes], freePrefix[kNumLanes+1];
+      freePrefix[0] = 0;
+      for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+        base[lane]    = tot[lane] < C ? tot[lane] : C;
+        freeCap[lane] = C - base[lane];
+        freePrefix[lane+1] = freePrefix[lane] + freeCap[lane];
+      }
+      // recompute base[], freePrefix[] as above
+      unsigned assigned[kNumLanes] = {0,0,0,0,0};
+      for (unsigned w = 0; w < NW; ++w) {
+        unsigned a = sharedOffsets[spillStartIdx(w)];
+        unsigned b = sharedOffsets[spillEndIdx(w)];
+        for (unsigned r = 0; r < kNumLanes; ++r) {
+          unsigned L = freePrefix[r], R = freePrefix[r+1];
+          if (a < R && b > L) assigned[r] += ( (b<R?b:R) - (a>L?a:L) );
+        }
+      }
+      for (unsigned r = 0; r < kNumLanes; ++r) {
+        unsigned written = base[r] + assigned[r];  // <= C
+        unsigned capacity = outBuf[r]->size() / sizeof(Ray); // == C
+        for (unsigned i = written; i < capacity; ++i) {
+          Ray* rr = reinterpret_cast<Ray*>(outBuf[r]->data() + i*sizeof(Ray));
+          rr->x = INVALID_RAY_ID;
+        }
+      }
+
+      unsigned outCnt[5] = {0,0,0,0,0}; 
 
       // Fill debugBytes (10 counts = 20 bytes)
       uint16_t* dbg = reinterpret_cast<uint16_t*>(debugBytes.data());
@@ -629,11 +668,41 @@ public:
     return true;
   }
 private:
+  [[gnu::always_inline]] unsigned getSharedIdx(unsigned workerId, unsigned lane) {
+    return workerId * kNumLanes + lane;
+  }
+
+  [[gnu::always_inline]] unsigned spillStartIdx(unsigned w) const {
+    const unsigned NW = poplar::MultiVertex::numWorkers();
+    return NW * kNumLanes + w;
+  }
+  [[gnu::always_inline]] unsigned spillEndIdx(unsigned w) const {
+    const unsigned NW = poplar::MultiVertex::numWorkers();
+    return NW * kNumLanes + NW + w;
+  }
 
   void routeRays(unsigned workerId) {
-    //------------------------------------------------------------------
-    //  1.  Local state
-    //------------------------------------------------------------------
+    const unsigned NW = poplar::MultiVertex::numWorkers();
+    const unsigned C  = kNumRays;
+        
+    // totals per lane (small loops, cheap)
+    unsigned tot[kNumLanes] = {0,0,0,0,0};
+    for (unsigned lane = 0; lane < kNumLanes; ++lane)
+      for (unsigned w = 0; w < NW; ++w)
+        tot[lane] += sharedCounts[getSharedIdx(w, lane)];
+
+    unsigned base[kNumLanes], freeCap[kNumLanes], freePrefix[kNumLanes+1];
+    freePrefix[0] = 0;
+    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+      base[lane]    = tot[lane] < C ? tot[lane] : C;
+      freeCap[lane] = C - base[lane];
+      freePrefix[lane+1] = freePrefix[lane] + freeCap[lane];
+    }
+
+    // my spill global range
+    unsigned g    = sharedOffsets[spillStartIdx(workerId)];
+    unsigned gEnd = sharedOffsets[spillEndIdx(workerId)];
+
     unsigned  wrCtr[kNumLanes] = {0,0,0,0,0};             // per-lane counter
 
     const poplar::Input<poplar::Vector<uint8_t>> *inBuf[kNumLanes] = {
@@ -654,33 +723,50 @@ private:
         if (ray->x == INVALID_RAY_ID) break;
 
         unsigned dst = findChildForCluster(ray->next_cluster);  // 0..4
+
         const unsigned wi = getSharedIdx(workerId, dst);
         const unsigned start = sharedOffsets[wi];
         const unsigned plannedEnd = start + sharedCounts[wi];
-        const unsigned end   = plannedEnd < kNumRays ? plannedEnd : kNumRays;
+        const unsigned end   = plannedEnd < C ? plannedEnd : C;
+
         unsigned slot = start + wrCtr[dst];
-        if(slot < end) {
-          std::memcpy(outBuf[dst]->data() + slot * sizeof(Ray), ray, sizeof(Ray));
+        if (slot < end) {
+          // primary write
+          std::memcpy(outBuf[dst]->data() + slot*sizeof(Ray), ray, sizeof(Ray));
           wrCtr[dst]++;
+        } else {
+          // spill write using my disjoint global free range
+          if (g < gEnd) {
+            // map global free index -> (receiver lane r, slotInR)
+            unsigned r = 0;
+            while (g >= freePrefix[r+1]) ++r;                 // 5 lanes, fast
+            unsigned slotInR = base[r] + (g - freePrefix[r]); // first free slot in r
+            std::memcpy(outBuf[r]->data() + slotInR*sizeof(Ray), ray, sizeof(Ray));
+            ++g;
+          } else {
+            // Shouldn't happen unless inputs exceeded total pool.
+            // Optionally drop or count to a debug counter here.
+          }
         }
+
       }
     }
 
     //------------------------------------------------------------------
     // 3. Last worker invalidates tail
     //------------------------------------------------------------------
-    if (workerId == kNumWorkers - 1) {
-      for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-        unsigned written  = sharedOffsets[getSharedIdx(kNumWorkers-1, lane)] + wrCtr[lane];   // total
-        unsigned capacity = outBuf[lane]->size() / sizeof(Ray);
-        for (unsigned i = written; i < capacity; ++i) {
-          Ray *r = reinterpret_cast<Ray*>(outBuf[lane]->data() + i*sizeof(Ray));
-          if(r->x == INVALID_RAY_ID)
-            break;
-          r->x = INVALID_RAY_ID;
-        }
-      }
-    }
+    // if (workerId == kNumWorkers - 1) {
+    //   for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+    //     unsigned written  = sharedOffsets[getSharedIdx(kNumWorkers-1, lane)] + wrCtr[lane];   // total
+    //     unsigned capacity = outBuf[lane]->size() / sizeof(Ray);
+    //     for (unsigned i = written; i < capacity; ++i) {
+    //       Ray *r = reinterpret_cast<Ray*>(outBuf[lane]->data() + i*sizeof(Ray));
+    //       if(r->x == INVALID_RAY_ID)
+    //         break;
+    //       r->x = INVALID_RAY_ID;
+    //     }
+    //   }
+    // }
   }
 
   [[gnu::always_inline]]
@@ -705,8 +791,10 @@ private:
   };
 
   void computeWriteOffsets() {
-    // first worker offsets are zero -> discarded
-    // sum of all is added last instead
+    const unsigned NW = poplar::MultiVertex::numWorkers();
+    const unsigned C  = kNumRays;
+
+    // compute offsets without considering spillovers
     for (unsigned lane = 0; lane < kNumLanes; ++lane) {
       unsigned offset = 0;
       for (unsigned worker = 0; worker < kNumWorkers; ++worker) {
@@ -715,11 +803,43 @@ private:
         offset += count;
       }
     }
-  }
 
-  [[gnu::always_inline]]
-  unsigned getSharedIdx(unsigned workerId, unsigned lane) {
-    return workerId * kNumLanes + lane;
+    // 2) totals and free per lane
+    unsigned tot[kNumLanes] = {0,0,0,0,0};
+    for (unsigned lane = 0; lane < kNumLanes; ++lane)
+      for (unsigned w = 0; w < NW; ++w)
+        tot[lane] += sharedCounts[getSharedIdx(w, lane)];
+
+    unsigned base[kNumLanes], freeCap[kNumLanes], freePrefix[kNumLanes+1];
+    freePrefix[0] = 0;
+    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+      base[lane]     = tot[lane] < C ? tot[lane] : C;
+      freeCap[lane]  = C - base[lane];
+      freePrefix[lane+1] = freePrefix[lane] + freeCap[lane];
+    }
+    unsigned totalFree = freePrefix[kNumLanes];
+
+    // 3) spill per worker
+    unsigned workerSpill[/*NW*/ 16]; // or dynamically sized if you prefer
+    for (unsigned w = 0; w < NW; ++w) {
+      unsigned s = 0;
+      for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+        unsigned start = sharedOffsets[getSharedIdx(w, lane)];
+        unsigned cnt   = sharedCounts[getSharedIdx(w, lane)];
+        unsigned allow = (start < C) ? ((cnt < (C - start)) ? cnt : (C - start)) : 0;
+        s += (cnt - allow);
+      }
+      workerSpill[w] = s;
+    }
+
+    // 4) assign each worker a contiguous slice of the global free list
+    unsigned scan = 0;
+    for (unsigned w = 0; w < NW; ++w) {
+      sharedOffsets[spillStartIdx(w)] = scan;
+      scan += workerSpill[w];
+      sharedOffsets[spillEndIdx(w)]   = scan;
+    }
+
   }
 
   void countRays(unsigned workerId) {
