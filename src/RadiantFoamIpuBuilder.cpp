@@ -1002,7 +1002,7 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
     // -----------------------------------------------------------------------------
     //  Router-lane saturation test
     // -----------------------------------------------------------------------------
-    constexpr std::uint16_t kWarnCap        = 0;  // threshold
+    constexpr std::uint16_t kWarnCap        = 2401;  // threshold
     constexpr int           kWordsPerRouter = 10;    // 0..4 = IN  / 5..9 = OUT
 
     auto dumpRouters =

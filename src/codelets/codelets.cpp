@@ -330,6 +330,7 @@ public:
   bool compute() {
     constexpr uint8_t shift = 8; // lvl 4*2
     uint16_t outCountC0 = 0, outCountC1 = 0, outCountC2 = 0, outCountC3 = 0;
+    unsigned attemptedOutCnt[4] = {0,0,0,0};
     uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
     uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
@@ -342,21 +343,25 @@ public:
     auto routeRay = [&](const Ray* ray) {
       int targetChild = findChildForCluster(ray->next_cluster);
       if (targetChild == 0) {
+        attemptedOutCnt[0]++;
         if (outCountC0 < kNumRays) {
           std::memcpy(childRaysOut0.data() + outCountC0 * sizeof(Ray), ray, sizeof(Ray));
           outCountC0++;
         }
       } else if (targetChild == 1) {
+        attemptedOutCnt[1]++;
         if (outCountC1 < kNumRays) {
           std::memcpy(childRaysOut1.data() + outCountC1 * sizeof(Ray), ray, sizeof(Ray));
           outCountC1++;
         }
       } else if (targetChild == 2) {
+        attemptedOutCnt[2]++;
         if (outCountC2 < kNumRays) {
           std::memcpy(childRaysOut2.data() + outCountC2 * sizeof(Ray), ray, sizeof(Ray));
           outCountC2++;
         }
       } else if (targetChild == 3) {
+        attemptedOutCnt[3]++;
         if (outCountC3 < kNumRays) {
           std::memcpy(childRaysOut3.data() + outCountC3 * sizeof(Ray), ray, sizeof(Ray));
           outCountC3++;
@@ -417,7 +422,7 @@ public:
     }
     if(mode == 2) {
       const int interval = 3;
-      const int nColsPerFrame = 5;
+      const int nColsPerFrame = 4;
       if(exec_count%interval == 0) {
         for(uint16_t x=0; x<nColsPerFrame; x++) {
           for(uint16_t y=0; y<kFullImageHeight; y++) {
@@ -489,10 +494,10 @@ public:
     dbg[3] = inCountC2;
     dbg[4] = inCountC3;
     dbg[5] = 0;
-    dbg[6] = outCountC0;
-    dbg[7] = outCountC1;
-    dbg[8] = outCountC2;
-    dbg[9] = outCountC3;
+    dbg[6] = attemptedOutCnt[0];
+    dbg[7] = attemptedOutCnt[1];
+    dbg[8] = attemptedOutCnt[2];
+    dbg[9] = attemptedOutCnt[3];
 
     *exec_count = exec_count+1;
     return true;
@@ -539,7 +544,12 @@ public:
   static constexpr unsigned kNumLanes = 5;
   static constexpr unsigned kNumWorkers = 6; //MultiVertex::numWorkers(); 
   static constexpr unsigned PARENT = 4;
-    
+
+  struct LanePartition {
+    unsigned base[kNumLanes];             // primary writes per lane, clamped to capacity C
+    unsigned freePrefix[kNumLanes + 1];   // prefix-scan of free capacities across lanes
+  };
+
   uint16_t myChildPrefix;
   uint8_t shift;
 
@@ -611,42 +621,7 @@ public:
     barrier(/*phase=*/3, workerId);  
 
     if(workerId == 0) {
-      const unsigned NW = poplar::MultiVertex::numWorkers();
-      const unsigned C  = kNumRays;
-      poplar::Output<poplar::Vector<uint8_t>> *outBuf[kNumLanes] = {
-          &childRaysOut0, &childRaysOut1, &childRaysOut2, &childRaysOut3, &parentRaysOut};
-          
-      // totals per lane (small loops, cheap)
-      unsigned tot[kNumLanes] = {0,0,0,0,0};
-      for (unsigned lane = 0; lane < kNumLanes; ++lane)
-        for (unsigned w = 0; w < NW; ++w)
-          tot[lane] += sharedCounts[getSharedIdx(w, lane)];
-
-      unsigned base[kNumLanes], freeCap[kNumLanes], freePrefix[kNumLanes+1];
-      freePrefix[0] = 0;
-      for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-        base[lane]    = tot[lane] < C ? tot[lane] : C;
-        freeCap[lane] = C - base[lane];
-        freePrefix[lane+1] = freePrefix[lane] + freeCap[lane];
-      }
-      // recompute base[], freePrefix[] as above
-      unsigned assigned[kNumLanes] = {0,0,0,0,0};
-      for (unsigned w = 0; w < NW; ++w) {
-        unsigned a = sharedOffsets[spillStartIdx(w)];
-        unsigned b = sharedOffsets[spillEndIdx(w)];
-        for (unsigned r = 0; r < kNumLanes; ++r) {
-          unsigned L = freePrefix[r], R = freePrefix[r+1];
-          if (a < R && b > L) assigned[r] += ( (b<R?b:R) - (a>L?a:L) );
-        }
-      }
-      for (unsigned r = 0; r < kNumLanes; ++r) {
-        unsigned written = base[r] + assigned[r];  // <= C
-        unsigned capacity = outBuf[r]->size() / sizeof(Ray); // == C
-        for (unsigned i = written; i < capacity; ++i) {
-          Ray* rr = reinterpret_cast<Ray*>(outBuf[r]->data() + i*sizeof(Ray));
-          rr->x = INVALID_RAY_ID;
-        }
-      }
+      invalidateAfterRouting();
 
       unsigned outCnt[5] = {0,0,0,0,0}; 
 
@@ -681,29 +656,51 @@ private:
     return NW * kNumLanes + NW + w;
   }
 
+  [[gnu::always_inline]]
+  void totalsPerLane(const poplar::Vector<unsigned> &sharedCounts,
+                            unsigned NW,
+                            unsigned outTot[kNumLanes]) {
+    for (unsigned r = 0; r < kNumLanes; ++r) outTot[r] = 0;
+    for (unsigned r = 0; r < kNumLanes; ++r)
+      for (unsigned w = 0; w < NW; ++w)
+        outTot[r] += sharedCounts[getSharedIdx(w, r)];
+  }
+
+  [[gnu::always_inline]]
+  void mapGlobalFreeToLane(unsigned g, const LanePartition &P,
+                                  unsigned &r, unsigned &slotInR) {
+    r = 0;
+    while (g >= P.freePrefix[r + 1]) ++r;             // 5 lanes max
+    slotInR = P.base[r] + (g - P.freePrefix[r]);
+  }
+
+  [[gnu::always_inline]]
+  LanePartition makePartition(const unsigned tot[kNumLanes], unsigned C) {
+    LanePartition P{};
+    P.freePrefix[0] = 0;
+    for (unsigned r = 0; r < kNumLanes; ++r) {
+      unsigned used = (tot[r] < C) ? tot[r] : C;
+      P.base[r] = used;
+      unsigned freeCap = C - used;
+      P.freePrefix[r + 1] = P.freePrefix[r] + freeCap;
+    }
+    return P;
+  }
+
   void routeRays(unsigned workerId) {
     const unsigned NW = poplar::MultiVertex::numWorkers();
     const unsigned C  = kNumRays;
         
-    // totals per lane (small loops, cheap)
-    unsigned tot[kNumLanes] = {0,0,0,0,0};
-    for (unsigned lane = 0; lane < kNumLanes; ++lane)
-      for (unsigned w = 0; w < NW; ++w)
-        tot[lane] += sharedCounts[getSharedIdx(w, lane)];
-
-    unsigned base[kNumLanes], freeCap[kNumLanes], freePrefix[kNumLanes+1];
-    freePrefix[0] = 0;
-    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-      base[lane]    = tot[lane] < C ? tot[lane] : C;
-      freeCap[lane] = C - base[lane];
-      freePrefix[lane+1] = freePrefix[lane] + freeCap[lane];
-    }
+    // totals per lane
+    unsigned tot[kNumLanes];
+    totalsPerLane(sharedCounts, NW, tot);
+    LanePartition P = makePartition(tot, C);
 
     // my spill global range
     unsigned g    = sharedOffsets[spillStartIdx(workerId)];
     unsigned gEnd = sharedOffsets[spillEndIdx(workerId)];
 
-    unsigned  wrCtr[kNumLanes] = {0,0,0,0,0};             // per-lane counter
+    unsigned  wrCtr[kNumLanes] = {0,0,0,0,0};
 
     const poplar::Input<poplar::Vector<uint8_t>> *inBuf[kNumLanes] = {
         &childRaysIn0, &childRaysIn1, &childRaysIn2, &childRaysIn3, &parentRaysIn};
@@ -711,12 +708,7 @@ private:
     poplar::Output<poplar::Vector<uint8_t>> *outBuf[kNumLanes] = {
         &childRaysOut0, &childRaysOut1, &childRaysOut2, &childRaysOut3, &parentRaysOut};
 
-    //------------------------------------------------------------------
-    //  2.  Strided walk over *all* input lanes
-    //------------------------------------------------------------------
     for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-      // const unsigned N = in.size() / sizeof(Ray);
-
       // indices: workerId, workerId+kNumWorkers, …
       for (unsigned idx = workerId; idx < kNumRays; idx += kNumWorkers) {
         const Ray *ray = reinterpret_cast<const Ray*>(inBuf[lane]->data() + idx * sizeof(Ray));
@@ -737,10 +729,8 @@ private:
         } else {
           // spill write using my disjoint global free range
           if (g < gEnd) {
-            // map global free index -> (receiver lane r, slotInR)
-            unsigned r = 0;
-            while (g >= freePrefix[r+1]) ++r;                 // 5 lanes, fast
-            unsigned slotInR = base[r] + (g - freePrefix[r]); // first free slot in r
+            unsigned r, slotInR;
+            mapGlobalFreeToLane(g, P, r, slotInR);
             std::memcpy(outBuf[r]->data() + slotInR*sizeof(Ray), ray, sizeof(Ray));
             ++g;
           } else {
@@ -748,25 +738,8 @@ private:
             // Optionally drop or count to a debug counter here.
           }
         }
-
       }
     }
-
-    //------------------------------------------------------------------
-    // 3. Last worker invalidates tail
-    //------------------------------------------------------------------
-    // if (workerId == kNumWorkers - 1) {
-    //   for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-    //     unsigned written  = sharedOffsets[getSharedIdx(kNumWorkers-1, lane)] + wrCtr[lane];   // total
-    //     unsigned capacity = outBuf[lane]->size() / sizeof(Ray);
-    //     for (unsigned i = written; i < capacity; ++i) {
-    //       Ray *r = reinterpret_cast<Ray*>(outBuf[lane]->data() + i*sizeof(Ray));
-    //       if(r->x == INVALID_RAY_ID)
-    //         break;
-    //       r->x = INVALID_RAY_ID;
-    //     }
-    //   }
-    // }
   }
 
   [[gnu::always_inline]]
@@ -806,56 +779,102 @@ private:
 
     // 2) totals and free per lane
     unsigned tot[kNumLanes] = {0,0,0,0,0};
-    for (unsigned lane = 0; lane < kNumLanes; ++lane)
-      for (unsigned w = 0; w < NW; ++w)
-        tot[lane] += sharedCounts[getSharedIdx(w, lane)];
+    totalsPerLane(sharedCounts, NW, tot);
+    LanePartition P = makePartition(tot, C);
+    const unsigned totalFree = P.freePrefix[kNumLanes];
 
-    unsigned base[kNumLanes], freeCap[kNumLanes], freePrefix[kNumLanes+1];
-    freePrefix[0] = 0;
-    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-      base[lane]     = tot[lane] < C ? tot[lane] : C;
-      freeCap[lane]  = C - base[lane];
-      freePrefix[lane+1] = freePrefix[lane] + freeCap[lane];
-    }
-    unsigned totalFree = freePrefix[kNumLanes];
-
-    // 3) spill per worker
-    unsigned workerSpill[/*NW*/ 16]; // or dynamically sized if you prefer
+    // 3) Spill needed by each worker = sum_lanes max(0, start+cnt - C)
+    unsigned workerSpill[kNumWorkers];  // kNumWorkers >= NW
     for (unsigned w = 0; w < NW; ++w) {
       unsigned s = 0;
       for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-        unsigned start = sharedOffsets[getSharedIdx(w, lane)];
-        unsigned cnt   = sharedCounts[getSharedIdx(w, lane)];
-        unsigned allow = (start < C) ? ((cnt < (C - start)) ? cnt : (C - start)) : 0;
+        const unsigned start = sharedOffsets[getSharedIdx(w, lane)];
+        const unsigned cnt   = sharedCounts[getSharedIdx(w, lane)];
+        const unsigned allow = (start < C) ? ((cnt < (C - start)) ? cnt : (C - start)) : 0;
         s += (cnt - allow);
       }
       workerSpill[w] = s;
     }
 
-    // 4) assign each worker a contiguous slice of the global free list
+    // 4) Assign each worker a contiguous slice of the global free list (clamped)
     unsigned scan = 0;
+    unsigned remaining = totalFree;
     for (unsigned w = 0; w < NW; ++w) {
-      sharedOffsets[spillStartIdx(w)] = scan;
-      scan += workerSpill[w];
-      sharedOffsets[spillEndIdx(w)]   = scan;
+      const unsigned take = (workerSpill[w] < remaining) ? workerSpill[w] : remaining;
+      sharedOffsets[spillStartIdx(w)] = scan;  // start (inclusive)
+      scan += take;
+      sharedOffsets[spillEndIdx(w)]   = scan;  // end (exclusive)
+      remaining -= take;
     }
 
   }
 
+  [[gnu::always_inline]]
+  void accumulateSpillAssigned(const poplar::Vector<unsigned> &so,
+                              unsigned NW,
+                              const LanePartition &P,
+                              unsigned assigned[kNumLanes]) {
+    for (unsigned r = 0; r < kNumLanes; ++r) assigned[r] = 0;
+    for (unsigned w = 0; w < NW; ++w) {
+      unsigned a = so[spillStartIdx(w)];      // [a, b)
+      unsigned b = so[spillEndIdx(w)];
+      unsigned r = 0;
+      while (a < b) {
+        while (a >= P.freePrefix[r + 1]) ++r; // find bin containing 'a'
+        unsigned R = P.freePrefix[r + 1];
+        unsigned take = ((b < R) ? b : R) - a;
+        assigned[r] += take;
+        a += take;
+      }
+    }
+  }
+
+  [[gnu::always_inline]]
+  void wipeTail(poplar::Output<poplar::Vector<uint8_t>> &out, unsigned written) {
+    const unsigned capacity = out.size() / sizeof(Ray);
+    if (written >= capacity) return;
+    for (unsigned i = written; i < capacity; ++i) {
+      Ray *rr = reinterpret_cast<Ray*>(out.data() + i*sizeof(Ray));
+      if (rr->x == INVALID_RAY_ID) break;  // already clean
+      rr->x = INVALID_RAY_ID;              // sentinel
+    }
+  }
+
+  void invalidateAfterRouting() {
+    const unsigned NW = poplar::MultiVertex::numWorkers();
+    const unsigned C  = kNumRays;
+
+    poplar::Output<poplar::Vector<uint8_t>> *outBuf[kNumLanes] = {
+      &childRaysOut0, &childRaysOut1, &childRaysOut2, &childRaysOut3, &parentRaysOut
+    };
+
+    // 1) Totals per lane and partition (base, freePrefix)
+    unsigned tot[kNumLanes];
+    totalsPerLane(sharedCounts, NW, tot);
+    LanePartition P = makePartition(tot, C);
+
+    // 2) How much global free space each lane received via spills
+    unsigned assigned[kNumLanes];
+    accumulateSpillAssigned(sharedOffsets, NW, P, assigned);
+
+    // 3) Wipe the tails past written = base + assigned
+    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+      const unsigned written = P.base[lane] + assigned[lane]; // <= C
+      wipeTail(*outBuf[lane], written);
+    }
+  }
+
+
   void countRays(unsigned workerId) {
-    // Clear previous values
     for (unsigned lane = 0; lane < kNumLanes; ++lane)
       sharedCounts[getSharedIdx(workerId, lane)] = 0;
 
-    // Convenient arrays of input buffers
     const poplar::Input<poplar::Vector<uint8_t>> *inputs[kNumLanes] = {
         &childRaysIn0, &childRaysIn1, &childRaysIn2, &childRaysIn3, &parentRaysIn};
 
-    // Visit every lane
     for (unsigned lane = 0; lane < kNumLanes; ++lane) {
       const auto &buf  = *inputs[lane];
 
-      // Strided loop: workerId, workerId+kNumWorkers, …
       for (unsigned i = workerId; i < kNumRays; i += kNumWorkers) {
         const Ray *ray = reinterpret_cast<const Ray *>(buf.data() + i * sizeof(Ray));
         if (ray->x == INVALID_RAY_ID) break;
