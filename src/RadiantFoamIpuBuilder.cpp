@@ -335,6 +335,18 @@ void RadiantFoamIpuBuilder::buildRayGenerator(poplar::Graph& g, poplar::ComputeS
     auto raygen_exec = exec_counts_.get().slice({kNumRayTracerTiles},{kNumRayTracerTiles+1}).reshape({});
     g.connect(v["exec_count"], raygen_exec);
 
+    const auto kNumWorkers = 6;
+    const auto kNumLanes = 4;
+    auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*kNumLanes}, "sharedCounts");
+    auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*kNumLanes + 2*kNumWorkers}, "sharedOffsets");
+    auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
+    g.setTileMapping(sharedCounts, kRaygenTile);
+    g.setTileMapping(sharedOffsets, kRaygenTile);
+    g.setTileMapping(readyFlags, kRaygenTile);
+    g.connect(v["sharedCounts"], sharedCounts);
+    g.connect(v["sharedOffsets"], sharedOffsets);
+    g.connect(v["readyFlags"], readyFlags);
+
     raygenDebugRead_.buildTensor(g, poplar::UNSIGNED_CHAR, {kRouterDebugSize});
     g.setTileMapping(raygenDebugRead_.get(), kRaygenTile);
     g.connect(v["debugBytes"], raygenDebugRead_.get());
