@@ -303,18 +303,32 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
 
 void RadiantFoamIpuBuilder::buildRayGenerator(poplar::Graph& g, poplar::ComputeSet& cs) {
     const size_t kRayIOBytesPerTile = kNumRays * sizeof(Ray);
+    const unsigned kPendingFactor = 2;
 
+    auto v = g.addVertex(cs, "RayGen");
     raygenInput  = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile}, "raygen_in");
     raygenOutput = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile}, "raygen_out");
     SetInit<uint8_t>(g, raygenInput,  0xFF);
     SetInit<uint8_t>(g, raygenOutput, 0xFF);
     g.setTileMapping(raygenInput,  kRaygenTile);
     g.setTileMapping(raygenOutput, kRaygenTile);
-
-    auto v = g.addVertex(cs, "RayGen");
     g.connect(v["RaysIn"],  raygenInput);
     g.connect(v["RaysOut"], raygenOutput);
-    
+
+    auto rgPending = g.addVariable(poplar::UNSIGNED_CHAR, {kPendingFactor * kRayIOBytesPerTile}, "rg_pending_rays");
+    SetInit<uint8_t>(g, rgPending, 0xFF); 
+    g.setTileMapping(rgPending, kRaygenTile);
+    g.connect(v["pendingRays"],  rgPending);
+
+    auto rgHead = g.addVariable(poplar::UNSIGNED_INT, {}, "rg_pending_head");
+    auto rgTail = g.addVariable(poplar::UNSIGNED_INT, {}, "rg_pending_tail");
+    g.setInitialValue(rgHead, poplar::ArrayRef<unsigned>({0u}));
+    g.setInitialValue(rgTail, poplar::ArrayRef<unsigned>({0u}));
+    g.setTileMapping(rgHead, kRaygenTile);
+    g.setTileMapping(rgTail, kRaygenTile);
+    g.connect(v["pendingHead"], rgHead);
+    g.connect(v["pendingTail"], rgTail);
+
     cameraCellInfo_.buildTensor(g, poplar::UNSIGNED_CHAR,{4});
     g.setTileMapping(cameraCellInfo_.get(),kRaygenTile);
     g.connect(v["camera_cell_info"], cameraCellInfo_.get());

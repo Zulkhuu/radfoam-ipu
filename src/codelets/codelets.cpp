@@ -311,197 +311,14 @@ private:
   }
 };
 
-// class RayGen : public poplar::Vertex {
-// public:
-//   poplar::Input<poplar::Vector<uint8_t>> RaysIn;
-
-//   poplar::Output<poplar::Vector<uint8_t>> RaysOut;
-
-//   poplar::InOut<unsigned> exec_count; 
-//   poplar::Input<poplar::Vector<uint8_t>> camera_cell_info;
-//   poplar::Output<poplar::Vector<uint8_t>> debugBytes;
-
-//   bool compute() {
-//     constexpr uint8_t shift = 8; // lvl 4*2
-//     uint16_t outCountC0 = 0, outCountC1 = 0, outCountC2 = 0, outCountC3 = 0;
-//     unsigned attemptedOutCnt[4] = {0,0,0,0};
-//     uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
-//     uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
-
-//     // Helper: Determine target child
-//     auto findChildForCluster = [&](uint16_t cid) __attribute__((always_inline)) -> unsigned {
-//         return (cid >> shift) & 0x3;
-//     };
-
-//     // Helper: Route a ray
-//     auto routeRay = [&](const Ray* ray) {
-//       int targetChild = findChildForCluster(ray->next_cluster);
-//       if (targetChild == 0) {
-//         attemptedOutCnt[0]++;
-//         if (outCountC0 < kNumRays) {
-//           std::memcpy(childRaysOut0.data() + outCountC0 * sizeof(Ray), ray, sizeof(Ray));
-//           outCountC0++;
-//         }
-//       } else if (targetChild == 1) {
-//         attemptedOutCnt[1]++;
-//         if (outCountC1 < kNumRays) {
-//           std::memcpy(childRaysOut1.data() + outCountC1 * sizeof(Ray), ray, sizeof(Ray));
-//           outCountC1++;
-//         }
-//       } else if (targetChild == 2) {
-//         attemptedOutCnt[2]++;
-//         if (outCountC2 < kNumRays) {
-//           std::memcpy(childRaysOut2.data() + outCountC2 * sizeof(Ray), ray, sizeof(Ray));
-//           outCountC2++;
-//         }
-//       } else if (targetChild == 3) {
-//         attemptedOutCnt[3]++;
-//         if (outCountC3 < kNumRays) {
-//           std::memcpy(childRaysOut3.data() + outCountC3 * sizeof(Ray), ray, sizeof(Ray));
-//           outCountC3++;
-//         }
-//       } 
-//     };
-
-//     auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) __attribute__((always_inline)) -> uint16_t {
-//       uint16_t count = 0;
-//       for (int i = 0; i < kNumRays; ++i) {
-//         const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * sizeof(Ray));
-//         if (ray->x == INVALID_RAY_ID) break;
-//         count++;
-//         routeRay(ray);
-
-//       }
-//       return count;
-//     };
-
-//     int mode = 2;
-//     if(mode == 0) { // Single ray test
-//       if(exec_count == 0) {
-//         Ray genRay{};
-//         genRay.x = 304;
-//         genRay.y = 288;
-//         genRay.r = 0.0f;
-//         genRay.g = 0.0f;
-//         genRay.b = 0.0f;
-//         genRay.t = 0.0f;
-//         genRay.transmittance = 1.0f;
-//         genRay.next_cluster = cluster_id;
-//         genRay.next_local   = local_id;
-//         routeRay(&genRay);
-//       }
-//     }
-//     if(mode == 1) { // Row scan
-//       const int interval = 3;
-//       const int nRowsPerFrame = 2;
-//       if(exec_count%interval == 0) {
-//         for(uint16_t x=0; x<kFullImageWidth; x++) {
-//           for(uint16_t y=0; y<nRowsPerFrame; y++) {
-//             Ray genRay{};
-
-//             genRay.x = x; //(x+(exec_count/interval)*3)%kFullImageWidth;
-//             genRay.y = (y+(exec_count/interval)*nRowsPerFrame)%kFullImageHeight;
-//             genRay.r = 0.0f;
-//             genRay.g = 0.0f;
-//             genRay.b = 0.0f;
-//             genRay.t = 0.0;
-//             genRay.transmittance = 1.0;
-//             genRay.next_cluster = cluster_id;
-//             genRay.next_local   = local_id;
-
-//             routeRay(&genRay);
-//           }
-//         }
-//       } 
-//     }
-//     if(mode == 2) {
-//       const int interval = 3;
-//       const int nColsPerFrame = 4;
-//       if(exec_count%interval == 0) {
-//         for(uint16_t x=0; x<nColsPerFrame; x++) {
-//           for(uint16_t y=0; y<kFullImageHeight; y++) {
-//             Ray genRay{};
-//             genRay.x = (x+(exec_count/interval)*nColsPerFrame)%kFullImageWidth;
-//             genRay.y = y;
-//             genRay.r = 0.0f;
-//             genRay.g = 0.0f;
-//             genRay.b = 0.0f;
-//             genRay.t = 0.0f;
-//             genRay.transmittance = 1.0f;
-//             genRay.next_cluster = cluster_id;
-//             genRay.next_local   = local_id;
-
-//             routeRay(&genRay);
-//           }
-//         }
-//       } 
-//     }
-//     if(mode == 3) {
-//       const int interval = 15;
-//       const int nx = 40;
-//       const int ny = 30;
-//       if(exec_count == 0) {
-//         for(uint16_t x=0; x<nx; x++) {
-//           for(uint16_t y=0; y<ny; y++) {
-//             Ray genRay{};
-//             genRay.x = x*16; // + ((exec_count/interval)%4)*4 ;
-//             genRay.y = y*16; // + (((exec_count/interval)/4)%4)*4;
-//             genRay.r = 0.0f;
-//             genRay.g = 0.0f;
-//             genRay.b = 0.0f;
-//             genRay.t = 0.0f;
-//             genRay.transmittance = 1.0f;
-//             genRay.next_cluster = cluster_id;
-//             genRay.next_local   = local_id;
-
-//             routeRay(&genRay);
-//           }
-//         }
-//       } 
-//     }
-
-//     // Route each child and capture their input counts
-//     uint16_t inCountC0 = routeChildRays(childRaysIn0);
-//     uint16_t inCountC1 = routeChildRays(childRaysIn1);
-//     uint16_t inCountC2 = routeChildRays(childRaysIn2);
-//     uint16_t inCountC3 = routeChildRays(childRaysIn3);
-
-//     auto invalidateRemaining = [&](poplar::Output<poplar::Vector<uint8_t>>& out, uint16_t count) __attribute__((always_inline)) {
-//       for (uint16_t i = count; i < kNumRays; ++i) {
-//         Ray* ray = reinterpret_cast<Ray*>(out.data() + sizeof(Ray) * i);
-//         if(ray->x == INVALID_RAY_ID)
-//           break;
-//         ray->x = INVALID_RAY_ID;
-//       }
-//     };
-
-//     invalidateRemaining(childRaysOut0, outCountC0);
-//     invalidateRemaining(childRaysOut1, outCountC1);
-//     invalidateRemaining(childRaysOut2, outCountC2);
-//     invalidateRemaining(childRaysOut3, outCountC3);
-
-//     // --- Debug bytes ---
-//     uint16_t* dbg = reinterpret_cast<uint16_t*>(debugBytes.data());
-//     dbg[0] = *exec_count;
-//     dbg[1] = inCountC0;
-//     dbg[2] = inCountC1;
-//     dbg[3] = inCountC2;
-//     dbg[4] = inCountC3;
-//     dbg[5] = 0;
-//     dbg[6] = attemptedOutCnt[0];
-//     dbg[7] = attemptedOutCnt[1];
-//     dbg[8] = attemptedOutCnt[2];
-//     dbg[9] = attemptedOutCnt[3];
-
-//     *exec_count = exec_count+1;
-//     return true;
-//   }
-// };
-
 class RayGen : public poplar::Vertex {
 public:
-  poplar::Input<poplar::Vector<uint8_t>>  RaysIn;   // from L4 parentOut (ignore or stats)
+  poplar::Input<poplar::Vector<uint8_t>>  RaysIn;   // from L4 parentOut (spillovers)
   poplar::Output<poplar::Vector<uint8_t>> RaysOut;  // to L4 parentIn
+
+  poplar::InOut<poplar::Vector<uint8_t>>  pendingRays; 
+  poplar::InOut<unsigned>                 pendingHead;   // [0..P-1]
+  poplar::InOut<unsigned>                 pendingTail;   // [0..P-1]
 
   poplar::InOut<unsigned> exec_count;
   poplar::Input<poplar::Vector<uint8_t>> camera_cell_info;
@@ -511,53 +328,115 @@ public:
     const uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
     const uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
 
-    // 1) generate rays into RaysOut
+    const unsigned C = RaysOut.size()    / sizeof(Ray);
+    const unsigned P = pendingRays.size()/ sizeof(Ray);
+    
+    unsigned head = *pendingHead;
+    unsigned tail = *pendingTail;
+
+    auto qNext  = [&](unsigned v) -> unsigned { unsigned nv = v + 1; return (nv == P) ? 0u : nv; };
+    auto qEmpty = [&](unsigned h, unsigned t) -> bool { return h == t; };
+    auto qFree  = [&](unsigned h, unsigned t) -> unsigned { return (P - 1) - ((t + P - h) % P); }; // max storable without overlap
+
+    auto qPop = [&](Ray &r) -> bool {
+      if (qEmpty(head, tail)) return false;
+      std::memcpy(&r, pendingRays.data() + head*sizeof(Ray), sizeof(Ray));
+      head = qNext(head);
+      return true;
+    };
+    auto qPush = [&](const Ray &r) -> bool {
+      unsigned nt = qNext(tail);
+      if (nt == head) return false; // full
+      std::memcpy(pendingRays.data() + tail*sizeof(Ray), &r, sizeof(Ray));
+      tail = nt;
+      return true;
+    };
+    auto emit = [&](const Ray &r, unsigned &outCnt) -> bool {
+      if (outCnt >= C) return false;
+      std::memcpy(RaysOut.data() + outCnt*sizeof(Ray), &r, sizeof(Ray));
+      ++outCnt;
+      return true;
+    };
+
     unsigned outCnt = 0;
-    if ((*exec_count % 3) == 0) {
-      const int nColsPerFrame = 5;
-      for (uint16_t x = 0; x < nColsPerFrame; ++x) {
-        for (uint16_t y = 0; y < kFullImageHeight; ++y) {
-          if (outCnt >= kNumRays) break;
-          Ray* ro = reinterpret_cast<Ray*>(RaysOut.data() + outCnt*sizeof(Ray));
-          ro->x = (x + (*exec_count/3)*nColsPerFrame) % kFullImageWidth;
-          ro->y = y;
-          ro->r = ro->g = ro->b = 0.0f;
-          ro->t = __builtin_ipu_f32tof16(0.0f);
-          ro->transmittance = __builtin_ipu_f32tof16(1.0f);
-          ro->next_cluster = cluster_id;
-          ro->next_local   = local_id;
-          ++outCnt;
+
+    // Stats (debug)
+    unsigned pendEmitted=0, spillSeen=0, spillEmitted=0, spillQueued=0, genEmitted=0, genQueued=0, drops=0;
+
+    // ── 1) send pending first
+    Ray tmp{};
+    while (outCnt < C && qPop(tmp)) {
+      emit(tmp, outCnt);
+      ++pendEmitted;
+    }
+
+    // ── 2) forward spillovers next; queue overflow
+    for (unsigned i = 0; i < C; ++i) {
+      const Ray* r = reinterpret_cast<const Ray*>(RaysIn.data() + i*sizeof(Ray));
+      if (r->x == INVALID_RAY_ID) break;
+      ++spillSeen;
+
+      if (emit(*r, outCnt)) { ++spillEmitted; }
+      else if (qPush(*r))   { ++spillQueued;  }
+      else                  { ++drops;        } // ring full
+    }
+
+    // ── 3) fill remaining with generated rays (simple column scan), queue rest
+    const bool genThisFrame = ((*exec_count % 2) == 0);
+    if (genThisFrame) {
+      const unsigned nColsPerFrame = 5;
+      const unsigned colBase = ((*exec_count)/2) * nColsPerFrame;
+
+      // Don’t generate more than remaining output capacity + queue free slots
+      unsigned budget = (C - outCnt) + qFree(head, tail);
+
+      for (uint16_t cx = 0; cx < nColsPerFrame && budget; ++cx) {
+        const uint16_t x = (colBase + cx) % kFullImageWidth;
+        for (uint16_t y = 0; y < kFullImageHeight && budget; ++y) {
+          Ray g{};
+          g.x = x; g.y = y;
+          g.r = g.g = g.b = 0.0f;
+          g.t = __builtin_ipu_f32tof16(0.0f);
+          g.transmittance = __builtin_ipu_f32tof16(1.0f);
+          g.next_cluster = cluster_id;
+          g.next_local   = local_id;
+
+          if (emit(g, outCnt)) { ++genEmitted; }
+          else if (qPush(g))   { ++genQueued;  }
+          else                 { ++drops;      } // shouldn’t happen due to budget, but safe
+          --budget;
         }
       }
     }
 
-    // 2) invalidate tail
-    for (unsigned i = outCnt; i < kNumRays; ++i) {
+    // ── Invalidate tail of RaysOut
+    for (unsigned i = outCnt; i < C; ++i) {
       Ray* r = reinterpret_cast<Ray*>(RaysOut.data() + i*sizeof(Ray));
-      if(r->x == INVALID_RAY_ID)
-        break;
+      if (r->x == INVALID_RAY_ID) break;
       r->x = INVALID_RAY_ID;
     }
 
-    // (Optional) count what bubbled up from below
-    unsigned inCnt = 0;
-    for (unsigned i = 0; i < kNumRays; ++i) {
-      const Ray* r = reinterpret_cast<const Ray*>(RaysIn.data() + i*sizeof(Ray));
-      if (r->x == INVALID_RAY_ID) break;
-      ++inCnt;
-    }
+    // Persist ring indices
+    *pendingHead = head;
+    *pendingTail = tail;
 
-    // debug
+    // Debug (10 x uint16)
     uint16_t* dbg = reinterpret_cast<uint16_t*>(debugBytes.data());
     dbg[0] = *exec_count;
-    dbg[1] = inCnt;
-    dbg[2] = outCnt;
+    dbg[1] = outCnt;                 // total emitted
+    dbg[2] = (P - 1) - qFree(head, tail); // backlog size
+    dbg[3] = pendEmitted;
+    dbg[4] = spillSeen;
+    dbg[5] = spillEmitted;
+    dbg[6] = spillQueued;
+    dbg[7] = genEmitted;
+    dbg[8] = genQueued;
+    dbg[9] = drops;
 
     *exec_count = *exec_count + 1;
     return true;
   }
 };
-
 
 template <unsigned Port>
 [[gnu::always_inline]] 
