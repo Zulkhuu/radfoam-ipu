@@ -578,23 +578,17 @@ public:
   bool compute(unsigned workerId) {
     shift = *level * 2;
     myChildPrefix = childClusterIds[0] >> (shift + 2);
-    const unsigned NW = poplar::MultiVertex::numWorkers();
 
-    // optional: clean start each iteration
     if (workerId == 0) {
       volatile unsigned* f = readyFlags.data();
-      for (unsigned i=0;i<NW;++i) f[i] = 0;
+      for (unsigned i=0;i<kNumWorkers;++i) f[i] = 0;
     }
     barrier(0, workerId);
     
-    // readyFlags[workerId] = 0;
     countRays(workerId);
     barrier(/*phase=*/1, workerId);  // countRays(workerId);
 
-    // waitForAllWorkersReady();
-  
     unsigned outCnt2[kNumLanes] = {0,0,0,0,0};
-    // readyFlags[0] = 0;
     if(workerId == 0) {
       for(int i=0; i<kNumWorkers; i++) {
         for(int lane=0; lane<kNumLanes; lane++) {
@@ -602,70 +596,20 @@ public:
         }
       }
       computeWriteOffsets();
-      // readyFlags[workerId] = 1;
     }
-    // waitForAllWorkersReady();
     barrier(/*phase=*/2, workerId);  
 
-    // volatile unsigned* flags = readyFlags.data();
-    // while (true) {
-    //   bool all = true;
-    //   for (unsigned i=0;i<kNumWorkers;++i) 
-    //     if (flags[i] != 1) { 
-    //       all=false; break; 
-    //     }
-    //   if (all) break;
-    //   asm volatile("" ::: "memory");
-    // }
-
-    // readyFlags[workerId] = 0;
     routeRays(workerId);
     barrier(/*phase=*/3, workerId);  
-    // waitForAllWorkersReady();
 
     if(workerId == 0) {
-      unsigned inCnt[5] = {0,0,0,0,0};
       unsigned outCnt[5] = {0,0,0,0,0}; 
 
-      poplar::Output<poplar::Vector<uint8_t>>* outPorts[5] = {
-          &childRaysOut0, &childRaysOut1, &childRaysOut2, &childRaysOut3, &parentRaysOut
-      };
-
-      auto routeRay = [&](const Ray* ray)  __attribute__((always_inline)) {
-        int targetChild = findChildForCluster(ray->next_cluster);
-        for(int lane=0; lane<kNumLanes; lane++) {
-          if (targetChild == lane) {
-            if (outCnt[lane] < kNumRays) {
-              std::memcpy(outPorts[lane]->data() + outCnt[lane] * sizeof(Ray), ray, sizeof(Ray));
-              outCnt[lane]++;
-            }
-          }
-        }
-      };
-          
-      auto routeChildRays = [&](const poplar::Input<poplar::Vector<uint8_t>>& childIn) __attribute__((always_inline)) -> uint16_t {
-        uint16_t count = 0;
-        for (int i = 0; i < kNumRays; ++i) {
-          const Ray* ray = reinterpret_cast<const Ray*>(childIn.data() + i * sizeof(Ray));
-          if (ray->x == INVALID_RAY_ID) break;
-          count++;
-          routeRay(ray);
-        }
-        return count;
-      };
-
-      // Route each child and capture their input counts
-      // inCnt[0] = routeChildRays(childRaysIn0);
-      // inCnt[1] = routeChildRays(childRaysIn1);
-      // inCnt[2] = routeChildRays(childRaysIn2);
-      // inCnt[3] = routeChildRays(childRaysIn3);
-      // inCnt[4] = routeChildRays(parentRaysIn);
-
-      invalidateRemainingRays(childRaysOut0, outCnt2[0]);
-      invalidateRemainingRays(childRaysOut1, outCnt2[1]);
-      invalidateRemainingRays(childRaysOut2, outCnt2[2]);
-      invalidateRemainingRays(childRaysOut3, outCnt2[3]);
-      invalidateRemainingRays(parentRaysOut, outCnt2[4]);
+      // invalidateRemainingRays(childRaysOut0, outCnt2[0]);
+      // invalidateRemainingRays(childRaysOut1, outCnt2[1]);
+      // invalidateRemainingRays(childRaysOut2, outCnt2[2]);
+      // invalidateRemainingRays(childRaysOut3, outCnt2[3]);
+      // invalidateRemainingRays(parentRaysOut, outCnt2[4]);
 
       // Fill debugBytes (10 counts = 20 bytes)
       uint16_t* dbg = reinterpret_cast<uint16_t*>(debugBytes.data());
@@ -725,29 +669,17 @@ private:
     //------------------------------------------------------------------
     // 3. Last worker invalidates tail
     //------------------------------------------------------------------
-    // if (workerId == kNumWorkers - 1) {
-    //   for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-    //     unsigned written  = sharedOffsets[getSharedIdx(kNumWorkers-1, lane)] + wrCtr[lane];   // total
-    //     unsigned capacity = outBuf[lane]->size() / sizeof(Ray);
-    //     for (unsigned i = written; i < capacity; ++i) {
-    //       Ray *r = reinterpret_cast<Ray*>(outBuf[lane]->data() + i*sizeof(Ray));
-    //       if(r->x == INVALID_RAY_ID)
-    //         continue;
-    //       r->x = INVALID_RAY_ID;
-    //     }
-    //   }
-    // }
-    
-    // readyFlags[workerId] = 1;
-  }
-
-  [[gnu::always_inline]]
-  void invalidateRemainingRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) {
-    for (int i = count; i < buffer.size()/sizeof(Ray); i++) {
-      Ray* ray = reinterpret_cast<Ray*>(buffer.data() + sizeof(Ray) * i);
-      if(ray->x == INVALID_RAY_ID)
-        continue;
-      ray->x = INVALID_RAY_ID;
+    if (workerId == kNumWorkers - 1) {
+      for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+        unsigned written  = sharedOffsets[getSharedIdx(kNumWorkers-1, lane)] + wrCtr[lane];   // total
+        unsigned capacity = outBuf[lane]->size() / sizeof(Ray);
+        for (unsigned i = written; i < capacity; ++i) {
+          Ray *r = reinterpret_cast<Ray*>(outBuf[lane]->data() + i*sizeof(Ray));
+          if(r->x == INVALID_RAY_ID)
+            break;
+          r->x = INVALID_RAY_ID;
+        }
+      }
     }
   }
 
@@ -772,20 +704,6 @@ private:
       return isChild ? childIdx : PARENT;
   };
 
-  [[gnu::always_inline]]
-  void waitForAllWorkersReady() const {
-    while (true) {
-      bool allReady = true;
-      for (unsigned i = 0; i < kNumWorkers; ++i) {
-        if (readyFlags[i] != 1) {
-          allReady = false;
-          break;
-        }
-      }
-      if (allReady) break;
-    }
-  }
-
   void computeWriteOffsets() {
     // first worker offsets are zero -> discarded
     // sum of all is added last instead
@@ -804,11 +722,7 @@ private:
     return workerId * kNumLanes + lane;
   }
 
-  // Each worker processes indices: workerId, workerId+kNumWorkers,
   void countRays(unsigned workerId) {
-    // Pointer to this worker's 5-lane counter slice
-    // unsigned *myCounts = &sharedCounts[workerId * kNumLanes];
-
     // Clear previous values
     for (unsigned lane = 0; lane < kNumLanes; ++lane)
       sharedCounts[getSharedIdx(workerId, lane)] = 0;
@@ -824,14 +738,12 @@ private:
       // Strided loop: workerId, workerId+kNumWorkers, …
       for (unsigned i = workerId; i < kNumRays; i += kNumWorkers) {
         const Ray *ray = reinterpret_cast<const Ray *>(buf.data() + i * sizeof(Ray));
-        if (ray->x == INVALID_RAY_ID) break;        // empty slot
+        if (ray->x == INVALID_RAY_ID) break;
 
         unsigned dst = findChildForCluster(ray->next_cluster);
-        sharedCounts[getSharedIdx(workerId, dst)]++;  // count by OUTPUT lane
+        sharedCounts[getSharedIdx(workerId, dst)]++; 
       }
     }
-
-    // readyFlags[workerId] = 1;
   }
 
 };
