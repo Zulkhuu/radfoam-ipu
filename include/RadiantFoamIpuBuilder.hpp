@@ -69,6 +69,7 @@ private:
     void buildRayRoutersL1(poplar::Graph& g, poplar::ComputeSet& cs);
     void buildRayRoutersL2(poplar::Graph& g, poplar::ComputeSet& cs);
     void buildRayRoutersL3(poplar::Graph& g, poplar::ComputeSet& cs);
+    void buildRayRoutersL4(poplar::Graph& g, poplar::ComputeSet& cs);
     void buildDataExchange(poplar::Graph& g);
     void setupHostStreams(poplar::Graph& g);
     void connectHostStreams(poplar::Engine& eng);
@@ -98,6 +99,8 @@ private:
     poplar::Tensor L2RouterIn; 
     poplar::Tensor L3RouterOut;
     poplar::Tensor L3RouterIn; 
+    poplar::Tensor L4RouterOut;
+    poplar::Tensor L4RouterIn; 
     poplar::Tensor raygenOutput;
     poplar::Tensor raygenInput;
 
@@ -116,6 +119,7 @@ private:
     ipu_utils::StreamableTensor l1routerDebugRead_{"l1_router_debug_bytes_read"};
     ipu_utils::StreamableTensor l2routerDebugRead_{"l2_router_debug_bytes_read"};
     ipu_utils::StreamableTensor l3routerDebugRead_{"l3_router_debug_bytes_read"};
+    ipu_utils::StreamableTensor l4routerDebugRead_{"l4_router_debug_bytes_read"};
     ipu_utils::StreamableTensor raygenDebugRead_{"raygen_debug_bytes_read"};
     ipu_utils::StreamableTensor finishedRaysRead_{"finished_rays_read"};
     ipu_utils::StreamableTensor finishedWriteOffsets_{"finished_rays_write_offsets"};
@@ -133,6 +137,7 @@ private:
     std::vector<uint8_t> l1routerDebugBytesHost_;
     std::vector<uint8_t> l2routerDebugBytesHost_;
     std::vector<uint8_t> l3routerDebugBytesHost_;
+    std::vector<uint8_t> l4routerDebugBytesHost_;
     std::vector<uint8_t> raygenDebugBytesHost_;
 
     // Helper program sequences ----------------------------------------------
