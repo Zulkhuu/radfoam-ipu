@@ -23,6 +23,7 @@ struct alignas(4) Ray {
 inline constexpr uint16_t kLeadMask   = 0xFC00u;   // 11111 00000000000₂
 inline constexpr uint8_t kShift = 10;  
 inline constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
+inline constexpr uint16_t FINISHED_RAY_ID = 0xFFFE;
 
 template <typename T>
 [[gnu::always_inline]] inline const T* readStructAt(const poplar::Input<poplar::Vector<uint8_t>>& buffer, std::size_t index) {
@@ -103,7 +104,7 @@ public:
     // Loop over input rays
     for (int ray_index = 0; ray_index < kNumRays; ++ray_index) {
       const Ray* ray_in = readStructAt<Ray>(raysIn, ray_index);
-      if (ray_in->x == INVALID_RAY_ID) break; // End of rays
+      if (ray_in->next_cluster == INVALID_RAY_ID) break; // End of rays
 
       if (ray_in->next_cluster != *tile_id) { // Check spillover rays
         if (out_ray_cntr < kNumRays) {
@@ -294,9 +295,9 @@ private:
   void invalidateRemainingRays(poplar::Output<poplar::Vector<uint8_t>>& buffer, int count) {
     for (int i = count; i < buffer.size()/sizeof(Ray); i++) {
       Ray* ray = reinterpret_cast<Ray*>(buffer.data() + sizeof(Ray) * i);
-      if(ray->x == INVALID_RAY_ID)
+      if(ray->next_cluster == INVALID_RAY_ID)
         break;
-      ray->x = INVALID_RAY_ID;
+      ray->next_cluster = INVALID_RAY_ID;
     }
   }
 
@@ -373,7 +374,7 @@ public:
     // ── 2) forward spillovers next; queue overflow
     for (unsigned i = 0; i < C; ++i) {
       const Ray* r = reinterpret_cast<const Ray*>(RaysIn.data() + i*sizeof(Ray));
-      if (r->x == INVALID_RAY_ID) break;
+      if (r->next_cluster == INVALID_RAY_ID) break;
       ++spillSeen;
 
       if (emit(*r, outCnt)) { ++spillEmitted; }
@@ -412,8 +413,8 @@ public:
     // ── Invalidate tail of RaysOut
     for (unsigned i = outCnt; i < C; ++i) {
       Ray* r = reinterpret_cast<Ray*>(RaysOut.data() + i*sizeof(Ray));
-      if (r->x == INVALID_RAY_ID) break;
-      r->x = INVALID_RAY_ID;
+      if (r->next_cluster == INVALID_RAY_ID) break;
+      r->next_cluster = INVALID_RAY_ID;
     }
 
     // Persist ring indices
@@ -646,7 +647,7 @@ private:
       // indices: workerId, workerId+kNumWorkers, …
       for (unsigned idx = workerId; idx < kNumRays; idx += kNumWorkers) {
         const Ray *ray = reinterpret_cast<const Ray*>(inBuf[lane]->data() + idx * sizeof(Ray));
-        if (ray->x == INVALID_RAY_ID) break;
+        if (ray->next_cluster == INVALID_RAY_ID) break;
 
         unsigned dst = findChildForCluster(ray->next_cluster);  // 0..4
 
@@ -769,8 +770,8 @@ private:
     if (written >= capacity) return;
     for (unsigned i = written; i < capacity; ++i) {
       Ray *rr = reinterpret_cast<Ray*>(out.data() + i*sizeof(Ray));
-      if (rr->x == INVALID_RAY_ID) break;  // already clean
-      rr->x = INVALID_RAY_ID;              // sentinel
+      if (rr->next_cluster == INVALID_RAY_ID) break;  // already clean
+      rr->next_cluster = INVALID_RAY_ID;              // sentinel
     }
   }
 
@@ -811,7 +812,8 @@ private:
 
       for (unsigned i = workerId; i < kNumRays; i += kNumWorkers) {
         const Ray *ray = reinterpret_cast<const Ray *>(buf.data() + i * sizeof(Ray));
-        if (ray->x == INVALID_RAY_ID) break;
+        if (ray->next_cluster == FINISHED_RAY_ID) continue;
+        if (ray->next_cluster == INVALID_RAY_ID) break;
 
         unsigned dst = findChildForCluster(ray->next_cluster);
         sharedCounts[getSharedIdx(workerId, dst)]++; 
