@@ -70,7 +70,7 @@ private:
     void buildRayRoutersL2(poplar::Graph& g, poplar::ComputeSet& cs);
     void buildRayRoutersL3(poplar::Graph& g, poplar::ComputeSet& cs);
     void buildRayRoutersL4(poplar::Graph& g, poplar::ComputeSet& cs);
-    void buildDataExchange(poplar::Graph& g);
+    poplar::program::Sequence buildDataExchange(poplar::Graph& g);
     void setupHostStreams(poplar::Graph& g);
     void connectHostStreams(poplar::Engine& eng);
     void readAllTiles(poplar::Engine& engine);
@@ -79,7 +79,8 @@ private:
     // Construction‑time constants
     const std::string h5_file_;
     bool debug_;
-    static constexpr int kSubsteps = 20;
+    bool loop_frames_ = false;
+    static constexpr int kSubsteps = 1;
     static constexpr int kRouterDebugSize = 24;
 
     // Scene data -------------------------------------------------------------
@@ -143,9 +144,6 @@ private:
     // Helper program sequences ----------------------------------------------
     poplar::program::Sequence per_tile_writes_;
     poplar::program::Sequence broadcastMatrices_;
-    poplar::program::Sequence data_exchange_seq;
-    poplar::program::Sequence frameStep_;
-    // poplar::program::Sequence frame_;
 
 };
 

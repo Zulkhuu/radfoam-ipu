@@ -286,10 +286,10 @@ int main(int argc, char** argv) {
   const size_t totalPixels = kFullImageWidth * kFullImageHeight;
   bool fullImageUpdated = false;
 
-  builder.stopFlagHost_ = 1;
-  std::thread ipuThread([&] {
-    mgr.execute(builder);
-  });
+  // builder.stopFlagHost_ = 1;
+  // std::thread ipuThread([&] {
+  //   mgr.execute(builder);
+  // });
 
   int step=0;
   do {
@@ -317,7 +317,9 @@ int main(int argc, char** argv) {
       }
     }
 
-    // mgr.execute(builder);
+    // per frame IPU program execution
+    mgr.execute(builder);
+
     auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
     *imagePtr = imageMat;
 
@@ -344,7 +346,7 @@ int main(int argc, char** argv) {
 
   if (enableUI) hostProcessing.waitForCompletion();
 
-  ipuThread.join();
+  // ipuThread.join();
 
   // cv::imwrite("framebuffer_full.png", AssembleFullImage(builder.framebuffer_host));
   auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
