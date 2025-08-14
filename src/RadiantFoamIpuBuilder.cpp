@@ -191,8 +191,8 @@ void RadiantFoamIpuBuilder::allocateGlobalTensors(poplar::Graph& g) {
 
     inStreamFinishedRays = g.addVariable(poplar::UNSIGNED_CHAR, {kNumRayTracerTiles * kFinishedRayBytesPerTile}, "instream-finished-rays");
     poplar::OptionFlags inOpts = {
-        {"bufferingDepth", "2"},
-        {"splitLimit", std::to_string(100 * 1024 * 1024)} // 100 MiB
+        {"bufferingDepth", "1"},
+        {"splitLimit", std::to_string(200 * 1024 * 1024)} // 200 MiB
     };
     inStream =  g.addDeviceToHostFIFO(
         "read-finished-rays-stream",

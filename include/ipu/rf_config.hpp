@@ -84,6 +84,6 @@ inline constexpr std::size_t kL2RouterTileBase = kNumRayTracerTiles + kNumL0Rout
 inline constexpr std::size_t kL3RouterTileBase = kNumRayTracerTiles + kNumL0RouterTiles + kNumL1RouterTiles + kNumL2RouterTiles;
 inline constexpr std::size_t kL4RouterTileBase = kNumRayTracerTiles + kNumL0RouterTiles + kNumL1RouterTiles + kNumL2RouterTiles + kL3RouterTileBase;
 
-inline constexpr std::size_t kFinishedFactor  = 1;
+inline constexpr std::size_t kFinishedFactor  = 5;
 inline constexpr std::size_t kFinishedRayBytesPerTile = kNumRays * kFinishedFactor * sizeof(radfoam::geometry::FinishedRay);
 }  // namespace rf

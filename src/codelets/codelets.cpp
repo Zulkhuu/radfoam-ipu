@@ -53,12 +53,15 @@ public:
   poplar::InOut<poplar::Vector<unsigned>> sharedOffsets;
   poplar::InOut<poplar::Vector<unsigned>> readyFlags;
 
+  // poplar::Input<unsigned> kSubsteps;
+
   // ---- aliasing guards ----
   [[poplar::constraint("elem(*raysIn)!=elem(*raysOut)")]]
   [[poplar::constraint("elem(*raysIn)!=elem(*finishedRays)")]]
   [[poplar::constraint("elem(*raysOut)!=elem(*finishedRays)")]]
 
   bool compute(unsigned workerId) {
+    const unsigned kSubSteps = 6;
     const unsigned NW = poplar::MultiVertex::numWorkers();
     const unsigned C  = raysOut.size() / sizeof(Ray);
     const unsigned FR_CAP = finishedRays.size() / sizeof(FinishedRay);
@@ -66,24 +69,13 @@ public:
     const uint16_t nNbrPts   = neighbor_pts.size() / sizeof(GenericPoint);
     const unsigned adjSize   = adjacency.size(); // elements (uint16)
 
-    // Per-worker fixed slice in finishedRays (even split; last worker takes remainder)
-    const unsigned basePer = FR_CAP / NW;
-    const unsigned myStart = workerId * basePer; // + (workerId < rem ? workerId : rem);
-    const unsigned myCount = 0; //basePer + (workerId < rem ? 1u : 0u);
-    const unsigned myEnd   = (workerId+1) * basePer; //(myStart + myCount <= FR_CAP) ? (myStart + myCount) : FR_CAP;
-    unsigned       myWrite = myStart; // next write index within finishedRays
-
-    // Clear only my finished slice for this frame
-    // for (unsigned i = myStart; i < myEnd; ++i) {
-    //   FinishedRay* fr = reinterpret_cast<FinishedRay*>(finishedRays.data() + i*sizeof(FinishedRay));
-    //   fr->x = INVALID_RAY_ID;
-    // }
-    
-    // for (unsigned idx = workerId; idx < C; idx += NW) {
-    //   auto *ro = reinterpret_cast<Ray*>(raysOut.data() + idx*sizeof(Ray));
-    //   ro->next_cluster = INVALID_RAY_ID;
-    // }
-
+    // ----- 0) Once per CPU-read (first substep), clear & reset head in parallel
+    const bool firstSubstep = ((*exec_count % kSubSteps) == 0);
+    if (firstSubstep) {
+      if (workerId == 0) 
+        *finishedWriteOffset = 0;
+    }
+    barrier(/*phase=*/0, workerId);
 
     // Setup matrices
     glm::mat4 invView = glm::make_mat4(view_matrix.data());
@@ -95,7 +87,6 @@ public:
     unsigned localMaxSeenPlus1 = 0;
 
     // Track last index we actually touched in our stripe to clean the tail later
-    // unsigned out_ray_cntr  = 0;
     uint16_t lastSeenIdx = 65533;
 
     // ---- Pass: march rays; write back to SAME index in raysOut; record finished into my slice ----
@@ -106,10 +97,8 @@ public:
       localMaxSeenPlus1 = idx + 1;
       Ray* out = reinterpret_cast<Ray*>(raysOut.data() + idx*sizeof(Ray));
       
-      // Spillover passthrough (ray belongs to another tile)
       if (in->next_cluster != myTile) {
         std::memcpy(out, in, sizeof(Ray));
-        // out_ray_cntr++;
         continue;
       }
 
@@ -129,18 +118,13 @@ public:
         continue;
       }
       bool finished = false;
-      unsigned step = 0;
 
       while (!finished) {
-        ++step;
-        if (current < 0 || current >= nLocalPts) { finished = true; break; }
         const LocalPoint* cur = readStructAt<LocalPoint>(local_pts, current);
         glm::vec3 p0(cur->x, cur->y, cur->z);
 
         uint16_t adjStart = (current==0) ? 0 : readStructAt<LocalPoint>(local_pts, current-1)->adj_end;
         uint16_t adjEnd   = cur->adj_end;
-        if (adjStart > adjEnd) adjStart = adjEnd;
-        if (adjEnd   > adjSize) adjEnd  = adjSize;
 
         float closestT = std::numeric_limits<float>::max();
         int   next     = -1;
@@ -150,12 +134,15 @@ public:
           glm::vec3 p1;
           if (nbrIdx < local_pts.size()/sizeof(LocalPoint)) {
             const LocalPoint* nb = readStructAt<LocalPoint>(local_pts, nbrIdx);
-            p1 = glm::vec3(nb->x, nb->y, nb->z);
+            p1.x = nb->x;
+            p1.y = nb->y;
+            p1.z = nb->z;
           } else {
             const uint16_t off = nbrIdx - nLocalPts;
-            if (off >= nNbrPts) { next = -1; continue; }
             const GenericPoint* nb = readStructAt<GenericPoint>(neighbor_pts, off);
-            p1 = glm::vec3(nb->x, nb->y, nb->z);
+            p1.x = nb->x;
+            p1.y = nb->y;
+            p1.z = nb->z;
           }
 
           const glm::vec3 faceNormal = p1 - p0;
@@ -190,22 +177,7 @@ public:
             out->t = __builtin_ipu_f32tof16(t0);
             out->transmittance = __builtin_ipu_f32tof16(transmittance);
             out->next_cluster  = FINISHED_RAY_ID;   // router will skip
-            out->next_local    = 0;
-
-            // Emit into my finished slice if space remains
-            if (myWrite < myEnd) {
-              FinishedRay* fr = reinterpret_cast<FinishedRay*>(
-                  finishedRays.data() + myWrite*sizeof(FinishedRay));
-              const uint16_t x10w = data10(in->x);
-              fr->x = x10w;
-              fr->y = in->y;
-              fr->r = clampToU8(color.x);
-              fr->g = clampToU8(color.y);
-              fr->b = clampToU8(color.z);
-              fr->t = t0;
-              ++myWrite;
-              ++localFinished;
-            }
+            ++localFinished;
           } else {
             // Cross to neighbor cluster
             const uint16_t nLocal = local_pts.size()/sizeof(LocalPoint);
@@ -216,7 +188,7 @@ public:
             out->g = color.y; 
             out->b = color.z;
             out->t = __builtin_ipu_f32tof16(t0);
-            out->transmittance = __builtin_ipu_f32tof16(__builtin_ipu_max(0.f, __builtin_ipu_min(1.f, transmittance)));
+            out->transmittance = __builtin_ipu_f32tof16(transmittance); //__builtin_ipu_max(0.f, __builtin_ipu_min(1.f, transmittance)));
             out->next_cluster  = nb->cluster_id;
             out->next_local    = nb->local_id;
           }
@@ -224,50 +196,84 @@ public:
           break;
         }
 
-        // Safety cap to avoid pathological loops
-        // if (step >= 120) finished = true;
         current = next;
       } // while(!finished)
     } // for stripe
+    sharedCounts[workerId]  = localFinished;
 
-    // sharedCounts[workerId]  = localFinished;
-    // barrier(0, workerId);
+    barrier(/*phase=*/1, workerId);
 
-    // if(workerId == 0) {
-    //   uint16_t totalFinished = 0;
-    //   for (unsigned w = 0; w < NW; ++w) {
-    //     totalFinished += sharedCounts[w];
-    //   }
-    // }
-    // barrier(1, workerId);
-    // Invalidate the remainder of my raysOut stripe to avoid stale entries
+    if (workerId == 0) {
+      computeWriteOffsets();
+    }
+    barrier(/*phase=*/2, workerId);
+    
+    // Fetch my slice start
+    unsigned myStart = sharedOffsets[workerId];
+    unsigned myCount = localFinished;
+
+    // ----- 4) Light second pass: emit FinishedRay records into my contiguous slice
+    unsigned written = 0;
+    for (uint16_t idx = workerId; written < myCount; idx += NW) {
+      const Ray* out = reinterpret_cast<const Ray*>(raysOut.data() + idx*sizeof(Ray));
+      if (out->next_cluster != FINISHED_RAY_ID) continue;
+      if (out->next_cluster == INVALID_RAY_ID) break;
+
+      auto fid = myStart + written;
+      if(fid >= FR_CAP) break;
+      FinishedRay* fr = reinterpret_cast<FinishedRay*>(finishedRays.data() + fid*sizeof(FinishedRay));
+
+      const uint16_t x10w = data10(out->x);
+      fr->x = x10w;
+      fr->y = out->y;
+      fr->r = clampToU8(out->r);
+      fr->g = clampToU8(out->g);
+      fr->b = clampToU8(out->b);
+      fr->t = __builtin_ipu_f16tof32(out->t);
+      ++written;
+    }
+
     unsigned startTail = (lastSeenIdx == 65533) ? workerId : (static_cast<unsigned>(lastSeenIdx) + NW);
     for (unsigned idx = startTail; idx < C; idx += NW) {
       Ray* ray = reinterpret_cast<Ray*>(raysOut.data() + idx*sizeof(Ray));
       if (ray->next_cluster == INVALID_RAY_ID) break;
       ray->next_cluster = INVALID_RAY_ID;
     }
-
-    for (unsigned i = myWrite; i < myEnd; ++i) {
-      FinishedRay* ray = reinterpret_cast<FinishedRay*>(finishedRays.data() + i*sizeof(FinishedRay));
+    barrier(/*phase=*/3, workerId);
+    
+    
+    if (workerId == 0) {
+      unsigned tail = finishedWriteOffset; //sharedOffsets[NW-1] + sharedCounts[NW-1];
+      for(int i=tail; i<FR_CAP; i++) {
+        FinishedRay* ray = reinterpret_cast<FinishedRay*>(finishedRays.data() + i*sizeof(FinishedRay));
       if (ray->x == INVALID_RAY_ID) break;
       ray->x = INVALID_RAY_ID;
+      }
     }
 
-    // Optional debug
     if (workerId == 0) {
       *exec_count = *exec_count + 1;
       *result_u16  = localFinished; 
-      // *result_float = static_cast<float>(*exec_count);
-      // if(lastSeenIdx != 65533)
-      //   framebuffer[0] = lastSeenIdx;
-      // else
-      //   framebuffer[0] = 0;
     }
     return true;
   }
 
 private:
+  [[gnu::always_inline]]
+  void computeWriteOffsets() {
+      const unsigned NW = poplar::MultiVertex::numWorkers();
+      // exclusive scan over workers
+      unsigned head = *finishedWriteOffset;
+      unsigned scan = 0, total = 0;
+      for (unsigned w = 0; w < NW; ++w) {
+        sharedOffsets[w] = head + scan;   // start for worker w
+        scan  += sharedCounts[w];
+      }
+      total = scan;
+
+      // capacity check (assume no wrap during a burst)
+      *finishedWriteOffset = head + total;
+  }
   [[gnu::always_inline]]
   glm::vec3 computeRayDir(uint16_t x, uint16_t y, glm::mat4& invProj, glm::mat4& invView) {
     float ndcX = (2.0f * x) / kFullImageWidth - 1.0f;
@@ -280,14 +286,14 @@ private:
   };
   
   // [[gnu::always_inline]]
-  void barrier2(unsigned phase, unsigned workerId) {
+  void barrier(unsigned phase, unsigned workerId) {
     volatile unsigned* flags = readyFlags.data();
     const unsigned NW = poplar::MultiVertex::numWorkers();
     asm volatile("" ::: "memory");
     while (true) {
       flags[workerId] = phase;
       bool all = true;
-      for (unsigned i = 0; i < NW; ++i) if (flags[i] != phase) { all = false; break; }
+      for (unsigned i = 0; i < NW; ++i) if (flags[i] < phase) { all = false; break; }
       if (all) break;
     }
     asm volatile("" ::: "memory");
@@ -389,10 +395,10 @@ public:
     }
 
     // ── 3) fill remaining with generated rays (simple column scan), queue rest
-    const unsigned interval = 2;
+    const unsigned interval = 1;
     const bool genThisFrame = ((*exec_count % interval) == 0);
     if (genThisFrame) {
-      const unsigned nColsPerFrame = 4;
+      const unsigned nColsPerFrame = 2;
       const unsigned colBase = ((*exec_count)/interval) * nColsPerFrame;
 
       // Don’t generate more than remaining output capacity + queue free slots
@@ -725,9 +731,6 @@ private:
         } else {
           needSpill = true; // this worker's primary quota used up
         }
-        // } else {
-        //   needSpill = true;   // this worker's primary quota used up
-        // }
 
         // spill only if required
         if (needSpill) {

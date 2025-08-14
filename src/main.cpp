@@ -376,32 +376,31 @@ int main(int argc, char** argv) {
       } while (f == lastFence);   // wait for a new frame to complete its copy
       lastFence = f;
 
-      // (optional but recommended) snapshot to avoid tearing if next frame begins
       static std::vector<uint8_t> localCopy(builder.finishedRaysHost_.size());
       std::memcpy(localCopy.data(), builder.finishedRaysHost_.data(), localCopy.size());
-      // auto [imageMat, updatedCount] = AssembleFinishedRaysImage(localCopy, vis_mode);
-      *imagePtr = AssembleFinishedRaysImageRGBOnly(localCopy);
+      auto [imageMat, updatedCount] = AssembleFinishedRaysImage(localCopy, vis_mode);
+      // *imagePtr = AssembleFinishedRaysImageRGBOnly(localCopy);
 
       // auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
-      // *imagePtr = imageMat;
+      *imagePtr = imageMat;
 
       std::swap(imagePtr, imagePtrBuffered);
       if (enableUI) hostProcessing.run(uiUpdateFunc);
-      std::cout << lastFence << std::endl;
-      // state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
+      
+      state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
 
-      // size_t nonZeroCount = CountNonZeroPixels(*imagePtr);
-      // if(!fullImageUpdated) {
-      //   std::cout << lastFence << "Updated pixels: " << updatedCount << " Non zero: " << nonZeroCount << std::endl;
-      //   if (nonZeroCount >= totalPixels*0.9995) {
-      //     auto now = std::chrono::steady_clock::now();
-      //     double elapsedSec = std::chrono::duration<double>(now - startTime).count();
-      //     std::cout << "Full image updated in " << elapsedSec << " seconds." << std::endl;
-      //     fullImageUpdated = true;
-      //     builder.stopFlagHost_ = 0;
-      //     break;
-      //   }
-      // }
+      size_t nonZeroCount = CountNonZeroPixels(*imagePtr);
+      if(!fullImageUpdated) {
+        std::cout << lastFence << ": Updated pixels: " << updatedCount << " Non zero: " << nonZeroCount << std::endl;
+        if (nonZeroCount >= totalPixels*0.9995) {
+          auto now = std::chrono::steady_clock::now();
+          double elapsedSec = std::chrono::duration<double>(now - startTime).count();
+          std::cout << "Full image updated in " << elapsedSec << " seconds." << std::endl;
+          fullImageUpdated = true;
+          // builder.stopFlagHost_ = 0;
+          // break;
+        }
+      }
 
       // std::this_thread::sleep_for(std::chrono::milliseconds(1)); 
 
