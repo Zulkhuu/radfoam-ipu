@@ -32,14 +32,9 @@
 namespace radfoam {
 namespace ipu {
 
-/// RadiantFoamIpuBuilder – constructs & drives the Poplar graph used by the
-/// real‑time RadiantFoam renderer. One instance lives on the host and may be
-/// reused across multiple frames; build() runs once, execute() runs every frame.
 class RadiantFoamIpuBuilder final : public ipu_utils::BuilderInterface {
 public:
-    /// @param h5_scene_file    Path to the baked HDF5 scene file.
-    /// @param debug_tile       Optional: tile ID to emit extra debug for.
-    explicit RadiantFoamIpuBuilder(std::string h5_scene_file, bool debug = false);
+    explicit RadiantFoamIpuBuilder(std::string h5_scene_file, bool loop_frames = false, bool debug = false);
 
     // BuilderInterface -------------------------------------------------------
     void build(poplar::Graph& graph, const poplar::Target& target) override;
@@ -57,6 +52,7 @@ public:
     std::vector<uint16_t> result_u16_host;    ///< Scratch debug channel
 
     unsigned stopFlagHost_;
+    std::atomic<uint32_t> frameFenceHost_{0};
 
 private:
     // ───────────── helper sections used by build() ─────────────
@@ -79,9 +75,9 @@ private:
     // Construction‑time constants
     const std::string h5_file_;
     bool debug_;
-    bool loop_frames_ = false;
+    bool loop_frames_;
     static constexpr int kSubsteps = 1;
-    static constexpr int kRouterDebugSize = 24;
+    static constexpr int kRouterDebugSize = 15;
 
     // Scene data -------------------------------------------------------------
     std::vector<std::vector<radfoam::geometry::LocalPoint>>   local_pts_;
@@ -134,12 +130,12 @@ private:
     std::vector<float> hostViewMatrix_;
     std::vector<float> hostProjMatrix_;
     std::array<uint8_t, 4> hostCameraCellInfo_{{0,0,0,0}};
-    std::vector<uint8_t> l0routerDebugBytesHost_;
-    std::vector<uint8_t> l1routerDebugBytesHost_;
-    std::vector<uint8_t> l2routerDebugBytesHost_;
-    std::vector<uint8_t> l3routerDebugBytesHost_;
-    std::vector<uint8_t> l4routerDebugBytesHost_;
-    std::vector<uint8_t> raygenDebugBytesHost_;
+    std::vector<unsigned> l0routerDebugBytesHost_;
+    std::vector<unsigned> l1routerDebugBytesHost_;
+    std::vector<unsigned> l2routerDebugBytesHost_;
+    std::vector<unsigned> l3routerDebugBytesHost_;
+    std::vector<unsigned> l4routerDebugBytesHost_;
+    std::vector<unsigned> raygenDebugBytesHost_;
 
     // Helper program sequences ----------------------------------------------
     poplar::program::Sequence per_tile_writes_;

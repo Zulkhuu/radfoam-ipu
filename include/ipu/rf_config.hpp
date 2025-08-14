@@ -30,7 +30,7 @@ inline constexpr std::size_t kNumL3RouterTiles = kNumL2RouterTiles / kChildrenPe
 inline constexpr std::size_t kNumL4RouterTiles = kNumL3RouterTiles / kChildrenPerRouter; // 1
 
 // Ray generator tile
-inline constexpr std::uint16_t kRaygenTile = 1470;
+inline constexpr std::uint16_t kRaygenTile = 1460;
 
 // Rays per IO buffer
 inline constexpr std::size_t kNumRays = 2400;
@@ -84,6 +84,6 @@ inline constexpr std::size_t kL2RouterTileBase = kNumRayTracerTiles + kNumL0Rout
 inline constexpr std::size_t kL3RouterTileBase = kNumRayTracerTiles + kNumL0RouterTiles + kNumL1RouterTiles + kNumL2RouterTiles;
 inline constexpr std::size_t kL4RouterTileBase = kNumRayTracerTiles + kNumL0RouterTiles + kNumL1RouterTiles + kNumL2RouterTiles + kL3RouterTileBase;
 
-inline constexpr std::size_t kFinishedFactor  = 3;
+inline constexpr std::size_t kFinishedFactor  = 1;
 inline constexpr std::size_t kFinishedRayBytesPerTile = kNumRays * kFinishedFactor * sizeof(radfoam::geometry::FinishedRay);
 }  // namespace rf

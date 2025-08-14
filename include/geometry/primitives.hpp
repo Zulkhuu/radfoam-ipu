@@ -21,7 +21,7 @@ static_assert(sizeof(GenericPoint) == 16, "GenericPoint size mismatch");
 
 struct Ray {
   uint16_t x, y;
-  uint16_t t, transmittance;
+  uint16_t t, transmittance; // uint16_t is placeholder for float16
   float r, g, b;
   uint16_t next_cluster; 
   uint16_t next_local;

@@ -83,30 +83,34 @@ static std::pair<cv::Mat, size_t> AssembleFinishedRaysImage(const std::vector<ui
   for (ptrdiff_t tid = 0; tid < static_cast<ptrdiff_t>(kNumRayTracerTiles); ++tid) {
     const FinishedRay* tileRays = rays + tid * num_finished_ray_per_tile;
 
-    for (size_t i = 0; i < num_finished_ray_per_tile; ++i) {
-      const FinishedRay& r = tileRays[i];
+    const int NW = 6;
+    const int kRayPerWorker = num_finished_ray_per_tile / NW;
+    for(int wid = 0; wid<NW; wid++) {
+      for (size_t i = wid*kRayPerWorker; i < (wid+1)*kRayPerWorker; ++i) {
+        const FinishedRay& r = tileRays[i];
 
-      if (r.x == 0xFFFF) break;
-      if (r.x >= static_cast<uint16_t>(W) || r.y >= static_cast<uint16_t>(H)) continue;
+        if (r.x == 0xFFFF) continue;
+        if (r.x >= static_cast<uint16_t>(W) || r.y >= static_cast<uint16_t>(H)) continue;
 
-      const size_t off_rgb = static_cast<size_t>(r.y) * rgb_step + static_cast<size_t>(r.x) * 3;
-      uchar* const dst_rgb = rgb_data + off_rgb;
-      dst_rgb[0] = r.b;
-      dst_rgb[1] = r.g;
-      dst_rgb[2] = r.r;
+        const size_t off_rgb = static_cast<size_t>(r.y) * rgb_step + static_cast<size_t>(r.x) * 3;
+        uchar* const dst_rgb = rgb_data + off_rgb;
+        dst_rgb[0] = r.b;
+        dst_rgb[1] = r.g;
+        dst_rgb[2] = r.r;
 
-      int tt = static_cast<int>(std::lround(r.t));
-      if (tt < 0)   tt = 0;
-      if (tt > 80)  tt = 80;
-      const cv::Vec3b bgr = T2BGR_LUT[tt];
+        int tt = static_cast<int>(std::lround(r.t));
+        if (tt < 0)   tt = 0;
+        if (tt > 80)  tt = 80;
+        const cv::Vec3b bgr = T2BGR_LUT[tt];
 
-      const size_t off_d = static_cast<size_t>(r.y) * depth_step + static_cast<size_t>(r.x) * 3;
-      uchar* const dst_d = depth_data + off_d;
-      dst_d[0] = bgr[0];
-      dst_d[1] = bgr[1];
-      dst_d[2] = bgr[2];
+        const size_t off_d = static_cast<size_t>(r.y) * depth_step + static_cast<size_t>(r.x) * 3;
+        uchar* const dst_d = depth_data + off_d;
+        dst_d[0] = bgr[0];
+        dst_d[1] = bgr[1];
+        dst_d[2] = bgr[2];
 
-      updatedPixels.fetch_add(1, std::memory_order_relaxed);
+        updatedPixels.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   }
 
@@ -121,50 +125,56 @@ size_t CountNonZeroPixels(const cv::Mat& img) {
     return static_cast<size_t>(cv::countNonZero(mask));
 }
 
+static cv::Mat AssembleFinishedRaysImageRGBOnly(const std::vector<uint8_t>& finishedRaysHost) {
+    static cv::Mat rgb_img(kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0, 0, 0));
+
+    const size_t numFinishedRays = finishedRaysHost.size() / sizeof(FinishedRay);
+    const FinishedRay* rays = reinterpret_cast<const FinishedRay*>(finishedRaysHost.data());
+    const size_t num_finished_ray_per_tile = (kNumRayTracerTiles > 0)
+        ? (numFinishedRays / kNumRayTracerTiles)
+        : 0;
+
+    const int W = kFullImageWidth;
+    const int H = kFullImageHeight;
+    const size_t rgb_step = rgb_img.step;
+    uchar* const rgb_data = rgb_img.data;
+
+    #pragma omp parallel for schedule(static)
+    for (ptrdiff_t tid = 0; tid < static_cast<ptrdiff_t>(kNumRayTracerTiles); ++tid) {
+        const FinishedRay* tileRays = rays + tid * num_finished_ray_per_tile;
+
+        const int NW = 6;
+        const int kRayPerWorker = num_finished_ray_per_tile / NW;
+        for (int wid = 0; wid < NW; wid++) {
+            for (size_t i = wid * kRayPerWorker; i < (wid + 1) * kRayPerWorker; ++i) {
+                const FinishedRay& r = tileRays[i];
+
+                if (r.x == 0xFFFF) continue;
+                if (r.x >= static_cast<uint16_t>(W) || r.y >= static_cast<uint16_t>(H)) continue;
+
+                const size_t off_rgb = static_cast<size_t>(r.y) * rgb_step + static_cast<size_t>(r.x) * 3;
+                uchar* const dst_rgb = rgb_data + off_rgb;
+                dst_rgb[0] = r.b;
+                dst_rgb[1] = r.g;
+                dst_rgb[2] = r.r;
+            }
+        }
+    }
+
+    return rgb_img;
+}
+
+
 int main(int argc, char** argv) {
-
-  // glm::mat4 ViewMatrix(
-  //   glm::vec4(-0.034899f,  0.000000f, -0.999391f, 0.000000f),
-  //   glm::vec4( 0.484514f, -0.874620f, -0.016920f, 0.000000f),
-  //   glm::vec4(-0.874087f, -0.484810f,  0.030524f, 0.000000f),
-  //   glm::vec4(-0.000000f, -0.000000f, -6.700000f, 1.000000f)
-  // );
-
-  // glm::mat4 ViewMatrix(
-  //   glm::vec4(-0.034899458f,  0.000000000f, -0.999390781f, 0.000000000f),
-  //   glm::vec4( 0.484514207f, -0.874619782f, -0.016919592f, 0.000000000f),
-  //   glm::vec4(-0.874086976f, -0.484809548f,  0.030523760f, 0.000000000f),
-  //   glm::vec4(-0.000000000f, -0.000000000f, -6.699999809f, 1.000000000f)
-  // );
-
-  glm::mat4 ViewMatrix(
-      glm::vec4(-0.995107710f,  0.000000000f,  0.098795786f, 0.000000000f),
-      glm::vec4(-0.067882277f, -0.726565778f, -0.683735430f, 0.000000000f),
-      glm::vec4( 0.071781643f, -0.687096834f,  0.723011255f, 0.000000000f),
-      glm::vec4( 0.206200063f,  1.675502419f, -3.500002146f, 1.000000000f)
-  );
-
-  glm::mat4 ProjectionMatrix(
-      glm::vec4(1.299038053f, 0.000000000f,  0.000000000f,  0.000000000f),
-      glm::vec4(0.000000000f, 1.732050657f,  0.000000000f,  0.000000000f),
-      glm::vec4(0.000000000f, 0.000000000f, -1.002002001f, -1.000000000f),
-      glm::vec4(0.000000000f, 0.000000000f, -0.200200200f,  0.000000000f)
-  );
-
-  // ------------------------------
-  // Profiling Trace Setup (PVTI)
-  // ------------------------------
   pvti::TraceChannel traceChannel = {"RadiantFoamIpu"};
 
-  // ------------------------------
-  // Input Arguments
-  // ------------------------------
   cxxopts::Options options("radiantfoam_ipu", "RadiantFoam IPU Renderer");
 
   options.add_options()
     ("i,input", "Input HDF5 file", cxxopts::value<std::string>()->default_value("./data/garden.h5"))
     ("n,nruns", "Number of runs to execute 0=inf", cxxopts::value<int>()->default_value("0"))
     ("no-ui", "Disable UI server", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
+    ("ipu-loop", "Enable multi frame IPU loop before CPU read", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("debug", "Enable debug reporting", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("p,port", "UI port", cxxopts::value<int>()->default_value("5000"))
     ("h,help", "Print usage");
@@ -179,35 +189,74 @@ int main(int argc, char** argv) {
   std::string inputFile = result["input"].as<std::string>();
   int nRuns = result["nruns"].as<int>();
   int vis_mode = 0;
+  bool dynamic_camera = false;
+  int inital_camera_pos = 1;
   bool enableUI = !result["no-ui"].as<bool>();
+  bool enableLoopIPU = result["ipu-loop"].as<bool>();
   bool enableDebug = result["debug"].as<bool>();
   int uiPort = result["port"].as<int>();
 
+  glm::mat4 ViewMatrix, ProjectionMatrix;
+  radfoam::geometry::GenericPoint camera_cell;
+
+  if(inital_camera_pos == 0) {    
+    ViewMatrix = glm::mat4(
+      glm::vec4(-0.034899458f,  0.000000000f, -0.999390781f, 0.000000000f),
+      glm::vec4( 0.484514207f, -0.874619782f, -0.016919592f, 0.000000000f),
+      glm::vec4(-0.874086976f, -0.484809548f,  0.030523760f, 0.000000000f),
+      glm::vec4(-0.000000000f, -0.000000000f, -6.699999809f, 1.000000000f)
+    );
+
+    ProjectionMatrix = glm::mat4(
+      glm::vec4(1.299038053f, 0.000000000f,  0.000000000f,  0.000000000f),
+      glm::vec4(0.000000000f, 1.732050657f,  0.000000000f,  0.000000000f),
+      glm::vec4(0.000000000f, 0.000000000f, -1.002002001f, -1.000000000f),
+      glm::vec4(0.000000000f, 0.000000000f, -0.200200200f,  0.000000000f)
+    );
+    camera_cell = { 6.6959f, -0.1134f,  0.2045f,
+      static_cast<uint16_t>(60),   // cluster_id
+      static_cast<uint16_t>(2476)   // local_id
+    };
+  }
+  
+  if(inital_camera_pos == 1) {
+    ViewMatrix = glm::mat4(
+      glm::vec4(-0.995107710f,  0.000000000f,  0.098795786f, 0.000000000f),
+      glm::vec4(-0.067882277f, -0.726565778f, -0.683735430f, 0.000000000f),
+      glm::vec4( 0.071781643f, -0.687096834f,  0.723011255f, 0.000000000f),
+      glm::vec4( 0.206200063f,  1.675502419f, -3.500002146f, 1.000000000f)
+    );
+    ProjectionMatrix = glm::mat4(
+      glm::vec4(1.299038053f, 0.000000000f,  0.000000000f,  0.000000000f),
+      glm::vec4(0.000000000f, 1.732050657f,  0.000000000f,  0.000000000f),
+      glm::vec4(0.000000000f, 0.000000000f, -1.002002001f, -1.000000000f),
+      glm::vec4(0.000000000f, 0.000000000f, -0.200200200f,  0.000000000f)
+    );
+  
+    camera_cell = radfoam::geometry::GenericPoint{
+      0.6503f, -1.2979f,  3.3524f, 
+      static_cast<uint16_t>(779),   // cluster_id
+      static_cast<uint16_t>(3532)   // local_id
+    };
+  }
+
   glm::mat4 inverseView = glm::inverse(ViewMatrix);
   glm::vec3 cameraPos = glm::vec3(inverseView[3]);
+
+  if(dynamic_camera){
+    KDTreeManager kdtree(inputFile);
+    
+    camera_cell = kdtree.getNearestNeighbor(cameraPos);
+    fmt::print("Camera position ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
+      cameraPos.x, cameraPos.y, cameraPos.z);
+    fmt::print("Closest Point to Camera:\n"
+      "  Cluster: {:>5}\n"
+      "  Local  : {:>5}\n"
+    						"  Position: ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
+    						camera_cell.cluster_id, camera_cell.local_id, 
+    						camera_cell.x, camera_cell.y, camera_cell.z);
+  }
   
-  // KDTreeManager kdtree(inputFile);
-  // 
-  // auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
-  // fmt::print("Camera position ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
-  // 						cameraPos.x, cameraPos.y, cameraPos.z);
-  // fmt::print("Closest Point to Camera:\n"
-  // 						"  Cluster: {:>5}\n"
-  // 						"  Local  : {:>5}\n"
-  // 						"  Position: ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
-  // 						camera_cell.cluster_id, camera_cell.local_id, 
-  // 						camera_cell.x, camera_cell.y, camera_cell.z);
-  
-  radfoam::geometry::GenericPoint camera_cell{
-     0.6503f, -1.2979f,  3.3524f, 
-     static_cast<uint16_t>(779),   // cluster_id
-     static_cast<uint16_t>(3532)   // local_id
-  };
-  // radfoam::geometry::GenericPoint camera_cell{
-  //    -6.6959f, -0.1134f,  0.2045f, 
-  //    static_cast<uint16_t>(60),   // cluster_id
-  //    static_cast<uint16_t>(2476)   // local_id
-  // };
 
   // ------------------------------
   // Poplar Engine Options
@@ -215,7 +264,7 @@ int main(int argc, char** argv) {
   poplar::OptionFlags engineOptions = {};
   if (enableDebug) {
     logger()->info("Enabling Poplar auto-reporting (POPLAR_ENGINE_OPTIONS set)");
-    setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true", "autoReport.executionProfileProgramRunCount":"10","debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
+    setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true", "autoReport.executionProfileProgramRunCount":"10","target.hostSyncTimeout":"30", "debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
     setenv("PVTI_OPTIONS", R"({"enable":"true"})", 1);
     engineOptions = {{"debug.instrument", "true"}};
   } else {
@@ -232,7 +281,7 @@ int main(int argc, char** argv) {
   // ------------------------------
   // Build and Configure IPU Graph
   // ------------------------------
-  radfoam::ipu::RadiantFoamIpuBuilder builder(inputFile, enableDebug);
+  radfoam::ipu::RadiantFoamIpuBuilder builder(inputFile, enableLoopIPU, enableDebug);
 
   ipu_utils::RuntimeConfig cfg{
     /*numIpus=*/1,
@@ -285,70 +334,140 @@ int main(int argc, char** argv) {
   auto startTime = std::chrono::steady_clock::now();
   const size_t totalPixels = kFullImageWidth * kFullImageHeight;
   bool fullImageUpdated = false;
-
-  // builder.stopFlagHost_ = 1;
-  // std::thread ipuThread([&] {
-  //   mgr.execute(builder);
-  // });
-
   int step=0;
-  do {
-    step++;
-    if(step==nRuns) {
-      builder.stopFlagHost_ = 0;
-      break;
-    }
-    glm::mat4 inverseView = glm::inverse(ViewMatrix);
-    glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
-    glm::vec3 cameraPos = glm::vec3(inverseView[3]);
-    // auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
+  
+  if(enableLoopIPU) { // use repeatwhiletrue for IPU execution
+    builder.stopFlagHost_ = 1;
+    std::thread ipuThread([&] {
+      mgr.execute(builder);
+    });
 
-    builder.updateViewMatrix(inverseView);
-    builder.updateProjectionMatrix(inverseProj);
-    builder.updateCameraCell(camera_cell);
-
-    if (enableUI) {
-      hostProcessing.waitForCompletion();
-      state = uiServer->consumeState();
-      if (state.device == "rgb") {
-        vis_mode = 0;
-      } else if(state.device == "depth") {
-        vis_mode = 1;
-      }
-    }
-
-    // per frame IPU program execution
-    mgr.execute(builder);
-
-    auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
-    *imagePtr = imageMat;
-
-    std::swap(imagePtr, imagePtrBuffered);
-    if (enableUI) hostProcessing.run(uiUpdateFunc);
-    
-    state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
-
-    size_t nonZeroCount = CountNonZeroPixels(*imagePtr);
-    if(!fullImageUpdated) {
-      std::cout << "Updated pixels: " << updatedCount << " Non zero: " << nonZeroCount << std::endl;
-      if (nonZeroCount >= totalPixels*0.9995) {
-        auto now = std::chrono::steady_clock::now();
-        double elapsedSec = std::chrono::duration<double>(now - startTime).count();
-        std::cout << "Full image updated in " << elapsedSec << " seconds." << std::endl;
-        fullImageUpdated = true;
+    do {
+      step++;
+      if(step==nRuns) {
         builder.stopFlagHost_ = 0;
         break;
       }
-    }
+      glm::mat4 inverseView = glm::inverse(ViewMatrix);
+      glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
+      glm::vec3 cameraPos = glm::vec3(inverseView[3]);
+      // // if(dynamic_camera) {
+      // //   auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
+      // // }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(32)); 
-  } while (!enableUI || (uiServer && !state.stop));
+      builder.updateViewMatrix(inverseView);
+      builder.updateProjectionMatrix(inverseProj);
+      builder.updateCameraCell(camera_cell);
+
+      if (enableUI) {
+        hostProcessing.waitForCompletion();
+        state = uiServer->consumeState();
+        if (state.device == "rgb") {
+          vis_mode = 0;
+        } else if(state.device == "depth") {
+          vis_mode = 1;
+        }
+      }
+      
+      static unsigned lastFence = 0;
+      unsigned f;
+      do {
+        f = builder.frameFenceHost_.load(std::memory_order_acquire);
+      } while (f == lastFence);   // wait for a new frame to complete its copy
+      lastFence = f;
+
+      // (optional but recommended) snapshot to avoid tearing if next frame begins
+      static std::vector<uint8_t> localCopy(builder.finishedRaysHost_.size());
+      std::memcpy(localCopy.data(), builder.finishedRaysHost_.data(), localCopy.size());
+      // auto [imageMat, updatedCount] = AssembleFinishedRaysImage(localCopy, vis_mode);
+      *imagePtr = AssembleFinishedRaysImageRGBOnly(localCopy);
+
+      // auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
+      // *imagePtr = imageMat;
+
+      std::swap(imagePtr, imagePtrBuffered);
+      if (enableUI) hostProcessing.run(uiUpdateFunc);
+      std::cout << lastFence << std::endl;
+      // state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
+
+      // size_t nonZeroCount = CountNonZeroPixels(*imagePtr);
+      // if(!fullImageUpdated) {
+      //   std::cout << lastFence << "Updated pixels: " << updatedCount << " Non zero: " << nonZeroCount << std::endl;
+      //   if (nonZeroCount >= totalPixels*0.9995) {
+      //     auto now = std::chrono::steady_clock::now();
+      //     double elapsedSec = std::chrono::duration<double>(now - startTime).count();
+      //     std::cout << "Full image updated in " << elapsedSec << " seconds." << std::endl;
+      //     fullImageUpdated = true;
+      //     builder.stopFlagHost_ = 0;
+      //     break;
+      //   }
+      // }
+
+      // std::this_thread::sleep_for(std::chrono::milliseconds(1)); 
+
+    } while (!enableUI || (uiServer && !state.stop));
+
+    builder.stopFlagHost_ = 0;
+    ipuThread.join();
+
+  } else { // execute IPU engine every time
+
+    do {
+      step++;
+      if(step==nRuns) {
+        break;
+      }
+      glm::mat4 inverseView = glm::inverse(ViewMatrix);
+      glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
+      glm::vec3 cameraPos = glm::vec3(inverseView[3]);
+      // if(dynamic_camera) {
+      //   auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
+      // }
+
+      builder.updateViewMatrix(inverseView);
+      builder.updateProjectionMatrix(inverseProj);
+      builder.updateCameraCell(camera_cell);
+
+      if (enableUI) {
+        hostProcessing.waitForCompletion();
+        state = uiServer->consumeState();
+        if (state.device == "rgb") {
+          vis_mode = 0;
+        } else if(state.device == "depth") {
+          vis_mode = 1;
+        }
+      }
+      // per frame IPU program execution
+      mgr.execute(builder);
+
+      auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
+      *imagePtr = imageMat;
+
+      std::swap(imagePtr, imagePtrBuffered);
+      if (enableUI) hostProcessing.run(uiUpdateFunc);
+      
+      state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
+
+      size_t nonZeroCount = CountNonZeroPixels(*imagePtr);
+      if(!fullImageUpdated) {
+        std::cout << "Updated pixels: " << updatedCount << " Non zero: " << nonZeroCount << std::endl;
+        if (nonZeroCount >= totalPixels*0.9995) {
+          auto now = std::chrono::steady_clock::now();
+          double elapsedSec = std::chrono::duration<double>(now - startTime).count();
+          std::cout << "Full image updated in " << elapsedSec << " seconds." << std::endl;
+          fullImageUpdated = true;
+          builder.stopFlagHost_ = 0;
+          break;
+        }
+      }
+
+
+    } while (!enableUI || (uiServer && !state.stop));
+  }
+
 
   if (enableUI) hostProcessing.waitForCompletion();
 
-  // ipuThread.join();
-
-  // cv::imwrite("framebuffer_full.png", AssembleFullImage(builder.framebuffer_host));
   auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
   cv::imwrite("framebuffer_full.png", imageMat);
 
