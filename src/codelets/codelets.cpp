@@ -544,7 +544,6 @@ public:
   [[poplar::constraint("elem(*childRaysIn3)!=elem(*childRaysOut2)")]]
   [[poplar::constraint("elem(*childRaysIn3)!=elem(*childRaysOut3)")]]
 
-
   // ---- Forbid any Output -> Output aliasing (C(5,2) = 10) ----
   [[poplar::constraint("elem(*parentRaysOut)!=elem(*childRaysOut0)")]]
   [[poplar::constraint("elem(*parentRaysOut)!=elem(*childRaysOut1)")]]
@@ -573,18 +572,14 @@ public:
       volatile unsigned* f = readyFlags.data();
       for (unsigned i=0;i<NW;++i) f[i] = 0;
     }
-    if(!barrier(0, workerId))
-      return false;
+    barrier(/*phase=*/0, workerId);  
     
     if (workerId == 0) {
       volatile unsigned* f = readyFlags.data();
       for (unsigned i=0;i<NW;++i) f[i] = 0;
     }
     countRays(workerId);
-
-    if(!barrier(1, workerId))
-      return false;
-    // barrier(/*phase=*/696, workerId);  // countRays(workerId);
+    barrier(/*phase=*/1, workerId);  
 
     unsigned outCnt[kNumLanes] = {0,0,0,0,0};
     if(workerId == 0) {
@@ -595,60 +590,49 @@ public:
       }
       computeWriteOffsets();
     }
-    // barrier(/*phase=*/2, workerId);  
-    if(!barrier(2, workerId))
-      return false;
+    barrier(/*phase=*/2, workerId);  
 
     routeRays(workerId);
-    // barrier(/*phase=*/3, workerId);  
-    if(!barrier(3, workerId))
-      return false;
+    barrier(/*phase=*/3, workerId);  
 
     if(workerId == 0) {
       invalidateAfterRouting();
 
-      unsigned inCnt[6] = {0,0,0,0,0,0}; 
-      unsigned outCnt2[5] = {0,0,0,0,0}; 
-      const poplar::Input<poplar::Vector<uint8_t>> *inputs[kNumLanes] = {
-          &childRaysIn0, &childRaysIn1, &childRaysIn2, &childRaysIn3, &parentRaysIn};
+      // unsigned inCnt[6] = {0,0,0,0,0,0}; 
+      // unsigned outCnt2[5] = {0,0,0,0,0}; 
+      // const poplar::Input<poplar::Vector<uint8_t>> *inputs[kNumLanes] = {
+      //     &childRaysIn0, &childRaysIn1, &childRaysIn2, &childRaysIn3, &parentRaysIn};
 
-      for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-        const auto &buf  = *inputs[lane];
+      // for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+      //   const auto &buf  = *inputs[lane];
 
-        for (unsigned i = 0; i < kNumRays; i ++) {
-          const Ray *ray = reinterpret_cast<const Ray *>(buf.data() + i * sizeof(Ray));
-          if (ray->next_cluster == FINISHED_RAY_ID) {
-            inCnt[5]++;
-            continue;
-          }
-          if (ray->next_cluster == INVALID_RAY_ID) break;
+      //   for (unsigned i = 0; i < kNumRays; i ++) {
+      //     const Ray *ray = reinterpret_cast<const Ray *>(buf.data() + i * sizeof(Ray));
+      //     if (ray->next_cluster == FINISHED_RAY_ID) {
+      //       inCnt[5]++;
+      //       continue;
+      //     }
+      //     if (ray->next_cluster == INVALID_RAY_ID) break;
 
-          unsigned dst = findChildForCluster(ray->next_cluster);  // 0..4
-          outCnt2[dst]++;
-          inCnt[lane]++;
-        }
-      }
+      //     unsigned dst = findChildForCluster(ray->next_cluster);  // 0..4
+      //     outCnt2[dst]++;
+      //     inCnt[lane]++;
+      //   }
+      // }
 
-      // Fill debugBytes (10 counts = 20 bytes)
-      unsigned* dbg = reinterpret_cast<unsigned*>(debugBytes.data());
+      // unsigned* dbg = reinterpret_cast<unsigned*>(debugBytes.data());
 
-      dbg[0] = inCnt[0];
-      dbg[1] = inCnt[1];
-      dbg[2] = inCnt[2];
-      dbg[3] = inCnt[3];
-      dbg[4] = inCnt[4];
-      dbg[5] = inCnt[5];
-      // dbg[0] = outCnt2[0];
-      // dbg[1] = outCnt2[1];
-      // dbg[2] = outCnt2[2];
-      // dbg[3] = outCnt2[3];
-      // dbg[4] = outCnt2[4];
-      dbg[6] = outCnt[0];
-      dbg[7] = outCnt[1];
-      dbg[8] = outCnt[2];
-      dbg[9] = outCnt[3];
-      dbg[10] = outCnt[4];
-      // dbg[10] = 0;
+      // dbg[0] = inCnt[0];
+      // dbg[1] = inCnt[1];
+      // dbg[2] = inCnt[2];
+      // dbg[3] = inCnt[3];
+      // dbg[4] = inCnt[4];
+      // dbg[5] = inCnt[5];
+      // dbg[6] = outCnt[0];
+      // dbg[7] = outCnt[1];
+      // dbg[8] = outCnt[2];
+      // dbg[9] = outCnt[3];
+      // dbg[10] = outCnt[4];
     }
 
     return true;
@@ -737,7 +721,6 @@ private:
         bool needSpill = false;
 
         // primary attempt
-        // if (wrCtr[dst] < sharedCounts[wi]) {
         unsigned slot = start + wrCtr[dst];
         if (slot < end) {
           // primary write OK
@@ -747,7 +730,7 @@ private:
           needSpill = true; // this worker's primary quota used up
         }
 
-        // spill only if required
+        // spill if required
         if (needSpill) {
           if (g < gEnd) {
             unsigned r, slotInR;
@@ -764,7 +747,7 @@ private:
   }
 
   [[gnu::always_inline]]
-  bool barrier(unsigned phase, unsigned workerId) {
+  void barrier(unsigned phase, unsigned workerId) {
     volatile unsigned* flags = readyFlags.data();
     const unsigned NW = poplar::MultiVertex::numWorkers();
     flags[workerId] = phase;
@@ -780,7 +763,6 @@ private:
       if (all) break;
     }
     asm volatile("" ::: "memory");
-    return true;
   }
 
   [[gnu::always_inline]]
