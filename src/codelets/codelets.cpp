@@ -19,6 +19,10 @@ struct alignas(4) Ray {
   uint16_t next_cluster; 
   uint16_t next_local;
 };
+struct alignas(4) FinishedPixel {
+  uint8_t r, g, b, a;
+  float t;
+};
 
 inline constexpr uint16_t kLeadMask   = 0xFC00u;   // 11111 00000000000₂
 inline constexpr uint8_t kShift = 10;  
@@ -55,10 +59,21 @@ public:
 
   // poplar::Input<unsigned> kSubsteps;
 
-  // ---- aliasing guards ----
+  // aliasing guards
   [[poplar::constraint("elem(*raysIn)!=elem(*raysOut)")]]
-  [[poplar::constraint("elem(*raysIn)!=elem(*finishedRays)")]]
-  [[poplar::constraint("elem(*raysOut)!=elem(*finishedRays)")]]
+  [[poplar::constraint("elem(*framebuffer)!=elem(*raysIn)")]]
+  [[poplar::constraint("elem(*framebuffer)!=elem(*raysOut)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*raysIn)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*raysOut)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*framebuffer)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*view_matrix)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*projection_matrix)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*adjacency)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*local_pts)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*neighbor_pts)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*result_float)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*result_u16)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*exec_count)")]]
 
   bool compute(unsigned workerId) {
     const unsigned kSubSteps = 6;
@@ -70,12 +85,12 @@ public:
     const unsigned adjSize   = adjacency.size(); // elements (uint16)
 
     // ----- 0) Once per CPU-read (first substep), clear & reset head in parallel
-    const bool firstSubstep = ((*exec_count % kSubSteps) == 0);
-    if (firstSubstep) {
-      if (workerId == 0) 
-        *finishedWriteOffset = 0;
-    }
-    barrier(/*phase=*/0, workerId);
+    // const bool firstSubstep = ((*exec_count % kSubSteps) == 0);
+    // if (firstSubstep) {
+    //   if (workerId == 0) 
+    //     *finishedWriteOffset = 0;
+    // }
+    // barrier(/*phase=*/0, workerId);
 
     // Setup matrices
     glm::mat4 invView = glm::make_mat4(view_matrix.data());
@@ -83,11 +98,27 @@ public:
     glm::vec3 rayOrigin = glm::vec3(invView[3]);
     const uint16_t myTile = *tile_id;
 
+    unsigned consumedFinishedOnThisTile = 0;
     unsigned localFinished = 0;
     unsigned localMaxSeenPlus1 = 0;
-
-    // Track last index we actually touched in our stripe to clean the tail later
     uint16_t lastSeenIdx = 65533;
+    
+    // helpers for tile ownership and local coords
+    auto tileOfXY = [&](uint16_t x10, uint16_t y)->uint16_t {
+      const uint16_t tx = x10 / kTileImageWidth;
+      const uint16_t ty = y   / kTileImageHeight;
+      return static_cast<uint16_t>(ty * kNumRayTracerTilesX + tx);
+    };
+    auto localXY = [&](uint16_t x10, uint16_t y, uint16_t tile, uint16_t &lx, uint16_t &ly){
+      const uint16_t tileX = tile % kNumRayTracerTilesX;
+      const uint16_t tileY = tile / kNumRayTracerTilesX;
+      lx = static_cast<uint16_t>(x10 - tileX * kTileImageWidth);
+      ly = static_cast<uint16_t>(y   - tileY * kTileImageHeight);
+    };
+    auto fbAt = [&](uint16_t lx, uint16_t ly)->FinishedPixel* {
+      FinishedPixel* fb = reinterpret_cast<FinishedPixel*>(framebuffer.data());
+      return &fb[static_cast<std::size_t>(ly) * kTileImageWidth + lx];
+    };
 
     // ---- Pass: march rays; write back to SAME index in raysOut; record finished into my slice ----
     for (uint16_t idx = workerId; idx < C; idx += NW) {
@@ -97,14 +128,41 @@ public:
       localMaxSeenPlus1 = idx + 1;
       Ray* out = reinterpret_cast<Ray*>(raysOut.data() + idx*sizeof(Ray));
       
-      if (in->next_cluster != myTile) {
+      if (in->next_cluster != myTile) { // spillover, immediately return
         std::memcpy(out, in, sizeof(Ray));
         continue;
       }
 
+      if (in->next_local == FINISHED_RAY_ID) {
+        if (in->next_cluster == myTile) {
+          // write pixel to my framebuffer, then mark as FINISHED_RAY_ID so routers skip it
+          // const uint16_t x10 = data10(in->x);
+          const uint16_t x   = in->x;
+          const uint16_t y   = in->y;
+          uint16_t lx, ly;
+          localXY(x, y, myTile, lx, ly);
+          if (lx < kTileImageWidth && ly < kTileImageHeight) {
+            FinishedPixel* p = fbAt(lx, ly);
+            p->r = clampToU8(in->r);
+            p->g = clampToU8(in->g);
+            p->b = clampToU8(in->b);
+            p->a = 255;
+            p->t = __builtin_ipu_f16tof32(in->t);
+            ++consumedFinishedOnThisTile;
+          }
+          // keep head-packed: write FINISHED_RAY_ID into raysOut
+          *out = *in;
+          out->next_cluster = FINISHED_RAY_ID;
+        } else {
+          // not my tile → just forward unchanged
+          *out = *in;
+        }
+        continue;
+      }
+
       // --- march ---
-      const uint16_t x10 = data10(in->x);
-      glm::vec3 rayDir = computeRayDir(x10, in->y, invProj, invView);
+      // const uint16_t x10 = data10(in->x);
+      glm::vec3 rayDir = computeRayDir(in->x, in->y, invProj, invView);
 
       glm::vec3 color(in->r, in->g, in->b);
       float transmittance = __builtin_ipu_f16tof32(in->transmittance);
@@ -176,7 +234,8 @@ public:
             out->b = color.z;
             out->t = __builtin_ipu_f32tof16(t0);
             out->transmittance = __builtin_ipu_f32tof16(transmittance);
-            out->next_cluster  = FINISHED_RAY_ID;   // router will skip
+            out->next_cluster  = tileOfXY(in->x, in->y);   // << route to FB owner tile
+            out->next_local  = FINISHED_RAY_ID;   //
             ++localFinished;
           } else {
             // Cross to neighbor cluster
@@ -199,39 +258,6 @@ public:
         current = next;
       } // while(!finished)
     } // for stripe
-    sharedCounts[workerId]  = localFinished;
-
-    barrier(/*phase=*/1, workerId);
-
-    if (workerId == 0) {
-      computeWriteOffsets();
-    }
-    barrier(/*phase=*/2, workerId);
-    
-    // Fetch my slice start
-    unsigned myStart = sharedOffsets[workerId];
-    unsigned myCount = localFinished;
-
-    // ----- 4) Light second pass: emit FinishedRay records into my contiguous slice
-    unsigned written = 0;
-    for (uint16_t idx = workerId; written < myCount; idx += NW) {
-      const Ray* out = reinterpret_cast<const Ray*>(raysOut.data() + idx*sizeof(Ray));
-      if (out->next_cluster != FINISHED_RAY_ID) continue;
-      if (out->next_cluster == INVALID_RAY_ID) break;
-
-      auto fid = myStart + written;
-      if(fid >= FR_CAP) break;
-      FinishedRay* fr = reinterpret_cast<FinishedRay*>(finishedRays.data() + fid*sizeof(FinishedRay));
-
-      const uint16_t x10w = data10(out->x);
-      fr->x = x10w;
-      fr->y = out->y;
-      fr->r = clampToU8(out->r);
-      fr->g = clampToU8(out->g);
-      fr->b = clampToU8(out->b);
-      fr->t = __builtin_ipu_f16tof32(out->t);
-      ++written;
-    }
 
     unsigned startTail = (lastSeenIdx == 65533) ? workerId : (static_cast<unsigned>(lastSeenIdx) + NW);
     for (unsigned idx = startTail; idx < C; idx += NW) {
@@ -239,21 +265,10 @@ public:
       if (ray->next_cluster == INVALID_RAY_ID) break;
       ray->next_cluster = INVALID_RAY_ID;
     }
-    barrier(/*phase=*/3, workerId);
     
-    
-    if (workerId == 0) {
-      unsigned tail = finishedWriteOffset; //sharedOffsets[NW-1] + sharedCounts[NW-1];
-      for(int i=tail; i<FR_CAP; i++) {
-        FinishedRay* ray = reinterpret_cast<FinishedRay*>(finishedRays.data() + i*sizeof(FinishedRay));
-      if (ray->x == INVALID_RAY_ID) break;
-      ray->x = INVALID_RAY_ID;
-      }
-    }
-
     if (workerId == 0) {
       *exec_count = *exec_count + 1;
-      *result_u16  = localFinished; 
+      *result_u16  = consumedFinishedOnThisTile; 
     }
     return true;
   }
@@ -767,42 +782,6 @@ private:
     asm volatile("" ::: "memory");
     return true;
   }
-
-  // bool barrier(unsigned phase, unsigned workerId) {
-  //   volatile unsigned* flags = readyFlags.data();
-  //   const unsigned NW = poplar::MultiVertex::numWorkers();
-
-  //   flags[workerId] = phase;
-  //   asm volatile ("" ::: "memory"); 
-
-  //   // Debug watchdog to avoid infinite spin during bring-up
-  //   unsigned spins = 0;
-  //   for (;;) {
-  //     bool all = true;
-  //     for (unsigned i = 0; i < NW; ++i) {
-  //       if (flags[i] < phase) { all = false; break; }
-  //     }
-  //     if (all) break;
-  //     if (++spins == 100000) { 
-  //       // drop a breadcrumb
-  //       unsigned* dbg = reinterpret_cast<unsigned*>(debugBytes.data());
-  //       // auto dbg = reinterpret_cast<volatile uint16_t*>(debugBytes.data());
-  //       dbg[0] = flags[0];
-  //       dbg[1] = flags[1];
-  //       dbg[2] = flags[2];
-  //       dbg[3] = flags[3];
-  //       dbg[4] = flags[4];
-  //       dbg[5] = flags[5];
-  //       dbg[11] = 999;
-  //       dbg[12] = phase*100 + workerId;
-  //       // spins = 0;
-  //       return false;
-  //     }
-  //   }
-
-  //   asm volatile ("" ::: "memory");
-  //   return true;
-  // }
 
   [[gnu::always_inline]]
   unsigned findChildForCluster (uint16_t cluster_id) {

@@ -40,12 +40,12 @@ inline constexpr std::size_t kTileImageWidth  = kFullImageWidth  / kNumRayTracer
 inline constexpr std::size_t kTileImageHeight = kFullImageHeight / kNumRayTracerTilesY;
 
 // Per-tile framebuffer size (RGB bytes)
-inline constexpr std::size_t kTileFramebufferSize = kTileImageWidth * kTileImageHeight * 3;
+inline constexpr std::size_t kTileFramebufferSize = kTileImageWidth * kTileImageHeight * sizeof(radfoam::geometry::FinishedPixel); // uint8 RGBA float depth
 
 // Sanity checks
 static_assert(kNumRayTracerTilesX * kNumRayTracerTilesY == kNumRayTracerTiles,
               "Trace tile grid does not match total tiles.");
-static_assert(kTileImageWidth * kTileImageHeight * 3 == kTileFramebufferSize,
+static_assert(kTileImageWidth * kTileImageHeight * sizeof(radfoam::geometry::FinishedPixel) == kTileFramebufferSize,
               "Framebuffer slice size mismatch.");
 static_assert(kTileImageWidth  * kNumRayTracerTilesX == kFullImageWidth,
               "Tile width must evenly divide image width.");
@@ -84,6 +84,6 @@ inline constexpr std::size_t kL2RouterTileBase = kNumRayTracerTiles + kNumL0Rout
 inline constexpr std::size_t kL3RouterTileBase = kNumRayTracerTiles + kNumL0RouterTiles + kNumL1RouterTiles + kNumL2RouterTiles;
 inline constexpr std::size_t kL4RouterTileBase = kNumRayTracerTiles + kNumL0RouterTiles + kNumL1RouterTiles + kNumL2RouterTiles + kL3RouterTileBase;
 
-inline constexpr std::size_t kFinishedFactor  = 5;
+inline constexpr std::size_t kFinishedFactor  = 1;
 inline constexpr std::size_t kFinishedRayBytesPerTile = kNumRays * kFinishedFactor * sizeof(radfoam::geometry::FinishedRay);
 }  // namespace rf

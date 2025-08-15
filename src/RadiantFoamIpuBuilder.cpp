@@ -58,7 +58,7 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& g, const poplar::Target&) {
 
     // Build: tracers + routers + generator all live in one compute set.
     poplar::ComputeSet cs = g.addComputeSet("RayTraceCS");
-    poplar::ComputeSet cs2 = g.addComputeSet("RayTraceCS");
+    // poplar::ComputeSet cs2 = g.addComputeSet("RayTraceCS");
     buildRayTracers(g, cs);
     buildRayRoutersL0(g, cs);
     buildRayRoutersL1(g, cs);
@@ -86,7 +86,7 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& g, const poplar::Target&) {
       substepProgram.add(dataExchangeSeq);
       frame_.add(poplar::program::Repeat(kSubsteps, substepProgram));
     }
-    frame_.add(poplar::program::Copy(inStreamFinishedRays, inStream));
+    frame_.add(framebuffer_read_.buildRead(g,true));
     frame_.add(poplar::program::Copy(rgExec, frameFenceStream_));
     getPrograms().add("frame", frame_);
 
@@ -162,8 +162,8 @@ void RadiantFoamIpuBuilder::allocateGlobalTensors(poplar::Graph& g) {
     result_u16_read_.buildTensor(g, poplar::UNSIGNED_SHORT, {kNumRayTracerTiles});
     poputil::mapTensorLinearlyWithOffset(g, result_u16_read_.get(), 0);
 
-    fb_read_all_.buildTensor(g,  poplar::UNSIGNED_CHAR, {kNumRayTracerTiles, kTileFramebufferSize});
-    poputil::mapTensorLinearlyWithOffset(g, fb_read_all_.get().reshape({kNumRayTracerTiles, kTileFramebufferSize}), 0);
+    framebuffer_read_.buildTensor(g,  poplar::UNSIGNED_CHAR, {kNumRayTracerTiles, kTileFramebufferSize});
+    poputil::mapTensorLinearlyWithOffset(g, framebuffer_read_.get().reshape({kNumRayTracerTiles, kTileFramebufferSize}), 0);
     
     const size_t kFinishedRayBytesPerTile = kNumRays * kFinishedFactor * sizeof(FinishedRay);
     // finishedRaysRead_.buildTensor(g,  poplar::UNSIGNED_CHAR, {kNumRayTracerTiles * kFinishedRayBytesPerTile});
@@ -194,10 +194,17 @@ void RadiantFoamIpuBuilder::allocateGlobalTensors(poplar::Graph& g) {
         {"bufferingDepth", "1"},
         {"splitLimit", std::to_string(200 * 1024 * 1024)} // 200 MiB
     };
+
     inStream =  g.addDeviceToHostFIFO(
         "read-finished-rays-stream",
         poplar::UNSIGNED_CHAR,
         kNumRayTracerTiles * kFinishedRayBytesPerTile,
+        inOpts);
+
+    fbStream =  g.addDeviceToHostFIFO(
+        "read-framebuffer-stream",
+        poplar::UNSIGNED_CHAR,
+        kNumRayTracerTiles * kTileFramebufferSize,
         inOpts);
 
     stopFlag_.buildTensor(g, poplar::UNSIGNED_INT, {});
@@ -269,7 +276,7 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
         // Per‑tile result scalars & framebuffer slice -----------------------
         g.connect(v["result_float"], result_f32_read_.get().slice({tid},{tid+1}).reshape({}));
         g.connect(v["result_u16"  ], result_u16_read_.get().slice({tid},{tid+1}).reshape({}));
-        auto fb_slice = fb_read_all_.get()
+        auto fb_slice = framebuffer_read_.get()
                             .slice({tid,0},{tid+1,kTileFramebufferSize})
                             .reshape({kTileFramebufferSize});
         g.connect(v["framebuffer"], fb_slice);
@@ -1026,8 +1033,6 @@ poplar::program::Sequence RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph
 
 void RadiantFoamIpuBuilder::setupHostStreams(poplar::Graph& g) {
     // Debug reads
-    framebuffer_host.resize(kTileFramebufferSize * kNumRayTracerTiles);
-    getPrograms().add("fb_read_all", fb_read_all_.buildRead(g,true));
     result_f32_host.resize(kNumRayTracerTiles);
     getPrograms().add("read_result_f32", result_f32_read_.buildRead(g,true));    
     result_u16_host.resize(kNumRayTracerTiles);
@@ -1046,6 +1051,8 @@ void RadiantFoamIpuBuilder::setupHostStreams(poplar::Graph& g) {
     getPrograms().add("read_raygen_router_debug_bytes", raygenDebugRead_.buildRead(g,true));
 
     finishedRaysHost_.resize(kNumRayTracerTiles * kFinishedRayBytesPerTile);
+    framebuffer_host.resize(kTileFramebufferSize * kNumRayTracerTiles);
+    // getPrograms().add("framebuffer_read", framebuffer_read_.buildRead(g,true));
     
     hostViewMatrix_.assign(16, 0.0f);
     hostProjMatrix_.assign(16, 0.0f);
@@ -1058,7 +1065,7 @@ void RadiantFoamIpuBuilder::connectHostStreams(poplar::Engine& eng) {
         adj_tensors_[t].connectWriteStream(eng, adjacency_[t]);
     }
 
-    fb_read_all_.connectReadStream(eng, framebuffer_host.data());
+    framebuffer_read_.connectReadStream(eng, framebuffer_host.data());
     result_f32_read_.connectReadStream(eng, result_f32_host.data());
     result_u16_read_.connectReadStream(eng, result_u16_host.data());
     // finishedRaysRead_.connectReadStream(eng, finishedRaysHost_.data());
@@ -1084,7 +1091,7 @@ void RadiantFoamIpuBuilder::connectHostStreams(poplar::Engine& eng) {
 //  readAllTiles() – simple helper to print data for debugging
 // ----------------------------------------------------------------------------
 void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
-    eng.run(getPrograms().getOrdinals().at("fb_read_all"));
+    // eng.run(getPrograms().getOrdinals().at("framebuffer_read"));
     eng.run(getPrograms().getOrdinals().at("read_result_f32"));
     eng.run(getPrograms().getOrdinals().at("read_result_u16"));
     eng.run(getPrograms().getOrdinals().at("read_l0_router_debug_bytes"));
@@ -1100,39 +1107,39 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
     constexpr unsigned kShift = 10;
 
     // Cell tracking
-    for (int tid = 0; tid < 1024; ++tid) {
-        const size_t offset = static_cast<size_t>(tid) * kTileFramebufferSize;
-        uint8_t cnt = framebuffer_host[offset];
+    // for (int tid = 0; tid < 1024; ++tid) {
+    //     const size_t offset = static_cast<size_t>(tid) * kTileFramebufferSize;
+    //     uint8_t cnt = framebuffer_host[offset];
 
-        if (cnt > 0) {
-            // Print summary for this tile
-            RF_LOG("Tile {}({}) result f32: {:.9f}, u16: {}", tid, tid/4,
-                result_f32_host[tid], result_u16_host[tid]);
+    //     if (cnt > 0) {
+    //         // Print summary for this tile
+    //         RF_LOG("Tile {}({}) result f32: {:.9f}, u16: {}", tid, tid/4,
+    //             result_f32_host[tid], result_u16_host[tid]);
 
-            // Iterate through points written in framebuffer
-            // for (uint8_t i = 1; i <= cnt; ++i) {
-            //     uint16_t x = (framebuffer_host[offset + i * 6] << 8) |
-            //                     framebuffer_host[offset + i * 6 + 1];
-            //     uint16_t y = (framebuffer_host[offset + i * 6 + 2] << 8) |
-            //                     framebuffer_host[offset + i * 6 + 3];
-            //     auto x_data = x & ~kLeadMask;
-            //     auto x_cluster_cnt = (x & kLeadMask) >> kShift;
-            //     uint16_t pt_idx = (framebuffer_host[offset + i * 6 + 4] << 8) |
-            //                     framebuffer_host[offset + i * 6 + 5];
+    //         // Iterate through points written in framebuffer
+    //         // for (uint8_t i = 1; i <= cnt; ++i) {
+    //         //     uint16_t x = (framebuffer_host[offset + i * 6] << 8) |
+    //         //                     framebuffer_host[offset + i * 6 + 1];
+    //         //     uint16_t y = (framebuffer_host[offset + i * 6 + 2] << 8) |
+    //         //                     framebuffer_host[offset + i * 6 + 3];
+    //         //     auto x_data = x & ~kLeadMask;
+    //         //     auto x_cluster_cnt = (x & kLeadMask) >> kShift;
+    //         //     uint16_t pt_idx = (framebuffer_host[offset + i * 6 + 4] << 8) |
+    //         //                     framebuffer_host[offset + i * 6 + 5];
 
-            //     if (pt_idx < local_pts_[tid].size()) {
-            //         const auto &pt = local_pts_[tid][pt_idx];
-            //         fmt::print("[{}] ({}, {}) {}: {:4} → ({:8.6f}, {:8.6f}, {:8.6f})\n",
-            //                 i, x_data, y, x_cluster_cnt, pt_idx, pt.x, pt.y, pt.z);
-            //     } else {
-            //         fmt::print("[{}]: {:4} → (INVALID INDEX)\n",
-            //                 i, pt_idx);
-            //     }
+    //         //     if (pt_idx < local_pts_[tid].size()) {
+    //         //         const auto &pt = local_pts_[tid][pt_idx];
+    //         //         fmt::print("[{}] ({}, {}) {}: {:4} → ({:8.6f}, {:8.6f}, {:8.6f})\n",
+    //         //                 i, x_data, y, x_cluster_cnt, pt_idx, pt.x, pt.y, pt.z);
+    //         //     } else {
+    //         //         fmt::print("[{}]: {:4} → (INVALID INDEX)\n",
+    //         //                 i, pt_idx);
+    //         //     }
 
-            //     ++overall_cntr;
-            // }
-        }
-    }
+    //         //     ++overall_cntr;
+    //         // }
+    //     }
+    // }
 
     // -----------------------------------------------------------------------------
     //  Router-lane saturation test

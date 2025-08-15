@@ -76,7 +76,7 @@ private:
     const std::string h5_file_;
     bool debug_;
     bool loop_frames_;
-    static constexpr int kSubsteps = 6;
+    static constexpr int kSubsteps = 15;
     static constexpr int kRouterDebugSize = 15;
 
     // Scene data -------------------------------------------------------------
@@ -106,7 +106,7 @@ private:
     std::vector<ipu_utils::StreamableTensor> adj_tensors_;
 
     ipu_utils::StreamableTensor exec_counts_{"exec_count"};
-    ipu_utils::StreamableTensor fb_read_all_{"fb_read_all"};
+    ipu_utils::StreamableTensor framebuffer_read_{"framebuffer_read"};
     ipu_utils::StreamableTensor result_f32_read_{"result_f32_read"};
     ipu_utils::StreamableTensor result_u16_read_{"result_u16_read"};
     ipu_utils::StreamableTensor viewMatrix_{"view_matrix"};
@@ -123,7 +123,7 @@ private:
 
     poplar::Tensor inStreamFinishedRays;
     ipu_utils::StreamableTensor stopFlag_{"stopFlag"};
-    poplar::DataStream inStream, stopFlagStream;
+    poplar::DataStream inStream, stopFlagStream, fbStream;
 
     // CPU‑side mirrors -------------------------------------------------------
     int exec_counter_;

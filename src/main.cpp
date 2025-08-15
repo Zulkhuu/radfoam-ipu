@@ -45,6 +45,7 @@
 
 using namespace radfoam::geometry;
 using namespace radfoam::config;
+using radfoam::geometry::FinishedPixel;
 
 using ipu_utils::logger;
 
@@ -115,6 +116,70 @@ static std::pair<cv::Mat, size_t> AssembleFinishedRaysImage(const std::vector<ui
   }
 
   return {(mode == 0) ? rgb_img : depth_img, updatedPixels.load()};
+}
+
+static std::pair<cv::Mat, size_t>
+AssembleFramebufferImage(const std::vector<uint8_t>& fbBytes, int mode /*0=rgb,1=depth*/)
+{
+  const int W = static_cast<int>(radfoam::config::kFullImageWidth);
+  const int H = static_cast<int>(radfoam::config::kFullImageHeight);
+  const int tileW = static_cast<int>(radfoam::config::kTileImageWidth);
+  const int tileH = static_cast<int>(radfoam::config::kTileImageHeight);
+  const int tilesX = static_cast<int>(radfoam::config::kNumRayTracerTilesX);
+  const int tilesY = static_cast<int>(radfoam::config::kNumRayTracerTilesY);
+  const std::size_t bytesPerTile = radfoam::config::kTileFramebufferSize;
+
+  cv::Mat rgb_img  (H, W, CV_8UC3, cv::Scalar(0,0,0));
+  cv::Mat depth_img(H, W, CV_8UC3, cv::Scalar(0,0,0));
+
+  // precompute HSV->BGR LUT for t in [0..80]
+  static std::array<cv::Vec3b, 81> T2BGR_LUT = []{
+    std::array<cv::Vec3b, 81> lut{};
+    for (int t = 0; t <= 80; ++t) {
+      const int hue = static_cast<int>(std::lround(t * (179.0 / 80.0)));
+      cv::Mat hsv(1, 1, CV_8UC3, cv::Scalar(hue, 255, 255));
+      cv::Mat bgr; cv::cvtColor(hsv, bgr, cv::COLOR_HSV2BGR);
+      lut[t] = bgr.at<cv::Vec3b>(0, 0);
+    }
+    return lut;
+  }();
+
+  std::atomic<size_t> updated{0};
+
+  // Walk tiles
+  for (int ty = 0; ty < tilesY; ++ty) {
+    for (int tx = 0; tx < tilesX; ++tx) {
+      const int tid = ty * tilesX + tx;
+      const std::size_t base = static_cast<std::size_t>(tid) * bytesPerTile;
+      const FinishedPixel* tile = reinterpret_cast<const FinishedPixel*>(fbBytes.data() + base);
+
+      for (int ly = 0; ly < tileH; ++ly) {
+        const int y = ty * tileH + ly;
+        uint8_t* dstRGB   = rgb_img.ptr<uint8_t>(y);
+        uint8_t* dstDepth = depth_img.ptr<uint8_t>(y);
+        for (int lx = 0; lx < tileW; ++lx) {
+          const int x = tx * tileW + lx;
+          const FinishedPixel& p = tile[ly * tileW + lx];
+
+          // consider non-zero alpha or any nonzero rgb a valid update
+          const bool nonzero = (p.a != 0) || (p.r|p.g|p.b);
+          if (nonzero) updated.fetch_add(1, std::memory_order_relaxed);
+
+          // RGB
+          uint8_t* rgb = dstRGB + x*3;
+          rgb[2] = p.r; rgb[1] = p.g; rgb[0] = p.b;
+
+          // depth pseudo-color from p.t (clamp 0..80)
+          int tt = static_cast<int>(std::lround(std::max(0.f, std::min(80.f, p.t))));
+          const cv::Vec3b bgr = T2BGR_LUT[tt];
+          uint8_t* d = dstDepth + x*3;
+          d[0] = bgr[0]; d[1] = bgr[1]; d[2] = bgr[2];
+        }
+      }
+    }
+  }
+
+  return {(mode == 0) ? rgb_img : depth_img, updated.load()};
 }
 
 size_t CountNonZeroPixels(const cv::Mat& img) {
@@ -376,12 +441,13 @@ int main(int argc, char** argv) {
       } while (f == lastFence);   // wait for a new frame to complete its copy
       lastFence = f;
 
-      static std::vector<uint8_t> localCopy(builder.finishedRaysHost_.size());
-      std::memcpy(localCopy.data(), builder.finishedRaysHost_.data(), localCopy.size());
-      auto [imageMat, updatedCount] = AssembleFinishedRaysImage(localCopy, vis_mode);
-      // *imagePtr = AssembleFinishedRaysImageRGBOnly(localCopy);
+      // Take a stable snapshot of the streamed framebuffer bytes
+      static std::vector<uint8_t> localCopy(builder.framebuffer_host.size());
+      std::memcpy(localCopy.data(),
+                  builder.framebuffer_host.data(),
+                  localCopy.size());
 
-      // auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
+      auto [imageMat, updatedCount] = AssembleFramebufferImage(localCopy, vis_mode);
       *imagePtr = imageMat;
 
       std::swap(imagePtr, imagePtrBuffered);
@@ -397,12 +463,10 @@ int main(int argc, char** argv) {
           double elapsedSec = std::chrono::duration<double>(now - startTime).count();
           std::cout << "Full image updated in " << elapsedSec << " seconds." << std::endl;
           fullImageUpdated = true;
-          // builder.stopFlagHost_ = 0;
-          // break;
         }
       }
 
-      // std::this_thread::sleep_for(std::chrono::milliseconds(1)); 
+      std::this_thread::sleep_for(std::chrono::milliseconds(1)); 
 
     } while (!enableUI || (uiServer && !state.stop));
 
@@ -439,7 +503,7 @@ int main(int argc, char** argv) {
       // per frame IPU program execution
       mgr.execute(builder);
 
-      auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
+      auto [imageMat, updatedCount] = AssembleFramebufferImage(builder.framebuffer_host, vis_mode);
       *imagePtr = imageMat;
 
       std::swap(imagePtr, imagePtrBuffered);
@@ -467,7 +531,7 @@ int main(int argc, char** argv) {
 
   if (enableUI) hostProcessing.waitForCompletion();
 
-  auto [imageMat, updatedCount] = AssembleFinishedRaysImage(builder.finishedRaysHost_, vis_mode);
+  auto [imageMat, updatedCount] = AssembleFramebufferImage(builder.framebuffer_host, vis_mode);
   cv::imwrite("framebuffer_full.png", imageMat);
 
   return 0;
