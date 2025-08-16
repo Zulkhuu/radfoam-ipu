@@ -9,6 +9,8 @@
 #include <ipu_vector_math>
 #include <ipu_memory_intrinsics>
 
+// __builtin_assume(kNumRays <= 4096);
+
 using namespace radfoam::config;
 using radfoam::geometry::LocalPoint;
 using radfoam::geometry::GenericPoint;
@@ -542,27 +544,14 @@ public:
   }
 };
 
-template <unsigned Port>
-[[gnu::always_inline]] 
-inline void emit(const Ray &r, unsigned &cnt,
-          poplar::Output<poplar::Vector<uint8_t>>* const (&outPorts)[5])
-{
-    // Port is a compile-time constant, so the expression below
-    // becomes a constant address + a run-time offset.
-    std::memcpy(outPorts[Port]->data() + cnt * sizeof(Ray), &r, sizeof(Ray));
-    ++cnt;
-}
-
 class RayRouter : public poplar::MultiVertex {
-  // using BytesVec   = poplar::Vector<uint8_t, poplar::VectorLayout::SPAN, kNumRays * sizeof(Ray)>;
-  using BytesVec   = poplar::Vector<uint8_t>;
-  using InBufferBytes    = poplar::Input<BytesVec>;
-  using InOutBufferBytes = poplar::InOut<BytesVec>;
+  using RayVecIn = poplar::Input< poplar::Vector<uint8_t, poplar::VectorLayout::ONE_PTR, 8> >;
+  using RayVecIO = poplar::InOut< poplar::Vector<uint8_t, poplar::VectorLayout::ONE_PTR, 8> >;
 
 public:
   // Incoming rays
-  InBufferBytes  parentRaysIn,  childRaysIn0, childRaysIn1, childRaysIn2, childRaysIn3;
-  InOutBufferBytes parentRaysOut, childRaysOut0, childRaysOut1, childRaysOut2, childRaysOut3;
+  RayVecIn parentRaysIn, childRaysIn0, childRaysIn1, childRaysIn2, childRaysIn3;
+  RayVecIO parentRaysOut, childRaysOut0, childRaysOut1, childRaysOut2, childRaysOut3;
 
   // ID mapping to know which cluster IDs belong to which child
   poplar::Input<poplar::Vector<unsigned short, poplar::VectorLayout::SPAN, 4>> childClusterIds;
@@ -631,22 +620,10 @@ public:
   [[poplar::constraint("elem(*sharedCounts)!=elem(*sharedOffsets)")]]
   [[poplar::constraint("elem(*sharedCounts)!=elem(*debugBytes)")]]
   [[poplar::constraint("elem(*sharedOffsets)!=elem(*debugBytes)")]]
-
+  
   bool compute(unsigned workerId) {
-    auto* __restrict outParent = parentRaysOut.data();
-    auto* __restrict outC0     = childRaysOut0.data();
-    auto* __restrict outC1     = childRaysOut1.data();
-    auto* __restrict outC2     = childRaysOut2.data();
-    auto* __restrict outC3     = childRaysOut3.data();
-    auto* __restrict inParent  = parentRaysIn.data();
-    auto* __restrict inC0      = childRaysIn0.data();
-    auto* __restrict inC1      = childRaysIn1.data();
-    auto* __restrict inC2      = childRaysIn2.data();
-    auto* __restrict inC3      = childRaysIn3.data();
-
     shift = *level * 2;
     myChildPrefix = childClusterIds[0] >> (shift + 2);
-    // const unsigned NW = poplar::MultiVertex::numWorkers();
 
     if (workerId == 0) {
       volatile unsigned* f = readyFlags.data();
@@ -676,43 +653,7 @@ public:
     barrier(/*phase=*/3, workerId);  
 
     if(workerId == 0) {
-      invalidateAfterRouting();
-
-      // unsigned inCnt[6] = {0,0,0,0,0,0}; 
-      // unsigned outCnt2[5] = {0,0,0,0,0}; 
-      // const poplar::Input<poplar::Vector<uint8_t>> *inputs[kNumLanes] = {
-      //     &childRaysIn0, &childRaysIn1, &childRaysIn2, &childRaysIn3, &parentRaysIn};
-
-      // for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-      //   const auto &buf  = *inputs[lane];
-
-      //   for (unsigned i = 0; i < kNumRays; i ++) {
-      //     const Ray *ray = reinterpret_cast<const Ray *>(buf.data() + i * sizeof(Ray));
-      //     if (ray->next_cluster == FINISHED_RAY_ID) {
-      //       inCnt[5]++;
-      //       continue;
-      //     }
-      //     if (ray->next_cluster == INVALID_RAY_ID) break;
-
-      //     unsigned dst = findChildForCluster(ray->next_cluster);  // 0..4
-      //     outCnt2[dst]++;
-      //     inCnt[lane]++;
-      //   }
-      // }
-
-      // unsigned* dbg = reinterpret_cast<unsigned*>(debugBytes.data());
-
-      // dbg[0] = inCnt[0];
-      // dbg[1] = inCnt[1];
-      // dbg[2] = inCnt[2];
-      // dbg[3] = inCnt[3];
-      // dbg[4] = inCnt[4];
-      // dbg[5] = inCnt[5];
-      // dbg[6] = outCnt[0];
-      // dbg[7] = outCnt[1];
-      // dbg[8] = outCnt[2];
-      // dbg[9] = outCnt[3];
-      // dbg[10] = outCnt[4];
+      invalidateAfterRouting();      
     }
 
     return true;
@@ -721,7 +662,6 @@ private:
   [[gnu::always_inline]] unsigned getSharedIdx(unsigned workerId, unsigned lane) {
     return workerId * kNumLanes + lane;
   }
-
   [[gnu::always_inline]] unsigned spillStartIdx(unsigned w) const {
     // const unsigned NW = poplar::MultiVertex::numWorkers();
     return NW * kNumLanes + w;
@@ -729,6 +669,50 @@ private:
   [[gnu::always_inline]] unsigned spillEndIdx(unsigned w) const {
     // const unsigned NW = poplar::MultiVertex::numWorkers();
     return NW * kNumLanes + NW + w;
+  }
+
+  [[gnu::always_inline]] void writeDebugInfos() {
+    unsigned inCnt[6] = {0,0,0,0,0,0}; 
+    unsigned outCnt2[5] = {0,0,0,0,0}; 
+    const Ray* __restrict inBase[kNumLanes] = {
+      reinterpret_cast<const Ray*>(childRaysIn0.data()),
+      reinterpret_cast<const Ray*>(childRaysIn1.data()),
+      reinterpret_cast<const Ray*>(childRaysIn2.data()),
+      reinterpret_cast<const Ray*>(childRaysIn3.data()),
+      reinterpret_cast<const Ray*>(parentRaysIn.data())
+    };
+
+    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+      const Ray* __restrict in = inBase[(unsigned)lane];
+
+      for (unsigned i = 0; i < kNumRays; i ++) {
+        // const Ray *ray = reinterpret_cast<const Ray *>(buf.data() + i * sizeof(Ray));
+        const Ray* ray = &in[i];
+        if (ray->next_cluster == FINISHED_RAY_ID) {
+          inCnt[5]++;
+          continue;
+        }
+        if (ray->next_cluster == INVALID_RAY_ID) break;
+
+        unsigned dst = findChildForCluster(ray->next_cluster);  // 0..4
+        outCnt2[dst]++;
+        inCnt[lane]++;
+      }
+    }
+
+    unsigned* dbg = reinterpret_cast<unsigned*>(debugBytes.data());
+
+    dbg[0] = inCnt[0];
+    dbg[1] = inCnt[1];
+    dbg[2] = inCnt[2];
+    dbg[3] = inCnt[3];
+    dbg[4] = inCnt[4];
+    dbg[5] = inCnt[5];
+    dbg[6] = outCnt2[0];
+    dbg[7] = outCnt2[1];
+    dbg[8] = outCnt2[2];
+    dbg[9] = outCnt2[3];
+    dbg[10] = outCnt2[4];
   }
 
   [[gnu::always_inline]]
@@ -765,6 +749,21 @@ private:
   void routeRays(unsigned workerId) {
     // const unsigned NW = poplar::MultiVertex::numWorkers();
     const unsigned C = kNumRays; //.size()    / sizeof(Ray);
+
+    const Ray* __restrict inBase[kNumLanes] = {
+      reinterpret_cast<const Ray*>(childRaysIn0.data()),
+      reinterpret_cast<const Ray*>(childRaysIn1.data()),
+      reinterpret_cast<const Ray*>(childRaysIn2.data()),
+      reinterpret_cast<const Ray*>(childRaysIn3.data()),
+      reinterpret_cast<const Ray*>(parentRaysIn.data())
+    };
+    Ray* __restrict outBase[kNumLanes] = {
+      reinterpret_cast<Ray*>(childRaysOut0.data()),
+      reinterpret_cast<Ray*>(childRaysOut1.data()),
+      reinterpret_cast<Ray*>(childRaysOut2.data()),
+      reinterpret_cast<Ray*>(childRaysOut3.data()),
+      reinterpret_cast<Ray*>(parentRaysOut.data())
+    };
         
     // totals per lane
     unsigned tot[kNumLanes];
@@ -774,53 +773,52 @@ private:
     // my spill global range
     unsigned g    = sharedOffsets[spillStartIdx(workerId)];
     unsigned gEnd = sharedOffsets[spillEndIdx(workerId)];
+    SpillCursor sc{}; if (g < gEnd) initSpillCursor(P, g, sc);
 
-    unsigned  wrCtr[kNumLanes] = {0,0,0,0,0};
+    // My primary ranges per lane (start/end), kept in registers
+    const unsigned s0 = sharedOffsets[getSharedIdx(workerId, 0)];
+    const unsigned c0 = sharedCounts [getSharedIdx(workerId, 0)];
+    const unsigned e0 = (s0 + c0 < kNumRays ? s0 + c0 : kNumRays);
+    const unsigned s1 = sharedOffsets[getSharedIdx(workerId, 1)];
+    const unsigned c1 = sharedCounts [getSharedIdx(workerId, 1)];
+    const unsigned e1 = (s1 + c1 < kNumRays ? s1 + c1 : kNumRays);
+    const unsigned s2 = sharedOffsets[getSharedIdx(workerId, 2)];
+    const unsigned c2 = sharedCounts [getSharedIdx(workerId, 2)];
+    const unsigned e2 = (s2 + c2 < kNumRays ? s2 + c2 : kNumRays);
+    const unsigned s3 = sharedOffsets[getSharedIdx(workerId, 3)];
+    const unsigned c3 = sharedCounts [getSharedIdx(workerId, 3)];
+    const unsigned e3 = (s3 + c3 < kNumRays ? s3 + c3 : kNumRays);
+    const unsigned sP = sharedOffsets[getSharedIdx(workerId, 4)];
+    const unsigned cP = sharedCounts [getSharedIdx(workerId, 4)];
+    const unsigned eP = (sP + cP < kNumRays ? sP + cP : kNumRays);
 
-    const InBufferBytes *inBuf[kNumLanes] = {&childRaysIn0, &childRaysIn1, &childRaysIn2, &childRaysIn3, &parentRaysIn};
-    InOutBufferBytes *outBuf[kNumLanes] = {&childRaysOut0, &childRaysOut1, &childRaysOut2, &childRaysOut3, &parentRaysOut};
+    unsigned wr0=0, wr1=0, wr2=0, wr3=0, wrP=0;
+    __builtin_assume(kNumRays <= 4096);
 
-    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-      // indices: workerId, workerId+NW, …
-      for (unsigned idx = workerId; idx < C; idx += NW) {
-        const Ray *ray = reinterpret_cast<const Ray*>(inBuf[lane]->data() + idx * sizeof(Ray));
-        if (ray->next_cluster == INVALID_RAY_ID) break;
-        if (ray->next_cluster == FINISHED_RAY_ID) continue; 
+    for (rptsize_t lane = 0; lane < (rptsize_t)kNumLanes; ++lane) {
+      const Ray* __restrict in = inBase[(unsigned)lane];
+      for (rptsize_t i = (rptsize_t)workerId; i < (rptsize_t)kNumRays; i += (rptsize_t)NW) {
+        const Ray* ray = &in[(unsigned)i];
+        if (__builtin_expect(ray->next_cluster == INVALID_RAY_ID, 0)) break;
+        if (__builtin_expect(ray->next_cluster == FINISHED_RAY_ID, 0)) continue;
 
-        unsigned dst = findChildForCluster(ray->next_cluster);  // 0..4
+        const unsigned dst = findChildForCluster(ray->next_cluster);
+        bool primaryOK = true;
+        unsigned slot = 0;
 
-        const unsigned wi = getSharedIdx(workerId, dst);
-        const unsigned start = sharedOffsets[wi];
-        const unsigned plannedEnd = start + sharedCounts[wi];
-        const unsigned end   = plannedEnd < C ? plannedEnd : C;
-        
-        // decide once per ray whether we need to spill
-        bool needSpill = false;
-
-        // primary attempt
-        unsigned slot = start + wrCtr[dst];
-        if (slot < end) {
-          // primary write OK
-          // std::memcpy(outBuf[dst]->data() + slot*sizeof(Ray), ray, sizeof(Ray));
-          Ray* loc = reinterpret_cast<Ray*>(outBuf[dst]->data() + slot*sizeof(Ray));
-          copy_ray(ray, loc);
-          ++wrCtr[dst];
-        } else {
-          needSpill = true; // this worker's primary quota used up
+        switch (dst) {
+          case 0: slot = s0 + wr0; primaryOK = (slot < e0); if (primaryOK) { copy_ray(ray, &outBase[0][slot]); ++wr0; } break;
+          case 1: slot = s1 + wr1; primaryOK = (slot < e1); if (primaryOK) { copy_ray(ray, &outBase[1][slot]); ++wr1; } break;
+          case 2: slot = s2 + wr2; primaryOK = (slot < e2); if (primaryOK) { copy_ray(ray, &outBase[2][slot]); ++wr2; } break;
+          case 3: slot = s3 + wr3; primaryOK = (slot < e3); if (primaryOK) { copy_ray(ray, &outBase[3][slot]); ++wr3; } break;
+          default:slot = sP + wrP; primaryOK = (slot < eP); if (primaryOK) { copy_ray(ray, &outBase[4][slot]); ++wrP; } break;
         }
 
-        // spill if required
-        if (needSpill) {
-          if (g < gEnd) {
-            unsigned r, slotInR;
-            mapGlobalFreeToLane(g, P, r, slotInR);
-            // std::memcpy(outBuf[r]->data() + slotInR*sizeof(Ray), ray, sizeof(Ray));
-            Ray* spill_loc = reinterpret_cast<Ray*>(outBuf[r]->data() + slotInR*sizeof(Ray));
-            copy_ray(ray, spill_loc);
-            ++g;
-          } else {
-            // optional: count a drop
-          }
+        if (!primaryOK && (g < gEnd)) {
+          spillAdvanceIfNeeded(P, g, sc);
+          const unsigned slotInR = P.base[sc.r] + (g - P.freePrefix[sc.r]);
+          copy_ray(ray, &outBase[sc.r][slotInR]);
+          ++g;
         }
 
       }
@@ -847,14 +845,17 @@ private:
   }
   [[gnu::always_inline]]
   static inline void copy_ray(const Ray* __restrict src, Ray* __restrict dst) {
-    const unsigned * __restrict s = reinterpret_cast<const unsigned*>(src);
-    unsigned * __restrict d_raw   = reinterpret_cast<unsigned*>(dst);
-    unsigned *d_ptr = d_raw; // pointer-to-element
-
-    for (int i = 0; i < (int)(sizeof(Ray)/4); ++i) {
-      ipu::store_postinc(&d_ptr, s[i], 1); // &d_ptr is unsigned int**, step=1 element (4 bytes)
-    }
-}
+    const unsigned* __restrict s = reinterpret_cast<const unsigned*>(src);
+    unsigned*       __restrict d_raw = reinterpret_cast<unsigned*>(dst);
+    unsigned *d = d_raw; 
+    // exact unroll (6 x 32-bit)
+    ipu::store_postinc(&d, s[0], 1);
+    ipu::store_postinc(&d, s[1], 1);
+    ipu::store_postinc(&d, s[2], 1);
+    ipu::store_postinc(&d, s[3], 1);
+    ipu::store_postinc(&d, s[4], 1);
+    ipu::store_postinc(&d, s[5], 1);
+  }
 
   [[gnu::always_inline]]
   unsigned findChildForCluster (uint16_t cluster_id) {
@@ -906,7 +907,23 @@ private:
       sharedOffsets[spillEndIdx(w)]   = scan;  // end (exclusive)
       remaining -= take;
     }
+  }
 
+  struct SpillCursor { unsigned r; unsigned nextBoundary; };
+
+  [[gnu::always_inline]]
+  static void initSpillCursor(const LanePartition& P, unsigned g, SpillCursor& sc) {
+    sc.r = 0;
+    while (g >= P.freePrefix[sc.r + 1]) ++sc.r;
+    sc.nextBoundary = P.freePrefix[sc.r + 1];
+  }
+
+  [[gnu::always_inline]]
+  static void spillAdvanceIfNeeded(const LanePartition& P, unsigned g, SpillCursor& sc) {
+    if (g >= sc.nextBoundary) {
+      do { ++sc.r; } while (g >= P.freePrefix[sc.r + 1]);
+      sc.nextBoundary = P.freePrefix[sc.r + 1];
+    }
   }
 
   [[gnu::always_inline]]
@@ -930,57 +947,75 @@ private:
   }
 
   [[gnu::always_inline]]
-  void wipeTail(InOutBufferBytes &out, unsigned written) {
-    // const unsigned capacity = kNumRays;
+  void wipeTail(Ray* __restrict out, unsigned written) {
     if (written >= kNumRays) return;
-    for (unsigned i = written; i < kNumRays; ++i) {
-      Ray *rr = reinterpret_cast<Ray*>(out.data() + i*sizeof(Ray));
-      if (rr->next_cluster == INVALID_RAY_ID) break;  // already clean
-      rr->next_cluster = INVALID_RAY_ID;              // sentinel
+    for (rptsize_t i = written; i < (rptsize_t)kNumRays; ++i) {
+      Ray* rr = &out[(unsigned)i];
+      if (rr->next_cluster == INVALID_RAY_ID) break;
+      rr->next_cluster = INVALID_RAY_ID;
     }
   }
 
   void invalidateAfterRouting() {
-    // const unsigned NW = poplar::MultiVertex::numWorkers();
-    const unsigned C = kNumRays; // raysOut.size()    / sizeof(Ray);
-
-    InOutBufferBytes *outBuf[kNumLanes] = {&childRaysOut0, &childRaysOut1, &childRaysOut2, &childRaysOut3, &parentRaysOut};
-
-    // 1) Totals per lane and partition (base, freePrefix)
+    // totals + partition
     unsigned tot[kNumLanes];
     totalsPerLane(sharedCounts, NW, tot);
-    LanePartition P = makePartition(tot, C);
+    LanePartition P = makePartition(tot, kNumRays);
 
-    // 2) How much global free space each lane received via spills
-    unsigned assigned[kNumLanes];
-    accumulateSpillAssigned(sharedOffsets, NW, P, assigned);
-
-    // 3) Wipe the tails past written = base + assigned
+    // how much spill each lane received
+    unsigned assigned[kNumLanes] = {0,0,0,0,0};
+    for (unsigned w = 0; w < NW; ++w) {
+      unsigned a = sharedOffsets[spillStartIdx(w)];
+      unsigned b = sharedOffsets[spillEndIdx(w)];
+      unsigned r = 0;
+      while (a < b) {
+        while (a >= P.freePrefix[r + 1]) ++r;
+        unsigned R = P.freePrefix[r + 1];
+        unsigned take = ((b < R) ? b : R) - a;
+        assigned[r] += take;
+        a += take;
+      }
+    }
+    
+    Ray* __restrict outBase[kNumLanes] = {
+      reinterpret_cast<Ray*>(childRaysOut0.data()),
+      reinterpret_cast<Ray*>(childRaysOut1.data()),
+      reinterpret_cast<Ray*>(childRaysOut2.data()),
+      reinterpret_cast<Ray*>(childRaysOut3.data()),
+      reinterpret_cast<Ray*>(parentRaysOut.data())
+    };
+    // wipe tails past written = base + assigned
     for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-      const unsigned written = P.base[lane] + assigned[lane]; // <= C
-      wipeTail(*outBuf[lane], written);
+      const unsigned written = P.base[lane] + assigned[lane];
+      wipeTail(outBase[lane], written);
     }
   }
 
-
   void countRays(unsigned workerId) {
-    // const unsigned NW = poplar::MultiVertex::numWorkers();
-    const unsigned C = kNumRays; //raysOut.size()    / sizeof(Ray);
     for (unsigned lane = 0; lane < kNumLanes; ++lane)
       sharedCounts[getSharedIdx(workerId, lane)] = 0;
 
-   InBufferBytes *inputs[kNumLanes] = {&childRaysIn0, &childRaysIn1, &childRaysIn2, &childRaysIn3, &parentRaysIn};
+    // Cast bases once (you’re using uint8_t buffers)
+    const Ray* __restrict inBase[kNumLanes] = {
+      reinterpret_cast<const Ray*>(childRaysIn0.data()),
+      reinterpret_cast<const Ray*>(childRaysIn1.data()),
+      reinterpret_cast<const Ray*>(childRaysIn2.data()),
+      reinterpret_cast<const Ray*>(childRaysIn3.data()),
+      reinterpret_cast<const Ray*>(parentRaysIn.data())
+    };
+
+    __builtin_assume(kNumRays <= 4096);
 
     for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-      const auto &buf  = *inputs[lane];
-
-      for (unsigned i = workerId; i < C; i += NW) {
-        const Ray *ray = reinterpret_cast<const Ray *>(buf.data() + i * sizeof(Ray));
-        if (ray->next_cluster == INVALID_RAY_ID) break;
-        if (ray->next_cluster == FINISHED_RAY_ID) continue;
-
-        unsigned dst = findChildForCluster(ray->next_cluster);
-        sharedCounts[getSharedIdx(workerId, dst)]++; 
+      const Ray* __restrict in = inBase[lane];
+      // worker-strided: i = workerId, workerId+NW, ...
+      for (rptsize_t i = (rptsize_t)workerId; i < (rptsize_t)kNumRays; i += (rptsize_t)NW) {
+        const Ray* ray = &in[(unsigned)i];
+        // Sentinel means end of valid rays for this lane → safe to break for this worker’s stride
+        if (__builtin_expect(ray->next_cluster == INVALID_RAY_ID, 0)) break;
+        if (__builtin_expect(ray->next_cluster == FINISHED_RAY_ID, 0)) continue;
+        const unsigned dst = findChildForCluster(ray->next_cluster);
+        ++sharedCounts[getSharedIdx(workerId, dst)];
       }
     }
   }
