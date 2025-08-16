@@ -77,6 +77,7 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& g, const poplar::Target&) {
     // batch frames: (compute set -> exchange) x kSubsteps then host copy
     // no batching: compute set -> exchange -> host copy
     poplar::program::Sequence frame_;
+    frame_.add(broadcastMatrices_);
     if(kSubsteps == 1) {
       frame_.add(poplar::program::Execute(cs));
       frame_.add(dataExchangeSeq);
@@ -118,8 +119,8 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
     if(loop_frames_ == false)
       eng.run(getPrograms().getOrdinals().at("frame"), fmt::format("frame_{:03d}", exec_counter_));
     
-    if(debug_)
-      readAllTiles(eng);
+    // if(debug_)
+    //   readAllTiles(eng);
 
     exec_counter_++;
 }

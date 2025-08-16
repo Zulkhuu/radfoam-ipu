@@ -76,7 +76,7 @@ private:
     const std::string h5_file_;
     bool debug_;
     bool loop_frames_;
-    static constexpr int kSubsteps = 8;
+    static constexpr int kSubsteps = 24;
     static constexpr int kRouterDebugSize = 15;
 
     // Scene data -------------------------------------------------------------

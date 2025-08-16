@@ -1021,3 +1021,346 @@ private:
   }
 
 };
+
+class RayRouter2 : public poplar::MultiVertex {
+  using RayVecIn = poplar::Input< poplar::Vector<uint8_t, poplar::VectorLayout::ONE_PTR, 8> >;
+  using RayVecIO = poplar::InOut< poplar::Vector<uint8_t, poplar::VectorLayout::ONE_PTR, 8> >;
+
+public:
+  // Incoming rays (5 lanes)
+  RayVecIn  parentRaysIn, childRaysIn0, childRaysIn1, childRaysIn2, childRaysIn3;
+  // Outgoing rays (5 lanes)
+  RayVecIO  parentRaysOut, childRaysOut0, childRaysOut1, childRaysOut2, childRaysOut3;
+
+  // Mapping info
+  poplar::Input< poplar::Vector<unsigned short, poplar::VectorLayout::SPAN, 4> > childClusterIds;
+  poplar::Input<uint8_t> level;
+
+  // Shared scratch
+  poplar::InOut< poplar::Vector<unsigned> > sharedCounts; 
+  poplar::InOut< poplar::Vector<unsigned> > sharedOffsets; 
+  poplar::InOut< poplar::Vector<unsigned> > readyFlags; 
+  poplar::InOut< poplar::Vector<unsigned> > debugBytes; // optional
+
+  inline static constexpr unsigned kNumLanes = 5;
+  inline static constexpr unsigned PARENT    = 4;
+  inline static constexpr unsigned NW        = 6; // MultiVertex workers
+  // NOTE: assume capacity per lane == kNumRays
+  inline static constexpr unsigned kNumRays  = /* your capacity here */ 1024;
+
+  struct LanePartition {
+    unsigned base[kNumLanes];
+    unsigned freePrefix[kNumLanes + 1];
+  };
+
+  uint16_t myChildPrefix;
+  uint8_t  shift;
+
+  // ---- aliasing constraints (unchanged) ----
+  [[poplar::constraint("elem(*readyFlags)!=elem(*sharedCounts)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*sharedOffsets)")]]
+  [[poplar::constraint("elem(*sharedCounts)!=elem(*sharedOffsets)")]]
+  // (add others you had if needed)
+
+  bool compute(unsigned workerId) {
+    // derive prefix mapping
+    shift = *level * 2;
+    myChildPrefix = childClusterIds[0] >> (shift + 2);
+
+    if (workerId == 0) {
+      volatile unsigned* f = readyFlags.data();
+      for (unsigned i = 0; i < NW; ++i) f[i] = 0;
+    }
+    barrier(0, workerId);
+
+    countRays(workerId);
+    barrier(1, workerId);
+
+    if (workerId == 0) computeWriteOffsets();
+    barrier(2, workerId);
+
+    routeRays(workerId);
+    barrier(3, workerId);
+
+    if (workerId == 0) invalidateAfterRouting();
+    return true;
+  }
+
+private:
+  // ---------- helpers ----------
+  [[gnu::always_inline]] unsigned getSharedIdx(unsigned workerId, unsigned lane) const {
+    return workerId * kNumLanes + lane;
+  }
+  [[gnu::always_inline]] unsigned spillStartIdx(unsigned w) const { return NW * kNumLanes + w; }
+  [[gnu::always_inline]] unsigned spillEndIdx  (unsigned w) const { return NW * kNumLanes + NW + w; }
+
+  [[gnu::always_inline]] 
+  static void workerRange(unsigned workerId, unsigned &begin, unsigned &end) {
+    begin = (kNumRays * workerId) / NW;
+    end   = (kNumRays * (workerId + 1)) / NW;
+  }
+
+  [[gnu::always_inline]]
+  static inline void copy_ray(const Ray* __restrict src, Ray* __restrict dst) {
+    // 24 bytes -> 6 x 32-bit words
+    const unsigned* __restrict s = reinterpret_cast<const unsigned*>(src);
+    unsigned* d = reinterpret_cast<unsigned*>(dst);  // NOTE: no __restrict here
+
+    // exact unroll helps codegen
+    ipu::store_postinc(&d, s[0], 1);
+    ipu::store_postinc(&d, s[1], 1);
+    ipu::store_postinc(&d, s[2], 1);
+    ipu::store_postinc(&d, s[3], 1);
+    ipu::store_postinc(&d, s[4], 1);
+    ipu::store_postinc(&d, s[5], 1);
+  }
+
+  [[gnu::always_inline]]
+  unsigned findChildForCluster (uint16_t cluster_id) const {
+    unsigned childIdx = (cluster_id >> shift) & 0x3;
+    bool isChild = ((cluster_id >> (shift + 2)) == myChildPrefix);
+    return isChild ? childIdx : PARENT;
+  }
+
+  [[gnu::always_inline]]
+  void totalsPerLane(const poplar::Vector<unsigned>& cnt, unsigned outTot[kNumLanes]) const {
+    for (unsigned r = 0; r < kNumLanes; ++r) outTot[r] = 0;
+    for (unsigned r = 0; r < kNumLanes; ++r)
+      for (unsigned w = 0; w < NW; ++w)
+        outTot[r] += cnt[getSharedIdx(w, r)];
+  }
+
+  [[gnu::always_inline]]
+  static LanePartition makePartition(const unsigned tot[kNumLanes]) {
+    LanePartition P{};
+    P.freePrefix[0] = 0;
+    for (unsigned r = 0; r < kNumLanes; ++r) {
+      const unsigned used = (tot[r] < kNumRays) ? tot[r] : kNumRays;
+      P.base[r] = used;
+      const unsigned freeCap = kNumRays - used;
+      P.freePrefix[r + 1] = P.freePrefix[r] + freeCap;
+    }
+    return P;
+  }
+
+  struct SpillCursor { unsigned r; unsigned nextBoundary; };
+
+  [[gnu::always_inline]]
+  static void initSpillCursor(const LanePartition& P, unsigned g, SpillCursor& sc) {
+    sc.r = 0;
+    while (g >= P.freePrefix[sc.r + 1]) ++sc.r;
+    sc.nextBoundary = P.freePrefix[sc.r + 1];
+  }
+
+  [[gnu::always_inline]]
+  static void spillAdvanceIfNeeded(const LanePartition& P, unsigned g, SpillCursor& sc) {
+    if (g >= sc.nextBoundary) {
+      do { ++sc.r; } while (g >= P.freePrefix[sc.r + 1]);
+      sc.nextBoundary = P.freePrefix[sc.r + 1];
+    }
+  }
+
+  // ---------- phases ----------
+  void countRays(unsigned workerId) {
+    // zero my row
+    for (unsigned lane = 0; lane < kNumLanes; ++lane)
+      sharedCounts[getSharedIdx(workerId, lane)] = 0;
+
+    // typed bases (if you kept uint8_t ABI, reinterpret_cast to Ray* once)
+    const Ray* __restrict inBase[kNumLanes] = {
+      reinterpret_cast<const Ray*>(childRaysIn0.data()),
+      reinterpret_cast<const Ray*>(childRaysIn1.data()),
+      reinterpret_cast<const Ray*>(childRaysIn2.data()),
+      reinterpret_cast<const Ray*>(childRaysIn3.data()),
+      reinterpret_cast<const Ray*>(parentRaysIn.data())
+    };
+
+    unsigned begin, end; workerRange(workerId, begin, end);
+    __builtin_assume(kNumRays <= 4096);
+
+    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+      const Ray* __restrict in = inBase[lane];
+      for (rptsize_t i = begin; i < (rptsize_t)end; ++i) {
+        const Ray* ray = &in[(unsigned)i];
+        if (__builtin_expect(ray->next_cluster == INVALID_RAY_ID, 0)) break;
+        if (__builtin_expect(ray->next_cluster == FINISHED_RAY_ID, 0)) continue;
+        const unsigned dst = findChildForCluster(ray->next_cluster);
+        ++sharedCounts[getSharedIdx(workerId, dst)];
+      }
+    }
+  }
+
+  void computeWriteOffsets() {
+    // primary offsets (no spill yet)
+    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+      unsigned offset = 0;
+      for (unsigned w = 0; w < NW; ++w) {
+        unsigned count = sharedCounts[getSharedIdx(w, lane)];
+        sharedOffsets[getSharedIdx(w, lane)] = offset;
+        offset += count;
+      }
+    }
+
+    // free space partition
+    unsigned tot[kNumLanes];
+    totalsPerLane(sharedCounts, tot);
+    LanePartition P = makePartition(tot);
+    const unsigned totalFree = P.freePrefix[kNumLanes];
+
+    // compute per-worker spill need
+    unsigned workerSpill[NW];
+    for (unsigned w = 0; w < NW; ++w) {
+      unsigned s = 0;
+      for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+        const unsigned start = sharedOffsets[getSharedIdx(w, lane)];
+        const unsigned cnt   = sharedCounts [getSharedIdx(w, lane)];
+        const unsigned allow = (start < kNumRays) ? ((cnt < (kNumRays - start)) ? cnt : (kNumRays - start)) : 0;
+        s += (cnt - allow);
+      }
+      workerSpill[w] = s;
+    }
+
+    // assign slices of global free space
+    unsigned scan = 0, remaining = totalFree;
+    for (unsigned w = 0; w < NW; ++w) {
+      const unsigned take = (workerSpill[w] < remaining) ? workerSpill[w] : remaining;
+      sharedOffsets[spillStartIdx(w)] = scan;
+      scan += take;
+      sharedOffsets[spillEndIdx(w)]   = scan;
+      remaining -= take;
+    }
+  }
+
+  void routeRays(unsigned workerId) {
+    // typed bases
+    const Ray* __restrict inBase[kNumLanes] = {
+      reinterpret_cast<const Ray*>(childRaysIn0.data()),
+      reinterpret_cast<const Ray*>(childRaysIn1.data()),
+      reinterpret_cast<const Ray*>(childRaysIn2.data()),
+      reinterpret_cast<const Ray*>(childRaysIn3.data()),
+      reinterpret_cast<const Ray*>(parentRaysIn.data())
+    };
+    Ray* __restrict outBase[kNumLanes] = {
+      reinterpret_cast<Ray*>(childRaysOut0.data()),
+      reinterpret_cast<Ray*>(childRaysOut1.data()),
+      reinterpret_cast<Ray*>(childRaysOut2.data()),
+      reinterpret_cast<Ray*>(childRaysOut3.data()),
+      reinterpret_cast<Ray*>(parentRaysOut.data())
+    };
+
+    // partition + spill
+    unsigned tot[kNumLanes]; totalsPerLane(sharedCounts, tot);
+    LanePartition P = makePartition(tot);
+
+    unsigned g    = sharedOffsets[spillStartIdx(workerId)];
+    unsigned gEnd = sharedOffsets[spillEndIdx(workerId)];
+    SpillCursor sc{}; if (g < gEnd) initSpillCursor(P, g, sc);
+
+    // my primary ranges per lane (start/end)
+    const unsigned s0 = sharedOffsets[getSharedIdx(workerId, 0)];
+    const unsigned c0 = sharedCounts [getSharedIdx(workerId, 0)];
+    const unsigned e0 = (s0 + c0 < kNumRays ? s0 + c0 : kNumRays);
+    const unsigned s1 = sharedOffsets[getSharedIdx(workerId, 1)];
+    const unsigned c1 = sharedCounts [getSharedIdx(workerId, 1)];
+    const unsigned e1 = (s1 + c1 < kNumRays ? s1 + c1 : kNumRays);
+    const unsigned s2 = sharedOffsets[getSharedIdx(workerId, 2)];
+    const unsigned c2 = sharedCounts [getSharedIdx(workerId, 2)];
+    const unsigned e2 = (s2 + c2 < kNumRays ? s2 + c2 : kNumRays);
+    const unsigned s3 = sharedOffsets[getSharedIdx(workerId, 3)];
+    const unsigned c3 = sharedCounts [getSharedIdx(workerId, 3)];
+    const unsigned e3 = (s3 + c3 < kNumRays ? s3 + c3 : kNumRays);
+    const unsigned sP = sharedOffsets[getSharedIdx(workerId, 4)];
+    const unsigned cP = sharedCounts [getSharedIdx(workerId, 4)];
+    const unsigned eP = (sP + cP < kNumRays ? sP + cP : kNumRays);
+
+    unsigned wr0=0, wr1=0, wr2=0, wr3=0, wrP=0;
+    unsigned begin, end; workerRange(workerId, begin, end);
+    __builtin_assume(kNumRays <= 4096);
+
+    for (rptsize_t lane = 0; lane < (rptsize_t)kNumLanes; ++lane) {
+      const Ray* __restrict in = inBase[(unsigned)lane];
+      for (rptsize_t i = begin; i < (rptsize_t)end; ++i) {
+        const Ray* ray = &in[(unsigned)i];
+        if (__builtin_expect(ray->next_cluster == INVALID_RAY_ID, 0)) break;
+        if (__builtin_expect(ray->next_cluster == FINISHED_RAY_ID, 0)) continue;
+
+        const unsigned dst = findChildForCluster(ray->next_cluster);
+        bool primaryOK = true;
+        unsigned slot = 0;
+
+        switch (dst) {
+          case 0: slot = s0 + wr0; primaryOK = (slot < e0); if (primaryOK) { copy_ray(ray, &outBase[0][slot]); ++wr0; } break;
+          case 1: slot = s1 + wr1; primaryOK = (slot < e1); if (primaryOK) { copy_ray(ray, &outBase[1][slot]); ++wr1; } break;
+          case 2: slot = s2 + wr2; primaryOK = (slot < e2); if (primaryOK) { copy_ray(ray, &outBase[2][slot]); ++wr2; } break;
+          case 3: slot = s3 + wr3; primaryOK = (slot < e3); if (primaryOK) { copy_ray(ray, &outBase[3][slot]); ++wr3; } break;
+          default:slot = sP + wrP; primaryOK = (slot < eP); if (primaryOK) { copy_ray(ray, &outBase[4][slot]); ++wrP; } break;
+        }
+
+        if (!primaryOK && (g < gEnd)) {
+          spillAdvanceIfNeeded(P, g, sc);
+          const unsigned slotInR = P.base[sc.r] + (g - P.freePrefix[sc.r]);
+          copy_ray(ray, &outBase[sc.r][slotInR]);
+          ++g;
+        }
+      }
+    }
+  }
+
+  [[gnu::always_inline]]
+  void wipeTail(Ray* __restrict out, unsigned written) {
+    if (written >= kNumRays) return;
+    for (rptsize_t i = written; i < (rptsize_t)kNumRays; ++i) {
+      Ray* rr = &out[(unsigned)i];
+      if (rr->next_cluster == INVALID_RAY_ID) break;
+      rr->next_cluster = INVALID_RAY_ID;
+    }
+  }
+
+  void invalidateAfterRouting() {
+    // totals + partition
+    unsigned tot[kNumLanes];
+    totalsPerLane(sharedCounts, tot);
+    LanePartition P = makePartition(tot);
+
+    // how much spill each lane received
+    unsigned assigned[kNumLanes] = {0,0,0,0,0};
+    for (unsigned w = 0; w < NW; ++w) {
+      unsigned a = sharedOffsets[spillStartIdx(w)];
+      unsigned b = sharedOffsets[spillEndIdx(w)];
+      unsigned r = 0;
+      while (a < b) {
+        while (a >= P.freePrefix[r + 1]) ++r;
+        unsigned R = P.freePrefix[r + 1];
+        unsigned take = ((b < R) ? b : R) - a;
+        assigned[r] += take;
+        a += take;
+      }
+    }
+
+    Ray* __restrict outBase[kNumLanes] = {
+      reinterpret_cast<Ray*>(childRaysOut0.data()),
+      reinterpret_cast<Ray*>(childRaysOut1.data()),
+      reinterpret_cast<Ray*>(childRaysOut2.data()),
+      reinterpret_cast<Ray*>(childRaysOut3.data()),
+      reinterpret_cast<Ray*>(parentRaysOut.data())
+    };
+    // wipe tails past written = base + assigned
+    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+      const unsigned written = P.base[lane] + assigned[lane];
+      wipeTail(outBase[lane], written);
+    }
+  }
+
+  [[gnu::always_inline]]
+  void barrier(unsigned phase, unsigned workerId) {
+    volatile unsigned* flags = readyFlags.data();
+    flags[workerId] = phase;
+    asm volatile("" ::: "memory");
+    while (true) {
+      bool all = true;
+      for (unsigned i = 0; i < NW; ++i) if (flags[i] < phase) { all = false; break; }
+      if (all) break;
+    }
+    asm volatile("" ::: "memory");
+  }
+};

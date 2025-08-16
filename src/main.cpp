@@ -118,8 +118,7 @@ static std::pair<cv::Mat, size_t> AssembleFinishedRaysImage(const std::vector<ui
   return {(mode == 0) ? rgb_img : depth_img, updatedPixels.load()};
 }
 
-static std::pair<cv::Mat, size_t>
-AssembleFramebufferImage(const std::vector<uint8_t>& fbBytes, int mode /*0=rgb,1=depth*/)
+static std::pair<cv::Mat, size_t> AssembleFramebufferImage(const std::vector<uint8_t>& fbBytes, int mode)
 {
   const int W = static_cast<int>(radfoam::config::kFullImageWidth);
   const int H = static_cast<int>(radfoam::config::kFullImageHeight);
@@ -229,6 +228,12 @@ static cv::Mat AssembleFinishedRaysImageRGBOnly(const std::vector<uint8_t>& fini
     return rgb_img;
 }
 
+static glm::mat4 UpdateProjection(float fovRadians,
+                                  float aspect,
+                                  float nearPlane = 0.1f,
+                                  float farPlane  = 100.0f) {
+    return glm::perspective(fovRadians, aspect, nearPlane, farPlane);
+}
 
 int main(int argc, char** argv) {
   pvti::TraceChannel traceChannel = {"RadiantFoamIpu"};
@@ -413,6 +418,13 @@ int main(int argc, char** argv) {
         builder.stopFlagHost_ = 0;
         break;
       }
+      
+      ProjectionMatrix = UpdateProjection(
+        state.fov,
+        static_cast<float>(kFullImageWidth) / static_cast<float>(kFullImageHeight),
+        0.1f,
+        100.0f
+      );
       glm::mat4 inverseView = glm::inverse(ViewMatrix);
       glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
       glm::vec3 cameraPos = glm::vec3(inverseView[3]);
@@ -463,8 +475,8 @@ int main(int argc, char** argv) {
           double elapsedSec = std::chrono::duration<double>(now - startTime).count();
           std::cout << "Full image updated in " << elapsedSec << " seconds." << std::endl;
           fullImageUpdated = true;
-          builder.stopFlagHost_ = 0;
-          break;
+          // builder.stopFlagHost_ = 0;
+          // break;
         }
       }
 
