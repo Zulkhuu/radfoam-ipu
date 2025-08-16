@@ -6,6 +6,8 @@
 #include <ipu/rf_config.hpp>
 #include <ipudef.h>
 #include <ipu_builtins.h>
+#include <ipu_vector_math>
+#include <ipu_memory_intrinsics>
 
 using namespace radfoam::config;
 using radfoam::geometry::LocalPoint;
@@ -23,11 +25,13 @@ struct alignas(4) FinishedPixel {
   uint8_t r, g, b, a;
   float t;
 };
+struct Mat4Rows { float r[4][4]; };
 
 inline constexpr uint16_t kLeadMask   = 0xFC00u;   // 11111 00000000000₂
 inline constexpr uint8_t kShift = 10;  
 inline constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
 inline constexpr uint16_t FINISHED_RAY_ID = 0xFFFE;
+inline constexpr unsigned NW = 6;
 
 class RayTrace : public poplar::MultiVertex {
 public:
@@ -77,12 +81,14 @@ public:
 
   bool compute(unsigned workerId) {
     const unsigned kSubSteps = 6;
-    const unsigned NW = poplar::MultiVertex::numWorkers();
+    // const unsigned NW = poplar::MultiVertex::numWorkers();
     const unsigned C  = raysOut.size() / sizeof(Ray);
     const unsigned FR_CAP = finishedRays.size() / sizeof(FinishedRay);
     const uint16_t nLocalPts = local_pts.size() / sizeof(LocalPoint);
     const uint16_t nNbrPts   = neighbor_pts.size() / sizeof(GenericPoint);
     const unsigned adjSize   = adjacency.size(); // elements (uint16)
+    const uint16_t tileX = tile_id % kNumRayTracerTilesX;
+    const uint16_t tileY = tile_id / kNumRayTracerTilesX;
 
     // ----- 0) Once per CPU-read (first substep), clear & reset head in parallel
     // const bool firstSubstep = ((*exec_count % kSubSteps) == 0);
@@ -95,6 +101,9 @@ public:
     // Setup matrices
     glm::mat4 invView = glm::make_mat4(view_matrix.data());
     glm::mat4 invProj = glm::make_mat4(projection_matrix.data());
+    const Mat4Rows invViewR = loadRows(view_matrix);
+    const Mat4Rows invProjR = loadRows(projection_matrix);
+
     glm::vec3 rayOrigin = glm::vec3(invView[3]);
     const uint16_t myTile = *tile_id;
 
@@ -110,8 +119,6 @@ public:
       return static_cast<uint16_t>(ty * kNumRayTracerTilesX + tx);
     };
     auto localXY = [&](uint16_t x10, uint16_t y, uint16_t tile, uint16_t &lx, uint16_t &ly){
-      const uint16_t tileX = tile % kNumRayTracerTilesX;
-      const uint16_t tileY = tile / kNumRayTracerTilesX;
       lx = static_cast<uint16_t>(x10 - tileX * kTileImageWidth);
       ly = static_cast<uint16_t>(y   - tileY * kTileImageHeight);
     };
@@ -163,6 +170,8 @@ public:
       // --- march ---
       // const uint16_t x10 = data10(in->x);
       glm::vec3 rayDir = computeRayDir(in->x, in->y, invProj, invView);
+      // glm::vec3 rayDir;
+      // computeRayDirFast(in->x, in->y, invProjR, invViewR, rayDir.x, rayDir.y, rayDir.z);
 
       glm::vec3 color(in->r, in->g, in->b);
       float transmittance = __builtin_ipu_f16tof32(in->transmittance);
@@ -196,15 +205,14 @@ public:
             p1.y = nb->y;
             p1.z = nb->z;
           } else {
-            const uint16_t off = nbrIdx - nLocalPts;
-            const GenericPoint* nb = readStructAt<GenericPoint>(neighbor_pts, off);
+            const GenericPoint* nb = readStructAt<GenericPoint>(neighbor_pts, nbrIdx - nLocalPts);
             p1.x = nb->x;
             p1.y = nb->y;
             p1.z = nb->z;
           }
 
           const glm::vec3 faceNormal = p1 - p0;
-          const glm::vec3 faceOrigin = p0 + 0.5f*faceNormal;
+          const glm::vec3 faceOrigin = 0.5f*(p1 + p0);
           const float dn = glm::dot(faceNormal, rayDir);
           if (dn <= 0.f) continue;
 
@@ -213,7 +221,12 @@ public:
         }
 
         const float delta = closestT - t0;
-        const float alpha = 1.f - __builtin_ipu_exp(-cur->density * delta);
+        // const float alpha = 1.f - __builtin_ipu_exp(-cur->density * delta);
+        const float x_ = cur->density * delta;
+        const float alpha = (x_ > -0.125f && x_ < 0.125f)
+                          ? (x_ - 0.5f*x_*x_)              // 2-term expm1 approx
+                          : (1.f - __builtin_ipu_exp(-x_));
+
         const float ta    = transmittance * alpha;
 
         color.x += ta * (cur->r / 255.f);
@@ -223,7 +236,6 @@ public:
         t0       = __builtin_ipu_max(t0, closestT);
 
         // Finish or cross boundary?
-        const uint16_t nLocalPts = local_pts.size()/sizeof(LocalPoint);
         if (transmittance < 0.01f || next == -1 || next >= nLocalPts) {
           if (transmittance < 0.01f || next == -1) {
             // Finished on this tile
@@ -239,8 +251,7 @@ public:
             ++localFinished;
           } else {
             // Cross to neighbor cluster
-            const uint16_t nLocal = local_pts.size()/sizeof(LocalPoint);
-            const GenericPoint* nb = readStructAt<GenericPoint>(neighbor_pts, next - nLocal);
+            const GenericPoint* nb = readStructAt<GenericPoint>(neighbor_pts, next - nLocalPts);
             out->x = in->x; 
             out->y = in->y;
             out->r = color.x; 
@@ -274,9 +285,53 @@ public:
   }
 
 private:
+
+  [[gnu::always_inline]] Mat4Rows loadRows(const poplar::Input<poplar::Vector<float>>& M){
+    Mat4Rows R; const float* p=M.data();
+    #pragma unroll
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++) R.r[i][j]=p[i*4+j];
+    return R;
+  }
+
+  [[gnu::always_inline]] void mul4(const Mat4Rows& A, const float v[4], float out[4]) {
+    #pragma unroll
+    for (int i=0;i<4;i++) {
+      float s = ipu::fma(A.r[i][0], v[0], A.r[i][3] * v[3]);
+      s = ipu::fma(A.r[i][1], v[1], s);
+      s = ipu::fma(A.r[i][2], v[2], s);
+      out[i] = s;
+    }
+  }
+
+  [[gnu::always_inline]]
+  void computeRayDirFast(uint16_t x, uint16_t y,
+                                      const Mat4Rows& invProj,
+                                      const Mat4Rows& invView,
+                                      float &dx, float &dy, float &dz) {
+    const float ndcX = (2.f * x) * (1.f/kFullImageWidth)  - 1.f;
+    const float ndcY = 1.f - (2.f * y) * (1.f/kFullImageHeight);
+    float clip[4] = { ndcX, ndcY, -1.f, 1.f }, eye[4], v[4];
+    mul4(invProj, clip, eye); eye[2] = -1.f; eye[3] = 0.f;
+    mul4(invView, eye, v);
+    float l2 = ipu::fma(v[0],v[0], ipu::fma(v[1],v[1], v[2]*v[2]));
+    float invL = ipu::rsqrt(l2);
+    dx = v[0]*invL; dy = v[1]*invL; dz = v[2]*invL;
+  }
+
+  [[gnu::always_inline]]
+  glm::vec3 computeRayDir(uint16_t x, uint16_t y, glm::mat4& invProj, glm::mat4& invView) {
+    float ndcX = (2.0f * x) / kFullImageWidth - 1.0f;
+    float ndcY = 1.0f - (2.0f * y) / kFullImageHeight;
+    glm::vec4 clipRay(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 eyeRay = invProj * clipRay;
+    eyeRay.z = -1.0f;
+    eyeRay.w = 0.0f;
+    return glm::normalize(glm::vec3(invView * eyeRay));
+  };
+ 
   [[gnu::always_inline]]
   void computeWriteOffsets() {
-      const unsigned NW = poplar::MultiVertex::numWorkers();
+      // const unsigned NW = poplar::MultiVertex::numWorkers();
       // exclusive scan over workers
       unsigned head = *finishedWriteOffset;
       unsigned scan = 0, total = 0;
@@ -289,21 +344,11 @@ private:
       // capacity check (assume no wrap during a burst)
       *finishedWriteOffset = head + total;
   }
-  [[gnu::always_inline]]
-  glm::vec3 computeRayDir(uint16_t x, uint16_t y, glm::mat4& invProj, glm::mat4& invView) {
-    float ndcX = (2.0f * x) / kFullImageWidth - 1.0f;
-    float ndcY = 1.0f - (2.0f * y) / kFullImageHeight;
-    glm::vec4 clipRay(ndcX, ndcY, -1.0f, 1.0f);
-    glm::vec4 eyeRay = invProj * clipRay;
-    eyeRay.z = -1.0f;
-    eyeRay.w = 0.0f;
-    return glm::normalize(glm::vec3(invView * eyeRay));
-  };
-  
+
   // [[gnu::always_inline]]
   void barrier(unsigned phase, unsigned workerId) {
     volatile unsigned* flags = readyFlags.data();
-    const unsigned NW = poplar::MultiVertex::numWorkers();
+    // const unsigned NW = poplar::MultiVertex::numWorkers();
     asm volatile("" ::: "memory");
     while (true) {
       flags[workerId] = phase;
@@ -322,7 +367,7 @@ private:
   }
 
   [[gnu::always_inline]] inline uint8_t clampToU8(float v) {
-    return static_cast<uint8_t>(__builtin_ipu_max(0.0f, __builtin_ipu_min(255.0f, std::round(v * 255.0f))));
+    return static_cast<uint8_t>(__builtin_ipu_max(0.0f, __builtin_ipu_min(255.0f, v * 255.0f)));
   }
 
   [[gnu::always_inline]] inline uint8_t getLead6(uint16_t v) { 
@@ -412,29 +457,58 @@ public:
     // ── 3) fill remaining with generated rays (simple column scan), queue rest
     const unsigned interval = 1;
     const bool genThisFrame = ((*exec_count % interval) == 0);
+    int raygen_mode = 1;
     if (genThisFrame) {
-      const unsigned nColsPerFrame = 2;
-      const unsigned colBase = ((*exec_count)/interval) * nColsPerFrame;
+      if(raygen_mode == 0) {
+        const unsigned nRowsPerFrame = 1;
+        const unsigned rowBase = ((*exec_count)/interval) * nRowsPerFrame;
 
-      // Don’t generate more than remaining output capacity + queue free slots
-      unsigned budget = (C - outCnt) + qFree(head, tail);
+        // Don’t generate more than remaining output capacity + queue free slots
+        unsigned budget = (C - outCnt) + qFree(head, tail);
 
-      Ray g{};
-      g.r = g.g = g.b = 0.0f;
-      g.t = __builtin_ipu_f32tof16(0.0f);
-      g.transmittance = __builtin_ipu_f32tof16(1.0f);
-      g.next_cluster = cluster_id;
-      g.next_local   = local_id;
-      for (uint16_t cx = 0; cx < nColsPerFrame && budget; ++cx) {
-        const uint16_t x = (colBase + cx) % kFullImageWidth;
-        for (uint16_t y = 0; y < kFullImageHeight && budget; ++y) {
-          g.x = x; 
-          g.y = y;
+        Ray g{};
+        g.r = g.g = g.b = 0.0f;
+        g.t = __builtin_ipu_f32tof16(0.0f);
+        g.transmittance = __builtin_ipu_f32tof16(1.0f);
+        g.next_cluster = cluster_id;
+        g.next_local   = local_id;
+        for (uint16_t cy = 0; cy < nRowsPerFrame && budget; ++cy) {
+          const uint16_t y = (rowBase + cy) % kFullImageWidth;
+          for (uint16_t x = 0; x < kFullImageWidth && budget; ++x) {
+            g.x = x; 
+            g.y = y;
 
-          if (emit(g, outCnt)) { ++genEmitted; }
-          else if (qPush(g))   { ++genQueued;  }
-          else                 { ++drops;      } // shouldn’t happen 
-          --budget;
+            if (emit(g, outCnt)) { ++genEmitted; }
+            else if (qPush(g))   { ++genQueued;  }
+            else                 { ++drops;      } // shouldn’t happen 
+            --budget;
+          }
+        }
+      }
+      if(raygen_mode == 1) {
+        const unsigned nColsPerFrame = 2;
+        const unsigned colBase = ((*exec_count)/interval) * nColsPerFrame;
+
+        // Don’t generate more than remaining output capacity + queue free slots
+        unsigned budget = (C - outCnt) + qFree(head, tail);
+
+        Ray g{};
+        g.r = g.g = g.b = 0.0f;
+        g.t = __builtin_ipu_f32tof16(0.0f);
+        g.transmittance = __builtin_ipu_f32tof16(1.0f);
+        g.next_cluster = cluster_id;
+        g.next_local   = local_id;
+        for (uint16_t cx = 0; cx < nColsPerFrame && budget; ++cx) {
+          const uint16_t x = (colBase + cx) % kFullImageWidth;
+          for (uint16_t y = 0; y < kFullImageHeight && budget; ++y) {
+            g.x = x; 
+            g.y = y;
+
+            if (emit(g, outCnt)) { ++genEmitted; }
+            else if (qPush(g))   { ++genQueued;  }
+            else                 { ++drops;      } // shouldn’t happen 
+            --budget;
+          }
         }
       }
     }
@@ -480,23 +554,18 @@ inline void emit(const Ray &r, unsigned &cnt,
 }
 
 class RayRouter : public poplar::MultiVertex {
+  // using BytesVec   = poplar::Vector<uint8_t, poplar::VectorLayout::SPAN, kNumRays * sizeof(Ray)>;
+  using BytesVec   = poplar::Vector<uint8_t>;
+  using InBufferBytes    = poplar::Input<BytesVec>;
+  using InOutBufferBytes = poplar::InOut<BytesVec>;
+
 public:
   // Incoming rays
-  poplar::Input<poplar::Vector<uint8_t>> parentRaysIn;
-  poplar::Input<poplar::Vector<uint8_t>> childRaysIn0;
-  poplar::Input<poplar::Vector<uint8_t>> childRaysIn1;
-  poplar::Input<poplar::Vector<uint8_t>> childRaysIn2;
-  poplar::Input<poplar::Vector<uint8_t>> childRaysIn3;
-
-  // Outgoing rays
-  poplar::InOut<poplar::Vector<uint8_t>> parentRaysOut;
-  poplar::InOut<poplar::Vector<uint8_t>> childRaysOut0;
-  poplar::InOut<poplar::Vector<uint8_t>> childRaysOut1;
-  poplar::InOut<poplar::Vector<uint8_t>> childRaysOut2;
-  poplar::InOut<poplar::Vector<uint8_t>> childRaysOut3;
+  InBufferBytes  parentRaysIn,  childRaysIn0, childRaysIn1, childRaysIn2, childRaysIn3;
+  InOutBufferBytes parentRaysOut, childRaysOut0, childRaysOut1, childRaysOut2, childRaysOut3;
 
   // ID mapping to know which cluster IDs belong to which child
-  poplar::Input<poplar::Vector<unsigned short>> childClusterIds;
+  poplar::Input<poplar::Vector<unsigned short, poplar::VectorLayout::SPAN, 4>> childClusterIds;
   poplar::Input<uint8_t> level;
 
   poplar::InOut<poplar::Vector<unsigned>> debugBytes;
@@ -505,9 +574,9 @@ public:
   poplar::InOut<poplar::Vector<unsigned>> sharedOffsets; 
   poplar::InOut<poplar::Vector<unsigned>> readyFlags; 
 
-  static constexpr unsigned kNumLanes = 5;
-  // static constexpr unsigned kNumWorkers = 6; //MultiVertex::numWorkers(); 
-  static constexpr unsigned PARENT = 4;
+  inline static constexpr unsigned kNumLanes = 5;
+  inline static constexpr unsigned PARENT = 4;
+  inline static constexpr unsigned NW = 6;//MultiVertex::numWorkers(); 
 
   struct LanePartition {
     unsigned base[kNumLanes];             // primary writes per lane, clamped to capacity C
@@ -564,9 +633,20 @@ public:
   [[poplar::constraint("elem(*sharedOffsets)!=elem(*debugBytes)")]]
 
   bool compute(unsigned workerId) {
+    auto* __restrict outParent = parentRaysOut.data();
+    auto* __restrict outC0     = childRaysOut0.data();
+    auto* __restrict outC1     = childRaysOut1.data();
+    auto* __restrict outC2     = childRaysOut2.data();
+    auto* __restrict outC3     = childRaysOut3.data();
+    auto* __restrict inParent  = parentRaysIn.data();
+    auto* __restrict inC0      = childRaysIn0.data();
+    auto* __restrict inC1      = childRaysIn1.data();
+    auto* __restrict inC2      = childRaysIn2.data();
+    auto* __restrict inC3      = childRaysIn3.data();
+
     shift = *level * 2;
     myChildPrefix = childClusterIds[0] >> (shift + 2);
-    const unsigned NW = poplar::MultiVertex::numWorkers();
+    // const unsigned NW = poplar::MultiVertex::numWorkers();
 
     if (workerId == 0) {
       volatile unsigned* f = readyFlags.data();
@@ -643,11 +723,11 @@ private:
   }
 
   [[gnu::always_inline]] unsigned spillStartIdx(unsigned w) const {
-    const unsigned NW = poplar::MultiVertex::numWorkers();
+    // const unsigned NW = poplar::MultiVertex::numWorkers();
     return NW * kNumLanes + w;
   }
   [[gnu::always_inline]] unsigned spillEndIdx(unsigned w) const {
-    const unsigned NW = poplar::MultiVertex::numWorkers();
+    // const unsigned NW = poplar::MultiVertex::numWorkers();
     return NW * kNumLanes + NW + w;
   }
 
@@ -683,7 +763,7 @@ private:
   }
 
   void routeRays(unsigned workerId) {
-    const unsigned NW = poplar::MultiVertex::numWorkers();
+    // const unsigned NW = poplar::MultiVertex::numWorkers();
     const unsigned C = kNumRays; //.size()    / sizeof(Ray);
         
     // totals per lane
@@ -697,11 +777,8 @@ private:
 
     unsigned  wrCtr[kNumLanes] = {0,0,0,0,0};
 
-    const poplar::Input<poplar::Vector<uint8_t>> *inBuf[kNumLanes] = {
-        &childRaysIn0, &childRaysIn1, &childRaysIn2, &childRaysIn3, &parentRaysIn};
-
-    poplar::InOut<poplar::Vector<uint8_t>> *outBuf[kNumLanes] = {
-        &childRaysOut0, &childRaysOut1, &childRaysOut2, &childRaysOut3, &parentRaysOut};
+    const InBufferBytes *inBuf[kNumLanes] = {&childRaysIn0, &childRaysIn1, &childRaysIn2, &childRaysIn3, &parentRaysIn};
+    InOutBufferBytes *outBuf[kNumLanes] = {&childRaysOut0, &childRaysOut1, &childRaysOut2, &childRaysOut3, &parentRaysOut};
 
     for (unsigned lane = 0; lane < kNumLanes; ++lane) {
       // indices: workerId, workerId+NW, …
@@ -724,7 +801,9 @@ private:
         unsigned slot = start + wrCtr[dst];
         if (slot < end) {
           // primary write OK
-          std::memcpy(outBuf[dst]->data() + slot*sizeof(Ray), ray, sizeof(Ray));
+          // std::memcpy(outBuf[dst]->data() + slot*sizeof(Ray), ray, sizeof(Ray));
+          Ray* loc = reinterpret_cast<Ray*>(outBuf[dst]->data() + slot*sizeof(Ray));
+          copy_ray(ray, loc);
           ++wrCtr[dst];
         } else {
           needSpill = true; // this worker's primary quota used up
@@ -735,7 +814,9 @@ private:
           if (g < gEnd) {
             unsigned r, slotInR;
             mapGlobalFreeToLane(g, P, r, slotInR);
-            std::memcpy(outBuf[r]->data() + slotInR*sizeof(Ray), ray, sizeof(Ray));
+            // std::memcpy(outBuf[r]->data() + slotInR*sizeof(Ray), ray, sizeof(Ray));
+            Ray* spill_loc = reinterpret_cast<Ray*>(outBuf[r]->data() + slotInR*sizeof(Ray));
+            copy_ray(ray, spill_loc);
             ++g;
           } else {
             // optional: count a drop
@@ -749,7 +830,7 @@ private:
   [[gnu::always_inline]]
   void barrier(unsigned phase, unsigned workerId) {
     volatile unsigned* flags = readyFlags.data();
-    const unsigned NW = poplar::MultiVertex::numWorkers();
+    // const unsigned NW = poplar::MultiVertex::numWorkers();
     flags[workerId] = phase;
     asm volatile("" ::: "memory");
     while (true) {
@@ -764,6 +845,16 @@ private:
     }
     asm volatile("" ::: "memory");
   }
+  [[gnu::always_inline]]
+  static inline void copy_ray(const Ray* __restrict src, Ray* __restrict dst) {
+    const unsigned * __restrict s = reinterpret_cast<const unsigned*>(src);
+    unsigned * __restrict d_raw   = reinterpret_cast<unsigned*>(dst);
+    unsigned *d_ptr = d_raw; // pointer-to-element
+
+    for (int i = 0; i < (int)(sizeof(Ray)/4); ++i) {
+      ipu::store_postinc(&d_ptr, s[i], 1); // &d_ptr is unsigned int**, step=1 element (4 bytes)
+    }
+}
 
   [[gnu::always_inline]]
   unsigned findChildForCluster (uint16_t cluster_id) {
@@ -773,7 +864,7 @@ private:
   };
 
   void computeWriteOffsets() {
-    const unsigned NW = poplar::MultiVertex::numWorkers();
+    // const unsigned NW = poplar::MultiVertex::numWorkers();
     const unsigned C = kNumRays; // raysOut.size()    / sizeof(Ray);
 
     // compute offsets without considering spillovers
@@ -839,10 +930,10 @@ private:
   }
 
   [[gnu::always_inline]]
-  void wipeTail(poplar::InOut<poplar::Vector<uint8_t>> &out, unsigned written) {
-    const unsigned capacity = out.size() / sizeof(Ray);
-    if (written >= capacity) return;
-    for (unsigned i = written; i < capacity; ++i) {
+  void wipeTail(InOutBufferBytes &out, unsigned written) {
+    // const unsigned capacity = kNumRays;
+    if (written >= kNumRays) return;
+    for (unsigned i = written; i < kNumRays; ++i) {
       Ray *rr = reinterpret_cast<Ray*>(out.data() + i*sizeof(Ray));
       if (rr->next_cluster == INVALID_RAY_ID) break;  // already clean
       rr->next_cluster = INVALID_RAY_ID;              // sentinel
@@ -850,12 +941,10 @@ private:
   }
 
   void invalidateAfterRouting() {
-    const unsigned NW = poplar::MultiVertex::numWorkers();
+    // const unsigned NW = poplar::MultiVertex::numWorkers();
     const unsigned C = kNumRays; // raysOut.size()    / sizeof(Ray);
 
-    poplar::InOut<poplar::Vector<uint8_t>> *outBuf[kNumLanes] = {
-      &childRaysOut0, &childRaysOut1, &childRaysOut2, &childRaysOut3, &parentRaysOut
-    };
+    InOutBufferBytes *outBuf[kNumLanes] = {&childRaysOut0, &childRaysOut1, &childRaysOut2, &childRaysOut3, &parentRaysOut};
 
     // 1) Totals per lane and partition (base, freePrefix)
     unsigned tot[kNumLanes];
@@ -875,13 +964,12 @@ private:
 
 
   void countRays(unsigned workerId) {
-    const unsigned NW = poplar::MultiVertex::numWorkers();
+    // const unsigned NW = poplar::MultiVertex::numWorkers();
     const unsigned C = kNumRays; //raysOut.size()    / sizeof(Ray);
     for (unsigned lane = 0; lane < kNumLanes; ++lane)
       sharedCounts[getSharedIdx(workerId, lane)] = 0;
 
-    const poplar::Input<poplar::Vector<uint8_t>> *inputs[kNumLanes] = {
-        &childRaysIn0, &childRaysIn1, &childRaysIn2, &childRaysIn3, &parentRaysIn};
+   InBufferBytes *inputs[kNumLanes] = {&childRaysIn0, &childRaysIn1, &childRaysIn2, &childRaysIn3, &parentRaysIn};
 
     for (unsigned lane = 0; lane < kNumLanes; ++lane) {
       const auto &buf  = *inputs[lane];

@@ -33,7 +33,7 @@ inline constexpr std::size_t kNumL4RouterTiles = kNumL3RouterTiles / kChildrenPe
 inline constexpr std::uint16_t kRaygenTile = 1460;
 
 // Rays per IO buffer
-inline constexpr std::size_t kNumRays = 2400;
+inline constexpr std::size_t kNumRays = 2448;
 
 // Per-tile image geometry (pixels)
 inline constexpr std::size_t kTileImageWidth  = kFullImageWidth  / kNumRayTracerTilesX;

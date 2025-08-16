@@ -463,6 +463,8 @@ int main(int argc, char** argv) {
           double elapsedSec = std::chrono::duration<double>(now - startTime).count();
           std::cout << "Full image updated in " << elapsedSec << " seconds." << std::endl;
           fullImageUpdated = true;
+          builder.stopFlagHost_ = 0;
+          break;
         }
       }
 
