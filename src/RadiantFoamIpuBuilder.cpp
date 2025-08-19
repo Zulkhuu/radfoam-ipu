@@ -65,7 +65,6 @@ void RadiantFoamIpuBuilder::updateCameraParameters(const InterfaceServer::State&
   float z = minVal + state.Z * (maxVal - minVal);
   
   glm::vec3 position(x, y, z);
-  fmt::print("P:({},{},{}) yaw:{} pitch:{}\n", x, y, z, state.envRotationDegrees, state.envRotationDegrees2);
   glm::mat4 view = glm::lookAt(
     position,
     position + glm::vec3(0.0f, 0.0f, -1.0f),
