@@ -1,8 +1,23 @@
 #pragma once
 #include <sstream>
 #include <vector>
+#include <glm/glm.hpp>
+#include <spdlog/fmt/fmt.h>
 
-namespace radfoam::util {
+template <>
+struct fmt::formatter<glm::mat4> {
+    constexpr auto parse(fmt::format_parse_context& ctx) { return ctx.begin(); }
+
+    template <typename FormatContext>
+    auto format(const glm::mat4& mat, FormatContext& ctx) {
+        for (int r = 0; r < 4; r++) {
+            fmt::format_to(ctx.out(), "[{: .6f}, {: .6f}, {: .6f}, {: .6f}]{}\n",
+                           mat[r][0], mat[r][1], mat[r][2], mat[r][3],
+                           (r == 3 ? "" : ""));
+        }
+        return ctx.out();
+    }
+};
 
 template <typename T>
 std::string VectorSliceToString(const std::vector<T>& v,
@@ -28,4 +43,3 @@ bool isPoplarEngineOptionsEnabled() {
     return (env != nullptr && std::string(env).find("autoReport") != std::string::npos);
 }
 
-}  // namespace radfoam::util

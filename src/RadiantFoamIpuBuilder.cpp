@@ -19,83 +19,131 @@ using ipu_utils::logger;
 using poplar::DebugContext;
 
 RadiantFoamIpuBuilder::RadiantFoamIpuBuilder(std::string h5_scene_file, bool loop_frames, bool debug)
-    : h5_file_(std::move(h5_scene_file)),
-    loop_frames_(loop_frames),
-    debug_(debug) {
-        exec_counter_ = 0;
-    }
+  : h5_file_(std::move(h5_scene_file)),
+  loop_frames_(loop_frames),
+  debug_(debug) {
+      exec_counter_ = 0;
+}
 
 void RadiantFoamIpuBuilder::updateViewMatrix(const glm::mat4& m) {
-    const float* ptr = glm::value_ptr(m);
-    for (size_t i = 0; i < 16; ++i) {
-        hostViewMatrix_[i] = ptr[i];
-    }
+  const float* ptr = glm::value_ptr(m);
+  for (size_t i = 0; i < 16; ++i) {
+    hostViewMatrix_[i] = ptr[i];
+  }
 }
 
 void RadiantFoamIpuBuilder::updateProjectionMatrix(const glm::mat4& m) {
-    const float* ptr = glm::value_ptr(m);
-    for (size_t i = 0; i < 16; ++i) {
-        hostProjMatrix_[i] = ptr[i];
-    }
+  const float* ptr = glm::value_ptr(m);
+  for (size_t i = 0; i < 16; ++i) {
+    hostProjMatrix_[i] = ptr[i];
+  }
 }
 
 void RadiantFoamIpuBuilder::updateCameraCell(const GenericPoint& cell) {
-    hostCameraCellInfo_[0] = static_cast<uint8_t>( cell.cluster_id        & 0xFF);
-    hostCameraCellInfo_[1] = static_cast<uint8_t>((cell.cluster_id >> 8)  & 0xFF);
-    hostCameraCellInfo_[2] = static_cast<uint8_t>( cell.local_id          & 0xFF);
-    hostCameraCellInfo_[3] = static_cast<uint8_t>((cell.local_id   >> 8)  & 0xFF);
+  hostCameraCellInfo_[0] = static_cast<uint8_t>( cell.cluster_id        & 0xFF);
+  hostCameraCellInfo_[1] = static_cast<uint8_t>((cell.cluster_id >> 8)  & 0xFF);
+  hostCameraCellInfo_[2] = static_cast<uint8_t>( cell.local_id          & 0xFF);
+  hostCameraCellInfo_[3] = static_cast<uint8_t>((cell.local_id   >> 8)  & 0xFF);
+}
+
+void RadiantFoamIpuBuilder::updateCameraParameters(const InterfaceServer::State& state) {
+  // Update (inverse) projection matrix
+  constexpr float aspectRatio = static_cast<float>(kFullImageWidth) / static_cast<float>(kFullImageHeight);
+  constexpr float nearPlane = 0.1f;
+  constexpr float farPlane = 100.0f;
+  glm::mat4 ProjectionMatrix = glm::perspective(state.fov, aspectRatio, nearPlane, farPlane);
+  glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
+  this->updateProjectionMatrix(inverseProj);
+
+  // Update (inverse) view matrix
+  float yaw   = glm::radians(state.envRotationDegrees);
+  float pitch = glm::radians(state.envRotationDegrees2);
+
+  float maxVal = 40, minVal = -40;
+  float x = minVal + state.X * (maxVal - minVal);
+  float y = minVal + state.Y * (maxVal - minVal);
+  float z = minVal + state.Z * (maxVal - minVal);
+  
+  glm::vec3 position(x, y, z);
+  fmt::print("P:({},{},{}) yaw:{} pitch:{}\n", x, y, z, state.envRotationDegrees, state.envRotationDegrees2);
+  glm::mat4 view = glm::lookAt(
+    position,
+    position + glm::vec3(0.0f, 0.0f, -1.0f),
+    glm::vec3(0.0f, 1.0f, 0.0f)
+  );
+
+  // forward vector from yaw & pitch
+  // glm::vec3 forward;
+  // forward.x = cos(pitch) * cos(yaw);
+  // forward.y = sin(pitch);
+  // forward.z = cos(pitch) * sin(yaw);
+  // forward   = glm::normalize(forward);
+
+  // glm::mat4 view = glm::lookAt(position, position + forward, glm::vec3(0,1,0));
+
+  view = glm::rotate(view, yaw, glm::vec3(0.0f, 1.0f, 0.0f));
+  view = glm::rotate(view, pitch, glm::vec3(1.0f, 0.0f, 0.0f));
+  // view = glm::rotate(view, glm::radians(152.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+
+  glm::mat4 inverseView = glm::inverse(view);
+  cameraPosition_ = glm::vec3(inverseView[3]);
+  this->updateViewMatrix(inverseView);
+}
+
+glm::vec3 RadiantFoamIpuBuilder::getCameraPos() {
+  return cameraPosition_;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  build() – graph construction (called exactly once)
 // ─────────────────────────────────────────────────────────────────────────────
 void RadiantFoamIpuBuilder::build(poplar::Graph& g, const poplar::Target&) {
-    RF_LOG("Building RadiantFoam graph");
+  RF_LOG("Building RadiantFoam graph");
 
-    loadScenePartitions();
-    registerCodeletsAndOps(g);
-    allocateGlobalTensors(g);
+  loadScenePartitions();
+  registerCodeletsAndOps(g);
+  allocateGlobalTensors(g);
 
-    // Build: tracers + routers + generator all live in one compute set.
-    poplar::ComputeSet cs = g.addComputeSet("RayTraceCS");
-    // poplar::ComputeSet cs2 = g.addComputeSet("RayTraceCS");
-    buildRayTracers(g, cs);
-    buildRayRoutersL0(g, cs);
-    buildRayRoutersL1(g, cs);
-    buildRayRoutersL2(g, cs);
-    buildRayRoutersL3(g, cs);
-    buildRayRoutersL4(g, cs);
-    buildRayGenerator(g, cs);
+  // Build: tracers + routers + generator all live in one compute set.
+  poplar::ComputeSet cs = g.addComputeSet("RayTraceCS");
+  // poplar::ComputeSet cs2 = g.addComputeSet("RayTraceCS");
+  buildRayTracers(g, cs);
+  buildRayRoutersL0(g, cs);
+  buildRayRoutersL1(g, cs);
+  buildRayRoutersL2(g, cs);
+  buildRayRoutersL3(g, cs);
+  buildRayRoutersL4(g, cs);
+  buildRayGenerator(g, cs);
 
-    // Inter-stage data exchange
-    poplar::program::Sequence dataExchangeSeq = buildDataExchange(g);
+  // Inter-stage data exchange
+  poplar::program::Sequence dataExchangeSeq = buildDataExchange(g);
 
-    setupHostStreams(g);
+  setupHostStreams(g);
 
-    auto frameFenceStream_ = g.addDeviceToHostFIFO("frame-fence", poplar::UNSIGNED_INT, 1);
-    auto rgExec = exec_counts_.get().slice({kNumRayTracerTiles},{kNumRayTracerTiles+1}).reshape({}); // 1 x UINT
-    // batch frames: (compute set -> exchange) x kSubsteps then host copy
-    // no batching: compute set -> exchange -> host copy
-    poplar::program::Sequence frame_;
-    frame_.add(broadcastMatrices_);
-    if(kSubsteps == 1) {
-      frame_.add(poplar::program::Execute(cs));
-      frame_.add(dataExchangeSeq);
-    } else {
-      poplar::program::Sequence substepProgram;
-      substepProgram.add(poplar::program::Execute(cs));
-      substepProgram.add(dataExchangeSeq);
-      frame_.add(poplar::program::Repeat(kSubsteps, substepProgram));
-    }
-    frame_.add(framebuffer_read_.buildRead(g,true));
-    frame_.add(poplar::program::Copy(rgExec, frameFenceStream_));
-    getPrograms().add("frame", frame_);
+  auto frameFenceStream_ = g.addDeviceToHostFIFO("frame-fence", poplar::UNSIGNED_INT, 1);
+  auto rgExec = exec_counts_.get().slice({kNumRayTracerTiles},{kNumRayTracerTiles+1}).reshape({}); // 1 x UINT
+  // batch frames: (compute set -> exchange) x kSubsteps then host copy
+  // no batching: compute set -> exchange -> host copy
+  poplar::program::Sequence frame_;
+  frame_.add(broadcastMatrices_);
+  if(kSubsteps == 1) {
+    frame_.add(poplar::program::Execute(cs));
+    frame_.add(dataExchangeSeq);
+  } else {
+    poplar::program::Sequence substepProgram;
+    substepProgram.add(poplar::program::Execute(cs));
+    substepProgram.add(dataExchangeSeq);
+    frame_.add(poplar::program::Repeat(kSubsteps, substepProgram));
+  }
+  frame_.add(framebuffer_read_.buildRead(g,true));
+  frame_.add(poplar::program::Copy(rgExec, frameFenceStream_));
+  getPrograms().add("frame", frame_);
 
-    // RepeatWhileTrue program setup
-    // called once from main and loop frame program until stopflag is enabled
-    auto condProgram = stopFlag_.buildWrite(g, true);
-    auto frameLoopProgram = poplar::program::RepeatWhileTrue(condProgram, stopFlag_.get(), frame_);
-    getPrograms().add("frame_loop", frameLoopProgram);
+  // RepeatWhileTrue program setup
+  // called once from main and loop frame program until stopflag is enabled
+  auto condProgram = stopFlag_.buildWrite(g, true);
+  auto frameLoopProgram = poplar::program::RepeatWhileTrue(condProgram, stopFlag_.get(), frame_);
+  getPrograms().add("frame_loop", frameLoopProgram);
 }
 
 // ----------------------------------------------------------------------------
@@ -109,8 +157,8 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
             fmt::format("frame_{:03d}/write_scene_data", exec_counter_));
         eng.run(getPrograms().getOrdinals().at("broadcast_matrices"),
             fmt::format("frame_{:03d}/broadcast_matrices", exec_counter_));
-        eng.run(getPrograms().getOrdinals().at("write_camera_cell_info"),
-            fmt::format("frame_{:03d}/write_camera_cell_info", exec_counter_));
+        // eng.run(getPrograms().getOrdinals().at("write_camera_cell_info"),
+        //     fmt::format("frame_{:03d}/write_camera_cell_info", exec_counter_));
 
         if(loop_frames_ == true)
           eng.run(getPrograms().getOrdinals().at("frame_loop"));
@@ -119,8 +167,8 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
     if(loop_frames_ == false)
       eng.run(getPrograms().getOrdinals().at("frame"), fmt::format("frame_{:03d}", exec_counter_));
     
-    // if(debug_)
-    //   readAllTiles(eng);
+    if(debug_)
+      readAllTiles(eng);
 
     exec_counter_++;
 }
@@ -224,6 +272,9 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
     SetInit<uint8_t>(g, rayTracerOutputRays_,  0xFF);
     SetInit<uint8_t>(g, rayTracerInputRays_,  0xFF);
 
+    rtDebugRead_.buildTensor(g, poplar::UNSIGNED_CHAR,{kNumRayTracerTiles, kRayTracerDebugSize});
+    poputil::mapTensorLinearlyWithOffset(g, rtDebugRead_.get().reshape({kNumRayTracerTiles, kRayTracerDebugSize}), 0);
+
     std::vector<poplar::Tensor> viewDests;  
     viewDests.reserve(kNumRayTracerTiles);
 
@@ -318,6 +369,11 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
         g.connect(v["sharedCounts"], sharedCounts);
         g.connect(v["sharedOffsets"], sharedOffsets);
         g.connect(v["readyFlags"], readyFlags);
+
+        auto dbgSlice = rtDebugRead_.get()
+                         .slice({tid,0},{tid+1,kRayTracerDebugSize})
+                         .reshape({kRayTracerDebugSize});
+        g.connect(v["debugBytes"], dbgSlice);
 
         per_tile_writes_.add(in_local.buildWrite(g, true));
         per_tile_writes_.add(in_nbr  .buildWrite(g, true));
@@ -799,7 +855,8 @@ void RadiantFoamIpuBuilder::buildRayGenerator(poplar::Graph& g, poplar::ComputeS
     cameraCellInfo_.buildTensor(g, poplar::UNSIGNED_CHAR,{4});
     g.setTileMapping(cameraCellInfo_.get(),kRaygenTile);
     g.connect(v["camera_cell_info"], cameraCellInfo_.get());
-    getPrograms().add("write_camera_cell_info", cameraCellInfo_.buildWrite(g,true));
+    // getPrograms().add("write_camera_cell_info", cameraCellInfo_.buildWrite(g,true));
+    broadcastMatrices_.add(cameraCellInfo_.buildWrite(g, true));
     
     auto raygen_exec = exec_counts_.get().slice({kNumRayTracerTiles},{kNumRayTracerTiles+1}).reshape({});
     g.connect(v["exec_count"], raygen_exec);
@@ -1038,6 +1095,8 @@ void RadiantFoamIpuBuilder::setupHostStreams(poplar::Graph& g) {
     getPrograms().add("read_result_f32", result_f32_read_.buildRead(g,true));    
     result_u16_host.resize(kNumRayTracerTiles);
     getPrograms().add("read_result_u16", result_u16_read_.buildRead(g,true));
+    rtDebugBytesHost_.resize(kNumRayTracerTiles * kRayTracerDebugSize);
+    getPrograms().add("read_rt_debug_bytes", rtDebugRead_.buildRead(g,true));
     l0routerDebugBytesHost_.resize(kNumL0RouterTiles * kRouterDebugSize);
     getPrograms().add("read_l0_router_debug_bytes", l0routerDebugRead_.buildRead(g,true));
     l1routerDebugBytesHost_.resize(kNumL1RouterTiles * kRouterDebugSize);
@@ -1072,6 +1131,7 @@ void RadiantFoamIpuBuilder::connectHostStreams(poplar::Engine& eng) {
     // finishedRaysRead_.connectReadStream(eng, finishedRaysHost_.data());
     eng.connectStream("read-finished-rays-stream", finishedRaysHost_.data(), finishedRaysHost_.data() + finishedRaysHost_.size());
 
+    rtDebugRead_.connectReadStream(eng, rtDebugBytesHost_.data());
     l0routerDebugRead_.connectReadStream(eng, l0routerDebugBytesHost_.data());
     l1routerDebugRead_.connectReadStream(eng, l1routerDebugBytesHost_.data());
     l2routerDebugRead_.connectReadStream(eng, l2routerDebugBytesHost_.data());
@@ -1092,9 +1152,9 @@ void RadiantFoamIpuBuilder::connectHostStreams(poplar::Engine& eng) {
 //  readAllTiles() – simple helper to print data for debugging
 // ----------------------------------------------------------------------------
 void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
-    // eng.run(getPrograms().getOrdinals().at("framebuffer_read"));
     eng.run(getPrograms().getOrdinals().at("read_result_f32"));
     eng.run(getPrograms().getOrdinals().at("read_result_u16"));
+    eng.run(getPrograms().getOrdinals().at("read_rt_debug_bytes"));
     eng.run(getPrograms().getOrdinals().at("read_l0_router_debug_bytes"));
     eng.run(getPrograms().getOrdinals().at("read_l1_router_debug_bytes"));
     eng.run(getPrograms().getOrdinals().at("read_l2_router_debug_bytes"));
@@ -1108,44 +1168,44 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
     constexpr unsigned kShift = 10;
 
     // Cell tracking
-    // for (int tid = 0; tid < 1024; ++tid) {
-    //     const size_t offset = static_cast<size_t>(tid) * kTileFramebufferSize;
-    //     uint8_t cnt = framebuffer_host[offset];
+    for (int tid = 0; tid < 1024; ++tid) {
+        const size_t offset = static_cast<size_t>(tid) * kRayTracerDebugSize;
+        uint8_t cnt = rtDebugBytesHost_[offset];
 
-    //     if (cnt > 0) {
-    //         // Print summary for this tile
-    //         RF_LOG("Tile {}({}) result f32: {:.9f}, u16: {}", tid, tid/4,
-    //             result_f32_host[tid], result_u16_host[tid]);
+        if (cnt > 0) {
+            // Print summary for this tile
+            RF_LOG("Tile {}({}) result f32: {:.9f}, u16: {}", tid, tid/4,
+                result_f32_host[tid], result_u16_host[tid]);
 
-    //         // Iterate through points written in framebuffer
-    //         // for (uint8_t i = 1; i <= cnt; ++i) {
-    //         //     uint16_t x = (framebuffer_host[offset + i * 6] << 8) |
-    //         //                     framebuffer_host[offset + i * 6 + 1];
-    //         //     uint16_t y = (framebuffer_host[offset + i * 6 + 2] << 8) |
-    //         //                     framebuffer_host[offset + i * 6 + 3];
-    //         //     auto x_data = x & ~kLeadMask;
-    //         //     auto x_cluster_cnt = (x & kLeadMask) >> kShift;
-    //         //     uint16_t pt_idx = (framebuffer_host[offset + i * 6 + 4] << 8) |
-    //         //                     framebuffer_host[offset + i * 6 + 5];
+            // Iterate through points written in framebuffer
+            for (uint8_t i = 1; i <= cnt; ++i) {
+                uint16_t x = (rtDebugBytesHost_[offset + i * 6] << 8) |
+                                rtDebugBytesHost_[offset + i * 6 + 1];
+                uint16_t y = (rtDebugBytesHost_[offset + i * 6 + 2] << 8) |
+                                rtDebugBytesHost_[offset + i * 6 + 3];
+                auto x_data = x & ~kLeadMask;
+                auto x_cluster_cnt = (x & kLeadMask) >> kShift;
+                uint16_t pt_idx = (rtDebugBytesHost_[offset + i * 6 + 4] << 8) |
+                                rtDebugBytesHost_[offset + i * 6 + 5];
 
-    //         //     if (pt_idx < local_pts_[tid].size()) {
-    //         //         const auto &pt = local_pts_[tid][pt_idx];
-    //         //         fmt::print("[{}] ({}, {}) {}: {:4} → ({:8.6f}, {:8.6f}, {:8.6f})\n",
-    //         //                 i, x_data, y, x_cluster_cnt, pt_idx, pt.x, pt.y, pt.z);
-    //         //     } else {
-    //         //         fmt::print("[{}]: {:4} → (INVALID INDEX)\n",
-    //         //                 i, pt_idx);
-    //         //     }
+                if (pt_idx < local_pts_[tid].size()) {
+                    const auto &pt = local_pts_[tid][pt_idx];
+                    fmt::print("[{}] ({}, {}) {}: {:4} → ({:8.6f}, {:8.6f}, {:8.6f})\n",
+                            i, x_data, y, x_cluster_cnt, pt_idx, pt.x, pt.y, pt.z);
+                } else {
+                    fmt::print("[{}]: {:4} → (INVALID INDEX)\n",
+                            i, pt_idx);
+                }
 
-    //         //     ++overall_cntr;
-    //         // }
-    //     }
-    // }
+                ++overall_cntr;
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------------
     //  Router-lane saturation test
     // -----------------------------------------------------------------------------
-    constexpr std::uint16_t kWarnCap        = 2300;  // threshold
+    constexpr std::uint16_t kWarnCap        = 2000;  // threshold
     constexpr int           kWordsPerRouter = kRouterDebugSize;    // 0..4 = IN  / 5..9 = OUT
 
     auto dumpRouters =
@@ -1168,12 +1228,12 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
                                     [](std::uint16_t v){ return v > kWarnCap; });
 
             // if (over || lvl == "RG" || w[11] == 1)
-            if (over || w[11] == 999)
+            if (over || lvl == "RG")
             {
               if(lvl == "RG" && w[9] != 0)
                 fmt::print("{} router {:4}: "
-                    "In: {:4}  {:4}  {:4}  {:4} {:4} {:4}\t"
-                    "Out: {:4}  {:4}  {:4}  {:4} {:4}====================================================\n",
+                    "In: {:4}  {:4}  {:4}  {:4} {:4}\t"
+                    "Out: {:4}  {:4}  {:4}  {:4} {:4}\n",
                     lvl, rid,
                     w[0], w[1], w[2], w[3], w[4],
                     w[5], w[6], w[7], w[8], w[9]);

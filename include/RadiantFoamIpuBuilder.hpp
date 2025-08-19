@@ -22,6 +22,7 @@
 #include <poplar/Engine.hpp>
 #include <popops/codelets.hpp>
 #include <poputil/TileMapping.hpp>
+#include <remote_ui/InterfaceServer.hpp>
 
 // Local
 #include "ipu/rf_config.hpp"
@@ -44,6 +45,8 @@ public:
     void updateViewMatrix(const glm::mat4& view);
     void updateProjectionMatrix(const glm::mat4& proj);
     void updateCameraCell(const radfoam::geometry::GenericPoint& cell);
+    void updateCameraParameters(const InterfaceServer::State& state);
+    glm::vec3 getCameraPos();
 
     // Host‑visible frame results -------------------------------------------
     std::vector<uint8_t>  finishedRaysHost_;
@@ -76,8 +79,9 @@ private:
     const std::string h5_file_;
     bool debug_;
     bool loop_frames_;
-    static constexpr int kSubsteps = 24;
+    static constexpr int kSubsteps = 15;
     static constexpr int kRouterDebugSize = 15;
+    static constexpr int kRayTracerDebugSize = 600;
 
     // Scene data -------------------------------------------------------------
     std::vector<std::vector<radfoam::geometry::LocalPoint>>   local_pts_;
@@ -112,6 +116,7 @@ private:
     ipu_utils::StreamableTensor viewMatrix_{"view_matrix"};
     ipu_utils::StreamableTensor projMatrix_{"proj_matrix"};
     ipu_utils::StreamableTensor cameraCellInfo_{"camera_cell_info"};
+    ipu_utils::StreamableTensor rtDebugRead_{"rt_debug_bytes_read"};
     ipu_utils::StreamableTensor l0routerDebugRead_{"l0_router_debug_bytes_read"};
     ipu_utils::StreamableTensor l1routerDebugRead_{"l1_router_debug_bytes_read"};
     ipu_utils::StreamableTensor l2routerDebugRead_{"l2_router_debug_bytes_read"};
@@ -127,9 +132,11 @@ private:
 
     // CPU‑side mirrors -------------------------------------------------------
     int exec_counter_;
+    glm::vec3 cameraPosition_;
     std::vector<float> hostViewMatrix_;
     std::vector<float> hostProjMatrix_;
     std::array<uint8_t, 4> hostCameraCellInfo_{{0,0,0,0}};
+    std::vector<uint8_t> rtDebugBytesHost_;
     std::vector<unsigned> l0routerDebugBytesHost_;
     std::vector<unsigned> l1routerDebugBytesHost_;
     std::vector<unsigned> l2routerDebugBytesHost_;

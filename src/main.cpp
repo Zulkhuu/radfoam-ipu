@@ -189,53 +189,41 @@ size_t CountNonZeroPixels(const cv::Mat& img) {
     return static_cast<size_t>(cv::countNonZero(mask));
 }
 
-static cv::Mat AssembleFinishedRaysImageRGBOnly(const std::vector<uint8_t>& finishedRaysHost) {
-    static cv::Mat rgb_img(kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0, 0, 0));
-
-    const size_t numFinishedRays = finishedRaysHost.size() / sizeof(FinishedRay);
-    const FinishedRay* rays = reinterpret_cast<const FinishedRay*>(finishedRaysHost.data());
-    const size_t num_finished_ray_per_tile = (kNumRayTracerTiles > 0)
-        ? (numFinishedRays / kNumRayTracerTiles)
-        : 0;
-
-    const int W = kFullImageWidth;
-    const int H = kFullImageHeight;
-    const size_t rgb_step = rgb_img.step;
-    uchar* const rgb_data = rgb_img.data;
-
-    #pragma omp parallel for schedule(static)
-    for (ptrdiff_t tid = 0; tid < static_cast<ptrdiff_t>(kNumRayTracerTiles); ++tid) {
-        const FinishedRay* tileRays = rays + tid * num_finished_ray_per_tile;
-
-        const int NW = 6;
-        const int kRayPerWorker = num_finished_ray_per_tile / NW;
-        for (int wid = 0; wid < NW; wid++) {
-            for (size_t i = wid * kRayPerWorker; i < (wid + 1) * kRayPerWorker; ++i) {
-                const FinishedRay& r = tileRays[i];
-
-                if (r.x == 0xFFFF) continue;
-                if (r.x >= static_cast<uint16_t>(W) || r.y >= static_cast<uint16_t>(H)) continue;
-
-                const size_t off_rgb = static_cast<size_t>(r.y) * rgb_step + static_cast<size_t>(r.x) * 3;
-                uchar* const dst_rgb = rgb_data + off_rgb;
-                dst_rgb[0] = r.b;
-                dst_rgb[1] = r.g;
-                dst_rgb[2] = r.r;
-            }
-        }
-    }
-
-    return rgb_img;
-}
-
-static glm::mat4 UpdateProjection(float fovRadians,
-                                  float aspect,
-                                  float nearPlane = 0.1f,
-                                  float farPlane  = 100.0f) {
-    return glm::perspective(fovRadians, aspect, nearPlane, farPlane);
-}
-
 int main(int argc, char** argv) {
+  // {
+  //   float yaw   = glm::radians(126.0);
+  //   float pitch = glm::radians(150.0);
+  //   float x = 0, y= 0, z = 5.51;
+  //   glm::vec3 position(x, y, z);
+
+  //   fmt::print("P:({},{},{}) yaw:{} pitch:{}\n", x, y, z, yaw, pitch);
+  //   // forward vector from yaw & pitch
+  //   // glm::vec3 forward;
+  //   // forward.x = cos(pitch) * cos(yaw);
+  //   // forward.y = sin(pitch);
+  //   // forward.z = cos(pitch) * sin(yaw);
+  //   // forward   = glm::normalize(forward);
+
+  //   // glm::mat4 view = glm::lookAt(position, position + forward, glm::vec3(0,1,0));
+  //   glm::mat4 view = glm::lookAt(position, 
+  //     position + glm::vec3(0.0f, 0.0f, -1.0f),
+  //     glm::vec3(0.0f, 1.0f, 0.0f));
+  //   view = glm::rotate(view, yaw, glm::vec3(0.0f, 1.0f, 0.0f));
+  //   view = glm::rotate(view, pitch, glm::vec3(1.0f, 0.0f, 0.0f));
+      
+  //   glm::mat4 ViewMatrix = glm::mat4(
+  //     glm::vec4(-0.034899458f,  0.000000000f, -0.999390781f, 0.000000000f),
+  //     glm::vec4( 0.484514207f, -0.874619782f, -0.016919592f, 0.000000000f),
+  //     glm::vec4(-0.874086976f, -0.484809548f,  0.030523760f, 0.000000000f),
+  //     glm::vec4(-0.000000000f, -0.000000000f, -6.699999809f, 1.000000000f)
+  //   );
+  //   // glm::mat4 inverseView = glm::inverse(ViewMatrix);
+  //   glm::mat4 inverseView = glm::inverse(view);
+  //   fmt::print("View matrix:\n {}", ViewMatrix);
+  //   fmt::print("View :\n {}", view);
+  // }
+  // return 0;
+
   pvti::TraceChannel traceChannel = {"RadiantFoamIpu"};
 
   cxxopts::Options options("radiantfoam_ipu", "RadiantFoam IPU Renderer");
@@ -259,8 +247,8 @@ int main(int argc, char** argv) {
   std::string inputFile = result["input"].as<std::string>();
   int nRuns = result["nruns"].as<int>();
   int vis_mode = 0;
-  bool dynamic_camera = false;
-  int inital_camera_pos = 1;
+  bool dynamic_camera = true;
+  int inital_camera_pos = 0;
   bool enableUI = !result["no-ui"].as<bool>();
   bool enableLoopIPU = result["ipu-loop"].as<bool>();
   bool enableDebug = result["debug"].as<bool>();
@@ -276,13 +264,6 @@ int main(int argc, char** argv) {
       glm::vec4(-0.874086976f, -0.484809548f,  0.030523760f, 0.000000000f),
       glm::vec4(-0.000000000f, -0.000000000f, -6.699999809f, 1.000000000f)
     );
-
-    ProjectionMatrix = glm::mat4(
-      glm::vec4(1.299038053f, 0.000000000f,  0.000000000f,  0.000000000f),
-      glm::vec4(0.000000000f, 1.732050657f,  0.000000000f,  0.000000000f),
-      glm::vec4(0.000000000f, 0.000000000f, -1.002002001f, -1.000000000f),
-      glm::vec4(0.000000000f, 0.000000000f, -0.200200200f,  0.000000000f)
-    );
     camera_cell = { 6.6959f, -0.1134f,  0.2045f,
       static_cast<uint16_t>(60),   // cluster_id
       static_cast<uint16_t>(2476)   // local_id
@@ -295,14 +276,7 @@ int main(int argc, char** argv) {
       glm::vec4(-0.067882277f, -0.726565778f, -0.683735430f, 0.000000000f),
       glm::vec4( 0.071781643f, -0.687096834f,  0.723011255f, 0.000000000f),
       glm::vec4( 0.206200063f,  1.675502419f, -3.500002146f, 1.000000000f)
-    );
-    ProjectionMatrix = glm::mat4(
-      glm::vec4(1.299038053f, 0.000000000f,  0.000000000f,  0.000000000f),
-      glm::vec4(0.000000000f, 1.732050657f,  0.000000000f,  0.000000000f),
-      glm::vec4(0.000000000f, 0.000000000f, -1.002002001f, -1.000000000f),
-      glm::vec4(0.000000000f, 0.000000000f, -0.200200200f,  0.000000000f)
-    );
-  
+    );  
     camera_cell = radfoam::geometry::GenericPoint{
       0.6503f, -1.2979f,  3.3524f, 
       static_cast<uint16_t>(779),   // cluster_id
@@ -313,18 +287,18 @@ int main(int argc, char** argv) {
   glm::mat4 inverseView = glm::inverse(ViewMatrix);
   glm::vec3 cameraPos = glm::vec3(inverseView[3]);
 
+  KDTreeManager kdtree(inputFile);
+  camera_cell = kdtree.getNearestNeighbor(cameraPos);
+  fmt::print("Camera position ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
+    cameraPos.x, cameraPos.y, cameraPos.z);
+  fmt::print("Closest Point to Camera:\n"
+    "  Cluster: {:>5}\n"
+    "  Local  : {:>5}\n"
+              "  Position: ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
+              camera_cell.cluster_id, camera_cell.local_id, 
+              camera_cell.x, camera_cell.y, camera_cell.z);
   if(dynamic_camera){
-    KDTreeManager kdtree(inputFile);
     
-    camera_cell = kdtree.getNearestNeighbor(cameraPos);
-    fmt::print("Camera position ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
-      cameraPos.x, cameraPos.y, cameraPos.z);
-    fmt::print("Closest Point to Camera:\n"
-      "  Cluster: {:>5}\n"
-      "  Local  : {:>5}\n"
-    						"  Position: ({:>8.4f}, {:>8.4f}, {:>8.4f})\n",
-    						camera_cell.cluster_id, camera_cell.local_id, 
-    						camera_cell.x, camera_cell.y, camera_cell.z);
   }
   
 
@@ -381,7 +355,7 @@ int main(int argc, char** argv) {
 
   std::unique_ptr<InterfaceServer> uiServer;
   InterfaceServer::State state;
-  state.fov    = glm::radians(40.f);
+  state.fov    = glm::radians(60.f);
 
   if (enableUI && uiPort) {
     uiServer = std::make_unique<InterfaceServer>(uiPort);
@@ -400,6 +374,7 @@ int main(int argc, char** argv) {
     }
   };
   
+
   std::cout << "IPU process started" << std::endl;
   auto startTime = std::chrono::steady_clock::now();
   const size_t totalPixels = kFullImageWidth * kFullImageHeight;
@@ -419,21 +394,9 @@ int main(int argc, char** argv) {
         break;
       }
       
-      ProjectionMatrix = UpdateProjection(
-        state.fov,
-        static_cast<float>(kFullImageWidth) / static_cast<float>(kFullImageHeight),
-        0.1f,
-        100.0f
-      );
-      glm::mat4 inverseView = glm::inverse(ViewMatrix);
-      glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
-      glm::vec3 cameraPos = glm::vec3(inverseView[3]);
-      // // if(dynamic_camera) {
-      // //   auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
-      // // }
-
-      builder.updateViewMatrix(inverseView);
-      builder.updateProjectionMatrix(inverseProj);
+      builder.updateCameraParameters(state);
+      auto camera_position = builder.getCameraPos();
+      auto camera_cell = kdtree.getNearestNeighbor(camera_position);
       builder.updateCameraCell(camera_cell);
 
       if (enableUI) {
@@ -494,15 +457,10 @@ int main(int argc, char** argv) {
       if(step==nRuns) {
         break;
       }
-      glm::mat4 inverseView = glm::inverse(ViewMatrix);
-      glm::mat4 inverseProj = glm::inverse(ProjectionMatrix);
-      glm::vec3 cameraPos = glm::vec3(inverseView[3]);
-      // if(dynamic_camera) {
-      //   auto camera_cell = kdtree.getNearestNeighbor(cameraPos);
-      // }
-
-      builder.updateViewMatrix(inverseView);
-      builder.updateProjectionMatrix(inverseProj);
+            
+      builder.updateCameraParameters(state);
+      auto camera_position = builder.getCameraPos();
+      auto camera_cell = kdtree.getNearestNeighbor(camera_position);
       builder.updateCameraCell(camera_cell);
 
       if (enableUI) {
@@ -533,8 +491,7 @@ int main(int argc, char** argv) {
           double elapsedSec = std::chrono::duration<double>(now - startTime).count();
           std::cout << "Full image updated in " << elapsedSec << " seconds." << std::endl;
           fullImageUpdated = true;
-          builder.stopFlagHost_ = 0;
-          break;
+          // break;
         }
       }
 

@@ -27,7 +27,6 @@ struct alignas(4) FinishedPixel {
   uint8_t r, g, b, a;
   float t;
 };
-struct Mat4Rows { float r[4][4]; };
 
 inline constexpr uint16_t kLeadMask   = 0xFC00u;   // 11111 00000000000₂
 inline constexpr uint8_t kShift = 10;  
@@ -53,6 +52,7 @@ public:
   // Debug outputs
   poplar::Output<float> result_float;
   poplar::Output<unsigned short> result_u16;
+  poplar::Output<poplar::Vector<uint8_t>> debugBytes;
 
   // InOut
   poplar::InOut<poplar::Vector<uint8_t>> framebuffer;
@@ -103,8 +103,6 @@ public:
     // Setup matrices
     glm::mat4 invView = glm::make_mat4(view_matrix.data());
     glm::mat4 invProj = glm::make_mat4(projection_matrix.data());
-    const Mat4Rows invViewR = loadRows(view_matrix);
-    const Mat4Rows invProjR = loadRows(projection_matrix);
 
     glm::vec3 rayOrigin = glm::vec3(invView[3]);
     const uint16_t myTile = *tile_id;
@@ -113,6 +111,10 @@ public:
     unsigned localFinished = 0;
     unsigned localMaxSeenPlus1 = 0;
     uint16_t lastSeenIdx = 65533;
+    int cell_cntr = 0;
+    bool debug = false;
+    if(workerId == 0)
+      debugBytes[0] = cell_cntr & 0xFF;
     
     // helpers for tile ownership and local coords
     auto tileOfXY = [&](uint16_t x10, uint16_t y)->uint16_t {
@@ -172,8 +174,6 @@ public:
       // --- march ---
       // const uint16_t x10 = data10(in->x);
       glm::vec3 rayDir = computeRayDir(in->x, in->y, invProj, invView);
-      // glm::vec3 rayDir;
-      // computeRayDirFast(in->x, in->y, invProjR, invViewR, rayDir.x, rayDir.y, rayDir.z);
 
       glm::vec3 color(in->r, in->g, in->b);
       float transmittance = __builtin_ipu_f16tof32(in->transmittance);
@@ -198,6 +198,15 @@ public:
         float closestT = std::numeric_limits<float>::max();
         int   next     = -1;
 
+        if(debug && workerId==0) {
+          cell_cntr++;
+          debugBytes[6 * cell_cntr]     = static_cast<uint8_t>((in->x >> 8) & 0xFF);
+          debugBytes[6 * cell_cntr + 1] = static_cast<uint8_t>(in->x & 0xFF);
+          debugBytes[6 * cell_cntr + 2]     = static_cast<uint8_t>((in->y >> 8) & 0xFF);
+          debugBytes[6 * cell_cntr + 3] = static_cast<uint8_t>(in->y & 0xFF);
+          debugBytes[6 * cell_cntr + 4]     = static_cast<uint8_t>((current >> 8) & 0xFF);
+          debugBytes[6 * cell_cntr + 5] = static_cast<uint8_t>(current & 0xFF);
+        }
         for (uint16_t j = adjStart; j < adjEnd; ++j) {
           const uint16_t nbrIdx = adjacency[j];
           glm::vec3 p1;
@@ -223,11 +232,11 @@ public:
         }
 
         const float delta = closestT - t0;
-        // const float alpha = 1.f - __builtin_ipu_exp(-cur->density * delta);
-        const float x_ = cur->density * delta;
-        const float alpha = (x_ > -0.125f && x_ < 0.125f)
-                          ? (x_ - 0.5f*x_*x_)              // 2-term expm1 approx
-                          : (1.f - __builtin_ipu_exp(-x_));
+        const float alpha = 1.f - __builtin_ipu_exp(-cur->density * delta);
+        // const float x_ = cur->density * delta;
+        // const float alpha = (x_ > -0.125f && x_ < 0.125f)
+        //                   ? (x_ - 0.5f*x_*x_)              // 2-term expm1 approx
+        //                   : (1.f - __builtin_ipu_exp(-x_));
 
         const float ta    = transmittance * alpha;
 
@@ -235,7 +244,8 @@ public:
         color.y += ta * (cur->g / 255.f);
         color.z += ta * (cur->b / 255.f);
         transmittance   *= (1.f - alpha);
-        t0       = __builtin_ipu_max(t0, closestT);
+        // t0       = __builtin_ipu_max(t0, closestT);
+        t0       = closestT;
 
         // Finish or cross boundary?
         if (transmittance < 0.01f || next == -1 || next >= nLocalPts) {
@@ -251,6 +261,8 @@ public:
             out->next_cluster  = tileOfXY(in->x, in->y);   // << route to FB owner tile
             out->next_local  = FINISHED_RAY_ID;   //
             ++localFinished;
+            *result_u16 = FINISHED_RAY_ID;
+            *result_float = color.x;
           } else {
             // Cross to neighbor cluster
             const GenericPoint* nb = readStructAt<GenericPoint>(neighbor_pts, next - nLocalPts);
@@ -263,6 +275,9 @@ public:
             out->transmittance = __builtin_ipu_f32tof16(transmittance); //__builtin_ipu_max(0.f, __builtin_ipu_min(1.f, transmittance)));
             out->next_cluster  = nb->cluster_id;
             out->next_local    = nb->local_id;
+
+            *result_u16 = nb->cluster_id;
+            *result_float = color.x;
           }
           finished = true;
           break;
@@ -278,48 +293,18 @@ public:
       if (ray->next_cluster == INVALID_RAY_ID) break;
       ray->next_cluster = INVALID_RAY_ID;
     }
-    
+
+    if(debug && workerId==0){
+      debugBytes[0] = cell_cntr & 0xFF;
+    }
     if (workerId == 0) {
       *exec_count = *exec_count + 1;
-      *result_u16  = consumedFinishedOnThisTile; 
+      // *result_u16  = consumedFinishedOnThisTile; 
     }
     return true;
   }
 
 private:
-
-  [[gnu::always_inline]] Mat4Rows loadRows(const poplar::Input<poplar::Vector<float>>& M){
-    Mat4Rows R; const float* p=M.data();
-    #pragma unroll
-    for(int i=0;i<4;i++) for(int j=0;j<4;j++) R.r[i][j]=p[i*4+j];
-    return R;
-  }
-
-  [[gnu::always_inline]] void mul4(const Mat4Rows& A, const float v[4], float out[4]) {
-    #pragma unroll
-    for (int i=0;i<4;i++) {
-      float s = ipu::fma(A.r[i][0], v[0], A.r[i][3] * v[3]);
-      s = ipu::fma(A.r[i][1], v[1], s);
-      s = ipu::fma(A.r[i][2], v[2], s);
-      out[i] = s;
-    }
-  }
-
-  [[gnu::always_inline]]
-  void computeRayDirFast(uint16_t x, uint16_t y,
-                                      const Mat4Rows& invProj,
-                                      const Mat4Rows& invView,
-                                      float &dx, float &dy, float &dz) {
-    const float ndcX = (2.f * x) * (1.f/kFullImageWidth)  - 1.f;
-    const float ndcY = 1.f - (2.f * y) * (1.f/kFullImageHeight);
-    float clip[4] = { ndcX, ndcY, -1.f, 1.f }, eye[4], v[4];
-    mul4(invProj, clip, eye); eye[2] = -1.f; eye[3] = 0.f;
-    mul4(invView, eye, v);
-    float l2 = ipu::fma(v[0],v[0], ipu::fma(v[1],v[1], v[2]*v[2]));
-    float invL = ipu::rsqrt(l2);
-    dx = v[0]*invL; dy = v[1]*invL; dz = v[2]*invL;
-  }
-
   [[gnu::always_inline]]
   glm::vec3 computeRayDir(uint16_t x, uint16_t y, glm::mat4& invProj, glm::mat4& invView) {
     float ndcX = (2.0f * x) / kFullImageWidth - 1.0f;
@@ -456,12 +441,12 @@ public:
       else                  { ++drops;        } // ring full
     }
 
-    // ── 3) fill remaining with generated rays (simple column scan), queue rest
-    const unsigned interval = 1;
-    const bool genThisFrame = ((*exec_count % interval) == 0);
+    // ── 3) fill remaining with generated rays
     int raygen_mode = 1;
-    if (genThisFrame) {
-      if(raygen_mode == 0) {
+    if(raygen_mode == 0) {
+      const unsigned interval = 1;
+      const bool genThisFrame = ((*exec_count % interval) == 0);
+      if (genThisFrame) {
         const unsigned nRowsPerFrame = 1;
         const unsigned rowBase = ((*exec_count)/interval) * nRowsPerFrame;
 
@@ -487,7 +472,11 @@ public:
           }
         }
       }
-      if(raygen_mode == 1) {
+    }
+    if(raygen_mode == 1) {
+      const unsigned interval = 1;
+      const bool genThisFrame = ((*exec_count % interval) == 0);
+      if (genThisFrame) {
         const unsigned nColsPerFrame = 2;
         const unsigned colBase = ((*exec_count)/interval) * nColsPerFrame;
 
@@ -512,6 +501,25 @@ public:
             --budget;
           }
         }
+      }
+    }
+    if(raygen_mode == 2) {
+      const bool genThisFrame = (*exec_count  == 1);
+      if (genThisFrame) {
+        unsigned budget = (C - outCnt) + qFree(head, tail);
+        Ray g{};
+        g.r = g.g = g.b = 0.0f;
+        g.t = __builtin_ipu_f32tof16(0.0f);
+        g.transmittance = __builtin_ipu_f32tof16(1.0f);
+        g.next_cluster = cluster_id;
+        g.next_local   = local_id;
+        g.x = 200; 
+        g.y = 440;
+
+        if (emit(g, outCnt)) { ++genEmitted; }
+        else if (qPush(g))   { ++genQueued;  }
+        else                 { ++drops;      } 
+        --budget;
       }
     }
 
@@ -544,12 +552,263 @@ public:
   }
 };
 
+class RayGenMT : public poplar::MultiVertex {
+public:
+  // I/O (same tensors as before)
+  poplar::Input<poplar::Vector<uint8_t>>  RaysIn;    // from L4 parentOut (spillovers)
+  poplar::InOut<poplar::Vector<uint8_t>>  RaysOut;   // to   L4 parentIn
+
+  poplar::InOut<poplar::Vector<uint8_t>>  pendingRays; 
+  poplar::InOut<unsigned>                 pendingHead;
+  poplar::InOut<unsigned>                 pendingTail;
+
+  poplar::InOut<unsigned>                 exec_count;
+  poplar::Input<poplar::Vector<uint8_t>>  camera_cell_info;
+  poplar::InOut<poplar::Vector<unsigned>> debugBytes;
+
+  // Small shared scratch (like in your router)
+  poplar::InOut<poplar::Vector<unsigned>> sharedCounts;   // size >= NW
+  poplar::InOut<poplar::Vector<unsigned>> sharedOffsets;  // size >= 2*NW + 8 (we reuse slots by phase)
+  poplar::InOut<poplar::Vector<unsigned>> readyFlags;     // size >= NW
+
+  
+  // Tunables
+  inline static constexpr unsigned NW = 6;          // workers
+  inline static constexpr unsigned nColsPerFrame = 3; // your mode=1 default
+  
+  // ---- constraints (avoid aliasing) ----
+  [[poplar::constraint("elem(*RaysIn)!=elem(*RaysOut)")]]
+  [[poplar::constraint("elem(*RaysIn)!=elem(*pendingRays)")]]
+  [[poplar::constraint("elem(*RaysOut)!=elem(*pendingRays)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*sharedCounts)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*sharedOffsets)")]]
+  [[poplar::constraint("elem(*readyFlags)!=elem(*debugBytes)")]]
+  [[poplar::constraint("elem(*sharedCounts)!=elem(*sharedOffsets)")]]
+  [[poplar::constraint("elem(*sharedCounts)!=elem(*debugBytes)")]]
+  [[poplar::constraint("elem(*sharedOffsets)!=elem(*debugBytes)")]]  
+  bool compute(unsigned workerId) {
+    // Typed bases once
+    Ray*       __restrict out = reinterpret_cast<Ray*>(RaysOut.data());
+    const Ray* __restrict in  = reinterpret_cast<const Ray*>(RaysIn.data());
+    Ray*       __restrict pend= reinterpret_cast<Ray*>(pendingRays.data());
+
+    const uint16_t cluster_id = camera_cell_info[0] | (camera_cell_info[1] << 8);
+    const uint16_t local_id   = camera_cell_info[2] | (camera_cell_info[3] << 8);
+
+    const unsigned C = RaysOut.size()     / sizeof(Ray);
+    const unsigned P = pendingRays.size() / sizeof(Ray);
+    __builtin_assume(C > 0);
+
+    // Shared scratch views
+    unsigned* __restrict SC = sharedCounts.data();
+    unsigned* __restrict SO = sharedOffsets.data();
+    volatile unsigned* RF   = readyFlags.data();
+
+    // Barrier helper
+    auto barrier = [&](unsigned phase) {
+      RF[workerId] = phase;
+      asm volatile("" ::: "memory");
+      while (true) {
+        bool all = true;
+        for (unsigned i=0;i<NW;++i) if (RF[i] < phase) { all=false; break; }
+        if (all) break;
+      }
+      asm volatile("" ::: "memory");
+    };
+
+    // ------------------------------
+    // Phase 0: clear flags, set up
+    // ------------------------------
+    if (workerId==0) for (unsigned i=0;i<NW;++i) RF[i]=0;
+    barrier(1);
+
+    // ------------------------------
+    // Phase 1: PENDING (worker 0 only)
+    //   - Copy as many as fit head-packed at [0..emitPend-1]
+    //   - Update head locally (write back later)
+    // ------------------------------
+    unsigned head = *pendingHead;
+    unsigned tail = *pendingTail;
+
+    auto qNext  = [&](unsigned v)->unsigned { unsigned nv=v+1; return (nv==P)?0u:nv; };
+    auto qEmpty = [&](unsigned h,unsigned t)->bool { return h==t; };
+    auto qAvail = [&](unsigned h,unsigned t)->unsigned { return (t + P - h) % P; };
+
+    unsigned emitPend = 0;
+    unsigned newHead  = head;
+
+    if (workerId==0) {
+      const unsigned avail = qAvail(head, tail);
+      emitPend = (avail < C) ? avail : C;   // clamp
+      // Copy in up to two slices (ring wrap)
+      unsigned first = emitPend;
+      if (head + first > P) first = P - head;
+      // slice #1
+      for (rptsize_t i=0; i<(rptsize_t)first; ++i)
+        out[i] = pend[head + (unsigned)i];
+      // slice #2
+      unsigned rest = emitPend - first;
+      for (rptsize_t i=0; i<(rptsize_t)rest; ++i)
+        out[first + (unsigned)i] = pend[i];
+      newHead = (head + emitPend) % P;
+
+      SO[0] = emitPend;     // publish pending emitted
+    }
+    barrier(2);
+    emitPend = SO[0];
+
+    // ------------------------------
+    // Phase 2: SPILLOVERS (parallel)
+    // 2a) COUNT (worker-strided i = w, w+NW, ...)
+    // ------------------------------
+    unsigned mySpillCnt = 0;
+    for (rptsize_t i=(rptsize_t)workerId; i<(rptsize_t)C; i+=(rptsize_t)NW) {
+      const Ray* r = &in[(unsigned)i];
+      if (__builtin_expect(r->next_cluster == 0xFFFF /*INVALID_RAY_ID*/, 0)) break;
+      ++mySpillCnt;
+    }
+    SC[workerId] = mySpillCnt;
+    barrier(3);
+
+    // 2b) PREFIX + QUOTAS (worker 0)
+    unsigned spillEmitTot=0;
+    if (workerId==0) {
+      unsigned cap = (emitPend < C) ? (C - emitPend) : 0;
+      unsigned scan=0;
+      for (unsigned w=0; w<NW; ++w) {
+        unsigned take = (SC[w] < cap) ? SC[w] : cap;
+        SO[1 + w] = emitPend + scan; // start offset for worker w spill
+        scan += take;
+        cap  -= take;
+      }
+      spillEmitTot = scan;
+      SO[1 + NW] = spillEmitTot; // publish total spill emitted
+    }
+    barrier(4);
+    spillEmitTot = SO[1 + NW];
+    const unsigned mySpillStart = SO[1 + workerId];
+    unsigned mySpillLeft = (workerId==NW-1)
+        ? spillEmitTot - (mySpillStart - emitPend)      // last worker takes the tail
+        : SO[1 + workerId + 1] - mySpillStart;          // size = nextStart - myStart
+
+    // 2c) WRITE my quota in head-packed block
+    for (rptsize_t i=(rptsize_t)workerId, w=0; i<(rptsize_t)C && mySpillLeft; i+=(rptsize_t)NW) {
+      const Ray* r = &in[(unsigned)i];
+      if (__builtin_expect(r->next_cluster == 0xFFFF, 0)) break;
+      out[mySpillStart + (unsigned)w] = *r;
+      ++w;
+      --mySpillLeft;
+    }
+
+    barrier(5);
+
+    // ------------------------------
+    // Phase 3: GENERATION (parallel)
+    //   We keep your "columns" pattern; each worker counts rows in stride.
+    // ------------------------------
+    const unsigned interval = 1;
+    const bool genThisFrame = ((*exec_count % interval) == 0);
+
+    // Count how many this worker WOULD generate (unclamped)
+    unsigned myGenCnt = 0;
+    unsigned colBase = ((*exec_count)/interval) * nColsPerFrame;
+
+    if (genThisFrame) {
+      for (uint16_t cx=0; cx<nColsPerFrame; ++cx) {
+        const uint16_t x = (uint16_t)((colBase + cx) % kFullImageWidth);
+        // worker-strided rows
+        for (rptsize_t y = (rptsize_t)workerId; y < (rptsize_t)kFullImageHeight; y += (rptsize_t)NW)
+          ++myGenCnt;
+      }
+    }
+    SC[workerId] = myGenCnt;
+    barrier(6);
+
+    // Worker 0 computes gen quotas + base offset
+    unsigned genEmitTot = 0;
+    const unsigned baseGen = emitPend + spillEmitTot;
+    if (workerId==0) {
+      unsigned cap = (baseGen < C) ? (C - baseGen) : 0;
+      unsigned scan = 0;
+      for (unsigned w=0; w<NW; ++w) {
+        unsigned take = (SC[w] < cap) ? SC[w] : cap;
+        SO[2 + w] = baseGen + scan;  // start for worker w generation
+        scan += take;
+        cap  -= take;
+      }
+      genEmitTot = scan;
+      SO[2 + NW] = genEmitTot;
+    }
+    barrier(7);
+    genEmitTot = SO[2 + NW];
+    const unsigned myGenStart = SO[2 + workerId];
+    unsigned myGenLeft = (workerId==NW-1)
+        ? genEmitTot - (myGenStart - baseGen)
+        : SO[2 + workerId + 1] - myGenStart;
+
+    // Emit generation into assigned block
+    if (genThisFrame && myGenLeft) {
+      Ray g{};
+      g.r = g.g = g.b = 0.0f;
+      g.t = __builtin_ipu_f32tof16(0.0f);
+      g.transmittance = __builtin_ipu_f32tof16(1.0f);
+      g.next_cluster = cluster_id;
+      g.next_local   = local_id;
+
+      unsigned written = 0;
+      for (uint16_t cx=0; cx<nColsPerFrame && written < myGenLeft; ++cx) {
+        const uint16_t x = (uint16_t)((colBase + cx) % kFullImageWidth);
+        for (rptsize_t y=(rptsize_t)workerId; y<(rptsize_t)kFullImageHeight && written < myGenLeft; y+=(rptsize_t)NW) {
+          g.x = x; g.y = (uint16_t)y;
+          out[myGenStart + written] = g;
+          ++written;
+        }
+      }
+    }
+
+    barrier(8);
+
+    // ------------------------------
+    // Phase 4: Invalidate tail, persist ring indices, stats
+    // ------------------------------
+    const unsigned totalWritten = emitPend + spillEmitTot + genEmitTot;
+
+    if (workerId==0) {
+      // Invalidate [totalWritten .. C)
+      for (rptsize_t i=(rptsize_t)totalWritten; i<(rptsize_t)C; ++i) {
+        Ray* r = &out[(unsigned)i];
+        if (r->next_cluster == 0xFFFF) break;
+        r->next_cluster = 0xFFFF; // INVALID_RAY_ID
+      }
+      // Commit ring head (only after copy)
+      *pendingHead = newHead;
+
+      // Debug (reuse your layout as much as possible)
+      unsigned* dbg = debugBytes.data();
+      dbg[0] = *exec_count;
+      dbg[1] = totalWritten;
+      dbg[2] = (P - 1) - ((P - 1) - ((P - 1) - ((P - 1)))); // you can set backlog etc. as you like
+      dbg[3] = emitPend;
+      dbg[4] = 0;               // spillSeen (optional to re-add if needed)
+      dbg[5] = spillEmitTot;
+      dbg[6] = 0;
+      dbg[7] = genEmitTot;
+      dbg[8] = 0;
+      dbg[9] = 0;
+
+      *exec_count = *exec_count + 1;
+    }
+    return true;
+  }
+};
+
+
 class RayRouter : public poplar::MultiVertex {
+  
+public:
   using RayVecIn = poplar::Input< poplar::Vector<uint8_t, poplar::VectorLayout::ONE_PTR, 8> >;
   using RayVecIO = poplar::InOut< poplar::Vector<uint8_t, poplar::VectorLayout::ONE_PTR, 8> >;
-
-public:
-  // Incoming rays
+  // Incoming and outcoming rays
   RayVecIn parentRaysIn, childRaysIn0, childRaysIn1, childRaysIn2, childRaysIn3;
   RayVecIO parentRaysOut, childRaysOut0, childRaysOut1, childRaysOut2, childRaysOut3;
 
@@ -575,7 +834,6 @@ public:
   uint16_t myChildPrefix;
   uint8_t shift;
 
-  // ---- Forbid any Input -> Output aliasing (5 x 5 = 25) ----
   [[poplar::constraint("elem(*parentRaysIn)!=elem(*parentRaysOut)")]]
   [[poplar::constraint("elem(*parentRaysIn)!=elem(*childRaysOut0)")]]
   [[poplar::constraint("elem(*parentRaysIn)!=elem(*childRaysOut1)")]]
@@ -602,7 +860,6 @@ public:
   [[poplar::constraint("elem(*childRaysIn3)!=elem(*childRaysOut2)")]]
   [[poplar::constraint("elem(*childRaysIn3)!=elem(*childRaysOut3)")]]
 
-  // ---- Forbid any Output -> Output aliasing (C(5,2) = 10) ----
   [[poplar::constraint("elem(*parentRaysOut)!=elem(*childRaysOut0)")]]
   [[poplar::constraint("elem(*parentRaysOut)!=elem(*childRaysOut1)")]]
   [[poplar::constraint("elem(*parentRaysOut)!=elem(*childRaysOut2)")]]
@@ -1020,347 +1277,4 @@ private:
     }
   }
 
-};
-
-class RayRouter2 : public poplar::MultiVertex {
-  using RayVecIn = poplar::Input< poplar::Vector<uint8_t, poplar::VectorLayout::ONE_PTR, 8> >;
-  using RayVecIO = poplar::InOut< poplar::Vector<uint8_t, poplar::VectorLayout::ONE_PTR, 8> >;
-
-public:
-  // Incoming rays (5 lanes)
-  RayVecIn  parentRaysIn, childRaysIn0, childRaysIn1, childRaysIn2, childRaysIn3;
-  // Outgoing rays (5 lanes)
-  RayVecIO  parentRaysOut, childRaysOut0, childRaysOut1, childRaysOut2, childRaysOut3;
-
-  // Mapping info
-  poplar::Input< poplar::Vector<unsigned short, poplar::VectorLayout::SPAN, 4> > childClusterIds;
-  poplar::Input<uint8_t> level;
-
-  // Shared scratch
-  poplar::InOut< poplar::Vector<unsigned> > sharedCounts; 
-  poplar::InOut< poplar::Vector<unsigned> > sharedOffsets; 
-  poplar::InOut< poplar::Vector<unsigned> > readyFlags; 
-  poplar::InOut< poplar::Vector<unsigned> > debugBytes; // optional
-
-  inline static constexpr unsigned kNumLanes = 5;
-  inline static constexpr unsigned PARENT    = 4;
-  inline static constexpr unsigned NW        = 6; // MultiVertex workers
-  // NOTE: assume capacity per lane == kNumRays
-  inline static constexpr unsigned kNumRays  = /* your capacity here */ 1024;
-
-  struct LanePartition {
-    unsigned base[kNumLanes];
-    unsigned freePrefix[kNumLanes + 1];
-  };
-
-  uint16_t myChildPrefix;
-  uint8_t  shift;
-
-  // ---- aliasing constraints (unchanged) ----
-  [[poplar::constraint("elem(*readyFlags)!=elem(*sharedCounts)")]]
-  [[poplar::constraint("elem(*readyFlags)!=elem(*sharedOffsets)")]]
-  [[poplar::constraint("elem(*sharedCounts)!=elem(*sharedOffsets)")]]
-  // (add others you had if needed)
-
-  bool compute(unsigned workerId) {
-    // derive prefix mapping
-    shift = *level * 2;
-    myChildPrefix = childClusterIds[0] >> (shift + 2);
-
-    if (workerId == 0) {
-      volatile unsigned* f = readyFlags.data();
-      for (unsigned i = 0; i < NW; ++i) f[i] = 0;
-    }
-    barrier(0, workerId);
-
-    countRays(workerId);
-    barrier(1, workerId);
-
-    if (workerId == 0) computeWriteOffsets();
-    barrier(2, workerId);
-
-    routeRays(workerId);
-    barrier(3, workerId);
-
-    if (workerId == 0) invalidateAfterRouting();
-    return true;
-  }
-
-private:
-  // ---------- helpers ----------
-  [[gnu::always_inline]] unsigned getSharedIdx(unsigned workerId, unsigned lane) const {
-    return workerId * kNumLanes + lane;
-  }
-  [[gnu::always_inline]] unsigned spillStartIdx(unsigned w) const { return NW * kNumLanes + w; }
-  [[gnu::always_inline]] unsigned spillEndIdx  (unsigned w) const { return NW * kNumLanes + NW + w; }
-
-  [[gnu::always_inline]] 
-  static void workerRange(unsigned workerId, unsigned &begin, unsigned &end) {
-    begin = (kNumRays * workerId) / NW;
-    end   = (kNumRays * (workerId + 1)) / NW;
-  }
-
-  [[gnu::always_inline]]
-  static inline void copy_ray(const Ray* __restrict src, Ray* __restrict dst) {
-    // 24 bytes -> 6 x 32-bit words
-    const unsigned* __restrict s = reinterpret_cast<const unsigned*>(src);
-    unsigned* d = reinterpret_cast<unsigned*>(dst);  // NOTE: no __restrict here
-
-    // exact unroll helps codegen
-    ipu::store_postinc(&d, s[0], 1);
-    ipu::store_postinc(&d, s[1], 1);
-    ipu::store_postinc(&d, s[2], 1);
-    ipu::store_postinc(&d, s[3], 1);
-    ipu::store_postinc(&d, s[4], 1);
-    ipu::store_postinc(&d, s[5], 1);
-  }
-
-  [[gnu::always_inline]]
-  unsigned findChildForCluster (uint16_t cluster_id) const {
-    unsigned childIdx = (cluster_id >> shift) & 0x3;
-    bool isChild = ((cluster_id >> (shift + 2)) == myChildPrefix);
-    return isChild ? childIdx : PARENT;
-  }
-
-  [[gnu::always_inline]]
-  void totalsPerLane(const poplar::Vector<unsigned>& cnt, unsigned outTot[kNumLanes]) const {
-    for (unsigned r = 0; r < kNumLanes; ++r) outTot[r] = 0;
-    for (unsigned r = 0; r < kNumLanes; ++r)
-      for (unsigned w = 0; w < NW; ++w)
-        outTot[r] += cnt[getSharedIdx(w, r)];
-  }
-
-  [[gnu::always_inline]]
-  static LanePartition makePartition(const unsigned tot[kNumLanes]) {
-    LanePartition P{};
-    P.freePrefix[0] = 0;
-    for (unsigned r = 0; r < kNumLanes; ++r) {
-      const unsigned used = (tot[r] < kNumRays) ? tot[r] : kNumRays;
-      P.base[r] = used;
-      const unsigned freeCap = kNumRays - used;
-      P.freePrefix[r + 1] = P.freePrefix[r] + freeCap;
-    }
-    return P;
-  }
-
-  struct SpillCursor { unsigned r; unsigned nextBoundary; };
-
-  [[gnu::always_inline]]
-  static void initSpillCursor(const LanePartition& P, unsigned g, SpillCursor& sc) {
-    sc.r = 0;
-    while (g >= P.freePrefix[sc.r + 1]) ++sc.r;
-    sc.nextBoundary = P.freePrefix[sc.r + 1];
-  }
-
-  [[gnu::always_inline]]
-  static void spillAdvanceIfNeeded(const LanePartition& P, unsigned g, SpillCursor& sc) {
-    if (g >= sc.nextBoundary) {
-      do { ++sc.r; } while (g >= P.freePrefix[sc.r + 1]);
-      sc.nextBoundary = P.freePrefix[sc.r + 1];
-    }
-  }
-
-  // ---------- phases ----------
-  void countRays(unsigned workerId) {
-    // zero my row
-    for (unsigned lane = 0; lane < kNumLanes; ++lane)
-      sharedCounts[getSharedIdx(workerId, lane)] = 0;
-
-    // typed bases (if you kept uint8_t ABI, reinterpret_cast to Ray* once)
-    const Ray* __restrict inBase[kNumLanes] = {
-      reinterpret_cast<const Ray*>(childRaysIn0.data()),
-      reinterpret_cast<const Ray*>(childRaysIn1.data()),
-      reinterpret_cast<const Ray*>(childRaysIn2.data()),
-      reinterpret_cast<const Ray*>(childRaysIn3.data()),
-      reinterpret_cast<const Ray*>(parentRaysIn.data())
-    };
-
-    unsigned begin, end; workerRange(workerId, begin, end);
-    __builtin_assume(kNumRays <= 4096);
-
-    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-      const Ray* __restrict in = inBase[lane];
-      for (rptsize_t i = begin; i < (rptsize_t)end; ++i) {
-        const Ray* ray = &in[(unsigned)i];
-        if (__builtin_expect(ray->next_cluster == INVALID_RAY_ID, 0)) break;
-        if (__builtin_expect(ray->next_cluster == FINISHED_RAY_ID, 0)) continue;
-        const unsigned dst = findChildForCluster(ray->next_cluster);
-        ++sharedCounts[getSharedIdx(workerId, dst)];
-      }
-    }
-  }
-
-  void computeWriteOffsets() {
-    // primary offsets (no spill yet)
-    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-      unsigned offset = 0;
-      for (unsigned w = 0; w < NW; ++w) {
-        unsigned count = sharedCounts[getSharedIdx(w, lane)];
-        sharedOffsets[getSharedIdx(w, lane)] = offset;
-        offset += count;
-      }
-    }
-
-    // free space partition
-    unsigned tot[kNumLanes];
-    totalsPerLane(sharedCounts, tot);
-    LanePartition P = makePartition(tot);
-    const unsigned totalFree = P.freePrefix[kNumLanes];
-
-    // compute per-worker spill need
-    unsigned workerSpill[NW];
-    for (unsigned w = 0; w < NW; ++w) {
-      unsigned s = 0;
-      for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-        const unsigned start = sharedOffsets[getSharedIdx(w, lane)];
-        const unsigned cnt   = sharedCounts [getSharedIdx(w, lane)];
-        const unsigned allow = (start < kNumRays) ? ((cnt < (kNumRays - start)) ? cnt : (kNumRays - start)) : 0;
-        s += (cnt - allow);
-      }
-      workerSpill[w] = s;
-    }
-
-    // assign slices of global free space
-    unsigned scan = 0, remaining = totalFree;
-    for (unsigned w = 0; w < NW; ++w) {
-      const unsigned take = (workerSpill[w] < remaining) ? workerSpill[w] : remaining;
-      sharedOffsets[spillStartIdx(w)] = scan;
-      scan += take;
-      sharedOffsets[spillEndIdx(w)]   = scan;
-      remaining -= take;
-    }
-  }
-
-  void routeRays(unsigned workerId) {
-    // typed bases
-    const Ray* __restrict inBase[kNumLanes] = {
-      reinterpret_cast<const Ray*>(childRaysIn0.data()),
-      reinterpret_cast<const Ray*>(childRaysIn1.data()),
-      reinterpret_cast<const Ray*>(childRaysIn2.data()),
-      reinterpret_cast<const Ray*>(childRaysIn3.data()),
-      reinterpret_cast<const Ray*>(parentRaysIn.data())
-    };
-    Ray* __restrict outBase[kNumLanes] = {
-      reinterpret_cast<Ray*>(childRaysOut0.data()),
-      reinterpret_cast<Ray*>(childRaysOut1.data()),
-      reinterpret_cast<Ray*>(childRaysOut2.data()),
-      reinterpret_cast<Ray*>(childRaysOut3.data()),
-      reinterpret_cast<Ray*>(parentRaysOut.data())
-    };
-
-    // partition + spill
-    unsigned tot[kNumLanes]; totalsPerLane(sharedCounts, tot);
-    LanePartition P = makePartition(tot);
-
-    unsigned g    = sharedOffsets[spillStartIdx(workerId)];
-    unsigned gEnd = sharedOffsets[spillEndIdx(workerId)];
-    SpillCursor sc{}; if (g < gEnd) initSpillCursor(P, g, sc);
-
-    // my primary ranges per lane (start/end)
-    const unsigned s0 = sharedOffsets[getSharedIdx(workerId, 0)];
-    const unsigned c0 = sharedCounts [getSharedIdx(workerId, 0)];
-    const unsigned e0 = (s0 + c0 < kNumRays ? s0 + c0 : kNumRays);
-    const unsigned s1 = sharedOffsets[getSharedIdx(workerId, 1)];
-    const unsigned c1 = sharedCounts [getSharedIdx(workerId, 1)];
-    const unsigned e1 = (s1 + c1 < kNumRays ? s1 + c1 : kNumRays);
-    const unsigned s2 = sharedOffsets[getSharedIdx(workerId, 2)];
-    const unsigned c2 = sharedCounts [getSharedIdx(workerId, 2)];
-    const unsigned e2 = (s2 + c2 < kNumRays ? s2 + c2 : kNumRays);
-    const unsigned s3 = sharedOffsets[getSharedIdx(workerId, 3)];
-    const unsigned c3 = sharedCounts [getSharedIdx(workerId, 3)];
-    const unsigned e3 = (s3 + c3 < kNumRays ? s3 + c3 : kNumRays);
-    const unsigned sP = sharedOffsets[getSharedIdx(workerId, 4)];
-    const unsigned cP = sharedCounts [getSharedIdx(workerId, 4)];
-    const unsigned eP = (sP + cP < kNumRays ? sP + cP : kNumRays);
-
-    unsigned wr0=0, wr1=0, wr2=0, wr3=0, wrP=0;
-    unsigned begin, end; workerRange(workerId, begin, end);
-    __builtin_assume(kNumRays <= 4096);
-
-    for (rptsize_t lane = 0; lane < (rptsize_t)kNumLanes; ++lane) {
-      const Ray* __restrict in = inBase[(unsigned)lane];
-      for (rptsize_t i = begin; i < (rptsize_t)end; ++i) {
-        const Ray* ray = &in[(unsigned)i];
-        if (__builtin_expect(ray->next_cluster == INVALID_RAY_ID, 0)) break;
-        if (__builtin_expect(ray->next_cluster == FINISHED_RAY_ID, 0)) continue;
-
-        const unsigned dst = findChildForCluster(ray->next_cluster);
-        bool primaryOK = true;
-        unsigned slot = 0;
-
-        switch (dst) {
-          case 0: slot = s0 + wr0; primaryOK = (slot < e0); if (primaryOK) { copy_ray(ray, &outBase[0][slot]); ++wr0; } break;
-          case 1: slot = s1 + wr1; primaryOK = (slot < e1); if (primaryOK) { copy_ray(ray, &outBase[1][slot]); ++wr1; } break;
-          case 2: slot = s2 + wr2; primaryOK = (slot < e2); if (primaryOK) { copy_ray(ray, &outBase[2][slot]); ++wr2; } break;
-          case 3: slot = s3 + wr3; primaryOK = (slot < e3); if (primaryOK) { copy_ray(ray, &outBase[3][slot]); ++wr3; } break;
-          default:slot = sP + wrP; primaryOK = (slot < eP); if (primaryOK) { copy_ray(ray, &outBase[4][slot]); ++wrP; } break;
-        }
-
-        if (!primaryOK && (g < gEnd)) {
-          spillAdvanceIfNeeded(P, g, sc);
-          const unsigned slotInR = P.base[sc.r] + (g - P.freePrefix[sc.r]);
-          copy_ray(ray, &outBase[sc.r][slotInR]);
-          ++g;
-        }
-      }
-    }
-  }
-
-  [[gnu::always_inline]]
-  void wipeTail(Ray* __restrict out, unsigned written) {
-    if (written >= kNumRays) return;
-    for (rptsize_t i = written; i < (rptsize_t)kNumRays; ++i) {
-      Ray* rr = &out[(unsigned)i];
-      if (rr->next_cluster == INVALID_RAY_ID) break;
-      rr->next_cluster = INVALID_RAY_ID;
-    }
-  }
-
-  void invalidateAfterRouting() {
-    // totals + partition
-    unsigned tot[kNumLanes];
-    totalsPerLane(sharedCounts, tot);
-    LanePartition P = makePartition(tot);
-
-    // how much spill each lane received
-    unsigned assigned[kNumLanes] = {0,0,0,0,0};
-    for (unsigned w = 0; w < NW; ++w) {
-      unsigned a = sharedOffsets[spillStartIdx(w)];
-      unsigned b = sharedOffsets[spillEndIdx(w)];
-      unsigned r = 0;
-      while (a < b) {
-        while (a >= P.freePrefix[r + 1]) ++r;
-        unsigned R = P.freePrefix[r + 1];
-        unsigned take = ((b < R) ? b : R) - a;
-        assigned[r] += take;
-        a += take;
-      }
-    }
-
-    Ray* __restrict outBase[kNumLanes] = {
-      reinterpret_cast<Ray*>(childRaysOut0.data()),
-      reinterpret_cast<Ray*>(childRaysOut1.data()),
-      reinterpret_cast<Ray*>(childRaysOut2.data()),
-      reinterpret_cast<Ray*>(childRaysOut3.data()),
-      reinterpret_cast<Ray*>(parentRaysOut.data())
-    };
-    // wipe tails past written = base + assigned
-    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-      const unsigned written = P.base[lane] + assigned[lane];
-      wipeTail(outBase[lane], written);
-    }
-  }
-
-  [[gnu::always_inline]]
-  void barrier(unsigned phase, unsigned workerId) {
-    volatile unsigned* flags = readyFlags.data();
-    flags[workerId] = phase;
-    asm volatile("" ::: "memory");
-    while (true) {
-      bool all = true;
-      for (unsigned i = 0; i < NW; ++i) if (flags[i] < phase) { all = false; break; }
-      if (all) break;
-    }
-    asm volatile("" ::: "memory");
-  }
 };
