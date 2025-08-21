@@ -193,12 +193,20 @@ void RadiantFoamIpuBuilder::loadScenePartitions() {
 }
 
 void RadiantFoamIpuBuilder::registerCodeletsAndOps(poplar::Graph& g) {
-    const std::string codeletFile = std::string(POPC_PREFIX) + "/src/codelets/codelets.cpp";
-    const std::string incPath     = std::string(POPC_PREFIX) + "/include/";
-    const std::string glmPath     = std::string(POPC_PREFIX) + "/external/glm/";
-    g.addCodelets(codeletFile, poplar::CodeletFileType::Auto,
-                  "-O3  -finline-functions -funroll-loops -I " + incPath + " -I " + glmPath);
-    popops::addCodelets(g);
+    const std::string base    = std::string(POPC_PREFIX) + "/src/codelets/";
+    const std::string incPath = std::string(POPC_PREFIX) + "/include/";
+    const std::string glmPath = std::string(POPC_PREFIX) + "/external/glm/";
+    const std::vector<std::string> codeletFiles = {
+      base + "ray_generator.cpp",
+      base + "ray_tracer.cpp",
+      base + "ray_router.cpp",
+    };
+
+    for(const auto& codeletFile : codeletFiles) {
+      g.addCodelets(codeletFile, poplar::CodeletFileType::Auto,
+                    "-O3  -finline-functions -funroll-loops -I " + incPath + " -I " + glmPath);
+      popops::addCodelets(g);
+    }
 }
 
 void RadiantFoamIpuBuilder::allocateGlobalTensors(poplar::Graph& g) {
@@ -294,7 +302,7 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
         g.setTileMapping(in_nbr.get(),   tid);
         g.setTileMapping(in_adj.get(),   tid);
 
-        auto v = g.addVertex(cs, "RayTrace");
+        auto v = g.addVertex(cs, "RayTracer");
 
         // Broadcasted matrices (tile‑local clones)
         auto localView = g.clone(viewMatrix_.get(), "view_mat_t"+std::to_string(tid));
@@ -827,7 +835,7 @@ void RadiantFoamIpuBuilder::buildRayGenerator(poplar::Graph& g, poplar::ComputeS
     const size_t kRayIOBytesPerTile = kNumRays * sizeof(Ray);
     const unsigned kPendingFactor = 2;
 
-    auto v = g.addVertex(cs, "RayGen");
+    auto v = g.addVertex(cs, "RayGenerator");
     raygenInput  = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile}, "raygen_in");
     raygenOutput = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile}, "raygen_out");
     SetInit<uint8_t>(g, raygenInput,  0xFF);
