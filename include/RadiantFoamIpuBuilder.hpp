@@ -79,7 +79,7 @@ private:
     const std::string h5_file_;
     bool debug_;
     bool loop_frames_;
-    static constexpr int kSubsteps = 15;
+    static constexpr int kSubsteps = 20;
     static constexpr int kRouterDebugSize = 15;
     static constexpr int kRayTracerDebugSize = 600;
 

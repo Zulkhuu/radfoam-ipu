@@ -352,15 +352,15 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
         g.connect(v["finishedWriteOffset"],  writeOffs);
 
         const auto kNumWorkers = 6;
-        auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers+1}, "sharedCounts");
-        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers+2}, "sharedOffsets");
         auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
+        auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*2}, "sharedCounts");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*3}, "sharedOffsets");
         g.setTileMapping(sharedCounts, tid);
         g.setTileMapping(sharedOffsets, tid);
         g.setTileMapping(readyFlags, tid);
         std::vector<unsigned> z6(kNumWorkers, 0u);
-        std::vector<unsigned> z7(kNumWorkers+1, 0u);
-        std::vector<unsigned> z8(kNumWorkers+2, 0u);
+        std::vector<unsigned> z7(kNumWorkers*2, 0u);
+        std::vector<unsigned> z8(kNumWorkers*3, 0u);
         g.setInitialValue(readyFlags,    poplar::ArrayRef<unsigned>(z6));
         g.setInitialValue(sharedCounts,  poplar::ArrayRef<unsigned>(z7));
         g.setInitialValue(sharedOffsets, poplar::ArrayRef<unsigned>(z8));
@@ -463,7 +463,7 @@ void RadiantFoamIpuBuilder::buildRayRoutersL0(poplar::Graph& g, poplar::ComputeS
 
         const auto kNumWorkers = 6;
         auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedCounts");
-        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5 + 2*kNumWorkers}, "sharedOffsets");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*6 + 2*kNumWorkers}, "sharedOffsets");
         auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
         g.setTileMapping(sharedCounts, tile);
         g.setTileMapping(sharedOffsets, tile);
@@ -549,7 +549,7 @@ void RadiantFoamIpuBuilder::buildRayRoutersL1(poplar::Graph& g, poplar::ComputeS
 
         const auto kNumWorkers = 6;
         auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedCounts");
-        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5 + 2*kNumWorkers}, "sharedOffsets");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*6 + 2*kNumWorkers}, "sharedOffsets");
         auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
         g.setTileMapping(sharedCounts, tile);
         g.setTileMapping(sharedOffsets, tile);
@@ -639,7 +639,7 @@ void RadiantFoamIpuBuilder::buildRayRoutersL2(poplar::Graph& g, poplar::ComputeS
 
         const auto kNumWorkers = 6;
         auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedCounts");
-        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5 + 2*kNumWorkers}, "sharedOffsets");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*6 + 2*kNumWorkers}, "sharedOffsets");
         auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
         g.setTileMapping(sharedCounts, tile);
         g.setTileMapping(sharedOffsets, tile);
@@ -735,7 +735,7 @@ void RadiantFoamIpuBuilder::buildRayRoutersL3(poplar::Graph& g, poplar::ComputeS
 
         const auto kNumWorkers = 6;
         auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5}, "sharedCounts");
-        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5 + 2*kNumWorkers}, "sharedOffsets");
+        auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*6 + 2*kNumWorkers}, "sharedOffsets");
         auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
         g.setTileMapping(sharedCounts, tile);
         g.setTileMapping(sharedOffsets, tile);
@@ -805,7 +805,7 @@ void RadiantFoamIpuBuilder::buildRayRoutersL4(poplar::Graph& g, poplar::ComputeS
 
   const auto kNumWorkers = 6;
   auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5},                 "l4_sharedCounts");
-  auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*5 + 2*kNumWorkers}, "l4_sharedOffsets");
+  auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*6 + 2*kNumWorkers}, "l4_sharedOffsets");
   auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers},                   "l4_readyFlags");
   g.setTileMapping(sharedCounts, tile);
   g.setTileMapping(sharedOffsets, tile);
@@ -859,6 +859,17 @@ void RadiantFoamIpuBuilder::buildRayGenerator(poplar::Graph& g, poplar::ComputeS
     
     auto raygen_exec = exec_counts_.get().slice({kNumRayTracerTiles},{kNumRayTracerTiles+1}).reshape({});
     g.connect(v["exec_count"], raygen_exec);
+
+    const auto kNumWorkers = 6;
+    auto sharedCounts  = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*3}, "rg_sharedCounts");
+    auto sharedOffsets = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers*6}, "rg_sharedOffsets");
+    auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers},   "rg_readyFlags");
+    g.setTileMapping(sharedCounts, kRaygenTile);
+    g.setTileMapping(sharedOffsets, kRaygenTile);
+    g.setTileMapping(readyFlags, kRaygenTile);
+    g.connect(v["sharedCounts"],  sharedCounts);
+    g.connect(v["sharedOffsets"], sharedOffsets);
+    g.connect(v["readyFlags"],    readyFlags);
 
     raygenDebugRead_.buildTensor(g, poplar::UNSIGNED_INT, {kRouterDebugSize});
     g.setTileMapping(raygenDebugRead_.get(), kRaygenTile);
@@ -1171,7 +1182,7 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
         const size_t offset = static_cast<size_t>(tid) * kRayTracerDebugSize;
         uint8_t cnt = rtDebugBytesHost_[offset];
 
-        if (cnt > 0) {
+        if (cnt > 256) {
             // Print summary for this tile
             RF_LOG("Tile {}({}) result f32: {:.9f}, u16: {}", tid, tid/4,
                 result_f32_host[tid], result_u16_host[tid]);
@@ -1179,9 +1190,9 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
             // Iterate through points written in framebuffer
             for (uint8_t i = 1; i <= cnt; ++i) {
                 uint16_t x = (rtDebugBytesHost_[offset + i * 6] << 8) |
-                                rtDebugBytesHost_[offset + i * 6 + 1];
+                              rtDebugBytesHost_[offset + i * 6 + 1];
                 uint16_t y = (rtDebugBytesHost_[offset + i * 6 + 2] << 8) |
-                                rtDebugBytesHost_[offset + i * 6 + 3];
+                              rtDebugBytesHost_[offset + i * 6 + 3];
                 auto x_data = x & ~kLeadMask;
                 auto x_cluster_cnt = (x & kLeadMask) >> kShift;
                 uint16_t pt_idx = (rtDebugBytesHost_[offset + i * 6 + 4] << 8) |
@@ -1204,11 +1215,11 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
     // -----------------------------------------------------------------------------
     //  Router-lane saturation test
     // -----------------------------------------------------------------------------
-    constexpr std::uint16_t kWarnCap        = 2000;  // threshold
+    constexpr std::uint16_t kWarnCap        = 12400;  // threshold
     constexpr int           kWordsPerRouter = kRouterDebugSize;    // 0..4 = IN  / 5..9 = OUT
 
     auto dumpRouters =
-        [&](const char                       *lvl,
+        [&](const char                   *lvl,
             const std::vector<unsigned>  &dbg,
             std::size_t                       numRouters)
     {
@@ -1227,11 +1238,11 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
                                     [](std::uint16_t v){ return v > kWarnCap; });
 
             // if (over || lvl == "RG" || w[11] == 1)
-            if (over || lvl == "RG")
+            if (over || lvl == "RG" || (lvl=="L0" && rid == 15))
             {
-              if(lvl == "RG" && w[9] != 0)
+              if(lvl == "RG")
                 fmt::print("{} router {:4}: "
-                    "In: {:4}  {:4}  {:4}  {:4} {:4}\t"
+                    "In: {:4}  {:4}  {:4}  {:4} {:4}\t\t"
                     "Out: {:4}  {:4}  {:4}  {:4} {:4}\n",
                     lvl, rid,
                     w[0], w[1], w[2], w[3], w[4],
@@ -1252,7 +1263,7 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
     dumpRouters("L2", l2routerDebugBytesHost_, kNumL2RouterTiles);
     dumpRouters("L3", l3routerDebugBytesHost_, kNumL3RouterTiles);
     dumpRouters("L4", l4routerDebugBytesHost_, kNumL4RouterTiles);
-    dumpRouters("RG",  raygenDebugBytesHost_,  1);   
+    dumpRouters("RG", raygenDebugBytesHost_,  1);   
 
 }
 

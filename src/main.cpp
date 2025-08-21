@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
   bool enableDebug = result["debug"].as<bool>();
   int uiPort = result["port"].as<int>();
   
-  bool dynamic_camera = true;
+  bool dynamic_camera = false;
   int inital_camera_setup = 0;
   radfoam::geometry::GenericPoint initial_camera_cell;
   InterfaceServer::State initial_state;

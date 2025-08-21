@@ -13,8 +13,8 @@ namespace radfoam::config {
 // ============================================================================
 
 // Full image (pixels)
-inline constexpr std::size_t kFullImageWidth  = 640;
-inline constexpr std::size_t kFullImageHeight = 480;
+inline constexpr std::size_t kFullImageWidth  = 1280;
+inline constexpr std::size_t kFullImageHeight = 736;
 
 // Ray tracer tiles
 inline constexpr std::size_t kNumRayTracerTilesX = 32;
