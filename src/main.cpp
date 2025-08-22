@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
   bool enableDebug = result["debug"].as<bool>();
   int uiPort = result["port"].as<int>();
   
-  bool dynamic_camera = false;
+  bool dynamic_camera = true;
   int inital_camera_setup = 0;
   radfoam::geometry::GenericPoint initial_camera_cell;
   InterfaceServer::State initial_state;
@@ -347,6 +347,7 @@ int main(int argc, char** argv) {
         builder.stopFlagHost_ = 0;
         break;
       }
+      state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
       
       auto state_ = dynamic_camera ? state : initial_state;
       builder.updateCameraParameters(state_);
@@ -383,7 +384,6 @@ int main(int argc, char** argv) {
       std::swap(imagePtr, imagePtrBuffered);
       if (enableUI) hostProcessing.run(uiUpdateFunc);
       
-      state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
 
       size_t nonZeroCount = CountNonZeroPixels(*imagePtr);
       if(!fullImageUpdated) {

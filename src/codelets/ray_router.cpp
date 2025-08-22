@@ -295,61 +295,61 @@ private:
   }
   
   void computeWriteOffsets() {
-  // const unsigned NW = poplar::MultiVertex::numWorkers();
-  const unsigned C = kNumRays; // raysOut.size()    / sizeof(Ray);
+    // const unsigned NW = poplar::MultiVertex::numWorkers();
+    const unsigned C = kNumRays; // raysOut.size()    / sizeof(Ray);
 
-  // compute offsets without considering spillovers
-  for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-    unsigned offset = 0;
-    for (unsigned worker = 0; worker < NW; ++worker) {
-      unsigned count = sharedCounts[getSharedIdx(worker, lane)];
-      sharedOffsets[getSharedIdx(worker, lane)] = offset;
-      offset += count;
-    }
-  }
-
-  // 2) totals and free per lane
-  unsigned tot[kNumLanes] = {0,0,0,0,0};
-  totalsPerLane(sharedCounts, NW, tot);
-  LanePartition P = makePartition(tot, C);
-  const unsigned totalFree = P.freePrefix[kNumLanes];
-
-  // 3) Spill needed by each worker = sum_lanes max(0, start+cnt - C)
-  unsigned workerSpill[NW];  // kNumWorkers >= NW
-  for (unsigned w = 0; w < NW; ++w) {
-    unsigned s = 0;
+    // compute offsets without considering spillovers
     for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-      const unsigned start = sharedOffsets[getSharedIdx(w, lane)];
-      const unsigned cnt   = sharedCounts[getSharedIdx(w, lane)];
-      const unsigned allow = (start < C) ? ((cnt < (C - start)) ? cnt : (C - start)) : 0;
-      s += (cnt - allow);
+      unsigned offset = 0;
+      for (unsigned worker = 0; worker < NW; ++worker) {
+        unsigned count = sharedCounts[getSharedIdx(worker, lane)];
+        sharedOffsets[getSharedIdx(worker, lane)] = offset;
+        offset += count;
+      }
     }
-    workerSpill[w] = s;
-  }
 
-  // 4) Assign each worker a contiguous slice of the global free list (clamped)
-  unsigned scan = 0;
-  unsigned remaining = totalFree;
-  for (unsigned w = 0; w < NW; ++w) {
-    const unsigned take = (workerSpill[w] < remaining) ? workerSpill[w] : remaining;
-    sharedOffsets[spillStartIdx(w)] = scan;  // start (inclusive)
-    scan += take;
-    sharedOffsets[spillEndIdx(w)]   = scan;  // end (exclusive)
-    remaining -= take;
-  }
+    // 2) totals and free per lane
+    unsigned tot[kNumLanes] = {0,0,0,0,0};
+    totalsPerLane(sharedCounts, NW, tot);
+    LanePartition P = makePartition(tot, C);
+    const unsigned totalFree = P.freePrefix[kNumLanes];
 
-  // 5) how much of those spills land in each lane?
-  unsigned assigned[kNumLanes] = {0,0,0,0,0};
-  accumulateSpillAssigned(sharedOffsets, NW, P, assigned); // sums spill slices via freePrefix
-
-  // 6) Store head shift and shift all primary starts by that amount
-  for (unsigned lane = 0; lane < kNumLanes; ++lane) {
-    sharedOffsets[laneHeadShiftIdx(lane)] = assigned[lane];   // spill head size
+    // 3) Spill needed by each worker = sum_lanes max(0, start+cnt - C)
+    unsigned workerSpill[NW];  // kNumWorkers >= NW
     for (unsigned w = 0; w < NW; ++w) {
-      sharedOffsets[getSharedIdx(w, lane)] += assigned[lane]; // move primaries after spills
+      unsigned s = 0;
+      for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+        const unsigned start = sharedOffsets[getSharedIdx(w, lane)];
+        const unsigned cnt   = sharedCounts[getSharedIdx(w, lane)];
+        const unsigned allow = (start < C) ? ((cnt < (C - start)) ? cnt : (C - start)) : 0;
+        s += (cnt - allow);
+      }
+      workerSpill[w] = s;
+    }
+
+    // 4) Assign each worker a contiguous slice of the global free list (clamped)
+    unsigned scan = 0;
+    unsigned remaining = totalFree;
+    for (unsigned w = 0; w < NW; ++w) {
+      const unsigned take = (workerSpill[w] < remaining) ? workerSpill[w] : remaining;
+      sharedOffsets[spillStartIdx(w)] = scan;  // start (inclusive)
+      scan += take;
+      sharedOffsets[spillEndIdx(w)]   = scan;  // end (exclusive)
+      remaining -= take;
+    }
+
+    // 5) how much of those spills land in each lane?
+    unsigned assigned[kNumLanes] = {0,0,0,0,0};
+    accumulateSpillAssigned(sharedOffsets, NW, P, assigned); // sums spill slices via freePrefix
+
+    // 6) Store head shift and shift all primary starts by that amount
+    for (unsigned lane = 0; lane < kNumLanes; ++lane) {
+      sharedOffsets[laneHeadShiftIdx(lane)] = assigned[lane];   // spill head size
+      for (unsigned w = 0; w < NW; ++w) {
+        sharedOffsets[getSharedIdx(w, lane)] += assigned[lane]; // move primaries after spills
+      }
     }
   }
-}
 
   void routeRays(unsigned workerId) {
     // const unsigned NW = poplar::MultiVertex::numWorkers();
@@ -422,7 +422,7 @@ private:
         if (!primaryOK && (g < gEnd)) {
           spillAdvanceIfNeeded(P, g, sc);
           // const unsigned slotInR = P.base[sc.r] + (g - P.freePrefix[sc.r]);
-          const unsigned slotInR = (g - P.freePrefix[sc.r]);
+          const unsigned slotInR = (g - P.freePrefix[sc.r]); //spillover first
           copy_ray(ray, &outBase[sc.r][slotInR]);
           ++g;
         }

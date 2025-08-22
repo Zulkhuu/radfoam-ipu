@@ -1116,10 +1116,10 @@ poplar::program::Sequence RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph
         //     raygenInput,
         //     true, DebugContext{"DX/L4->RG/up"}));
 
-        // data_exchange_seq.add(poplar::program::Copy(
-        //     L4RouterOut.slice(0, kNumRays*sizeof(Ray)),
-        //     L4RouterIn.slice(0, kNumRays*sizeof(Ray)),
-        //     true, DebugContext{"DX/L4->L4/updown"}));
+        data_exchange_seq.add(poplar::program::Copy(
+            L4RouterOut.slice(0, kNumRays*sizeof(Ray)),
+            L4RouterIn.slice(0, kNumRays*sizeof(Ray)),
+            true, DebugContext{"DX/L4->L4/updown"}));
     }
     // ────────────────────────────────────────────────────────────────────────────
     // RayGen -> RayTracer

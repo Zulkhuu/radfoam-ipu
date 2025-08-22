@@ -23,13 +23,15 @@ struct alignas(4) Ray {
   uint16_t next_cluster; 
   uint16_t next_local;
 };
+
 struct alignas(4) SeedRay {
   uint16_t x, y;
-  uint16_t ncols, nrows;
-  float pad1, pad2, pad3;
+  uint16_t ncols, nrows, mode, upad;
+  float pad1, pad2;
   uint16_t next_cluster; 
   uint16_t next_local;
 };
+
 struct alignas(4) FinishedPixel {
   uint8_t r, g, b, a;
   float t;
@@ -108,17 +110,33 @@ public:
     const bool haveSeed = (seed->next_cluster != INVALID_RAY_ID);
     if (haveSeed) {
       const uint16_t x0        = seed->x;
+      const uint16_t y0        = seed->y;
       const uint16_t seedLocal = static_cast<uint16_t>(seed->next_local);
 
-      unsigned nCols = seed->ncols;
-      const unsigned totalRays = nCols * kFullImageHeight;
+      uint16_t nCols = seed->ncols;
+      uint16_t nRows = seed->nrows;
+      uint16_t mode = seed->mode;
+      unsigned totalRays = 0;
+      if(mode == 0)
+        totalRays = nCols * kFullImageHeight;
+      if(mode == 1)
+        totalRays = nRows * kFullImageWidth;
       const unsigned writeCount = (totalRays < C) ? totalRays : C;
 
       for (unsigned i = workerId; i < writeCount; i += NW) {
-        const unsigned  col = i / kFullImageHeight;          // 0..(nCols-1)
-        const unsigned  row = i % kFullImageHeight;          // 0..H-1
-        const uint16_t  x   = static_cast<uint16_t>((x0 + col) % kFullImageWidth);
-        const uint16_t  y   = static_cast<uint16_t>(row);
+        uint16_t x, y;
+        if(mode == 0) {
+          const unsigned  col = i / kFullImageHeight;          // 0..(nCols-1)
+          const unsigned  row = i % kFullImageHeight;          // 0..H-1
+          x = static_cast<uint16_t>((x0 + col) % kFullImageWidth);
+          y = static_cast<uint16_t>(row);
+        }
+        if(mode == 1) {
+          const unsigned  col = i % kFullImageWidth;          // 0..(nCols-1)
+          const unsigned  row = i / kFullImageWidth;          // 0..H-1
+          x = static_cast<uint16_t>(col);
+          y = static_cast<uint16_t>((y0 + row) % kFullImageHeight);
+        }
 
         glm::vec3 color(0.f); 
         float trans = 1.f, t0 = 0.f;

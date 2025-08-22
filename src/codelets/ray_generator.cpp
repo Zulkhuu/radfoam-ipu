@@ -21,10 +21,11 @@ struct alignas(4) Ray {
   uint16_t next_cluster; 
   uint16_t next_local;
 };
+
 struct alignas(4) SeedRay {
   uint16_t x, y;
-  uint16_t ncols, nrows;
-  float pad1, pad2, pad3;
+  uint16_t ncols, nrows, mode, upad;
+  float pad1, pad2;
   uint16_t next_cluster; 
   uint16_t next_local;
 };
@@ -678,11 +679,10 @@ public:
   bool compute(unsigned wid) {
     const unsigned NW = poplar::MultiVertex::numWorkers();
     const unsigned numTiles = kNumRayTracerTiles; // kNumRayTracerTiles
-    const unsigned bytesPerRay = sizeof(Ray);
 
     // 1) Clear all seeds to INVALID in parallel
     for (unsigned t = wid; t < numTiles; t += NW) {
-      Ray* slot = reinterpret_cast<Ray*>(seedRaysOut.data() + t * bytesPerRay);
+      Ray* slot = reinterpret_cast<Ray*>(seedRaysOut.data() + t * sizeof(Ray));
       slot->next_cluster = INVALID_RAY_ID;
     }
 
@@ -690,19 +690,47 @@ public:
     // camera_cell_info = [cluster_lo, cluster_hi, local_lo, local_hi]
     const uint16_t destTile = static_cast<uint16_t>(camera_cell_info[0] | (uint16_t(camera_cell_info[1]) << 8));
     const uint16_t seedLocal = static_cast<uint16_t>(camera_cell_info[2] | (uint16_t(camera_cell_info[3]) << 8));
-
-    // choose x you want to seed from (for your 3-column mode)
-    const unsigned nColsPerFrame = 2;
-    const uint16_t colBase = ((*exec_count)) * nColsPerFrame;
-
+    
+    int raygen_mode = 1;
     if (wid == 0) {
-      SeedRay* slot = reinterpret_cast<SeedRay*>(seedRaysOut.data() + destTile * bytesPerRay);
-      slot->x            = colBase%kFullImageWidth;
-      slot->y            = 0;  
-      slot->nrows        = 0;
-      slot->ncols        = nColsPerFrame;
-      slot->next_cluster = destTile;      // consumed by that tile
-      slot->next_local   = seedLocal;     // starting cell
+      if(raygen_mode == 0) {
+        const unsigned nColsPerFrame = 1;
+        const uint16_t colBase = ((*exec_count)) * nColsPerFrame;
+        const unsigned breakframes = 100;
+        unsigned frames_required = kFullImageWidth / nColsPerFrame; 
+        if(*exec_count == frames_required + breakframes) {
+          *exec_count = 0;
+        }
+        if(*exec_count < frames_required) {
+          SeedRay* slot = reinterpret_cast<SeedRay*>(seedRaysOut.data() + destTile * sizeof(Ray));
+          slot->x            = colBase%kFullImageWidth;
+          slot->y            = 0;  
+          slot->nrows        = 0;
+          slot->ncols        = nColsPerFrame;
+          slot->mode         = raygen_mode;
+          slot->next_cluster = destTile;
+          slot->next_local   = seedLocal;
+        }
+      }
+      if(raygen_mode == 1) {
+        const unsigned nRowsPerFrame = 1;
+        const uint16_t rowBase = ((*exec_count)) * nRowsPerFrame;
+        const unsigned breakframes = 150;
+        unsigned frames_required = kFullImageHeight / nRowsPerFrame; 
+        if(*exec_count == frames_required + breakframes) {
+          *exec_count = 0;
+        }
+        if(*exec_count < frames_required) {
+          SeedRay* slot = reinterpret_cast<SeedRay*>(seedRaysOut.data() + destTile * sizeof(Ray));
+          slot->x            = 0;  
+          slot->y            = rowBase%kFullImageHeight;
+          slot->nrows        = nRowsPerFrame;
+          slot->ncols        = 0;
+          slot->mode         = raygen_mode;
+          slot->next_cluster = destTile;
+          slot->next_local   = seedLocal;
+        }
+      }
       *exec_count = *exec_count + 1;
     }
     return true;
