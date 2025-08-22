@@ -23,6 +23,13 @@ struct alignas(4) Ray {
   uint16_t next_cluster; 
   uint16_t next_local;
 };
+struct alignas(4) SeedRay {
+  uint16_t x, y;
+  uint16_t ncols, nrows;
+  float pad1, pad2, pad3;
+  uint16_t next_cluster; 
+  uint16_t next_local;
+};
 struct alignas(4) FinishedPixel {
   uint8_t r, g, b, a;
   float t;
@@ -44,6 +51,7 @@ public:
   poplar::Input<poplar::Vector<unsigned short>>     adjacency;
   poplar::Input<unsigned short>                     tile_id;
   poplar::Input<poplar::Vector<uint8_t>>            raysIn;
+  poplar::Input<poplar::Vector<uint8_t>>            seedRay;
 
   // Outputs
   poplar::InOut<poplar::Vector<uint8_t>>            raysOut;
@@ -83,41 +91,100 @@ public:
 
     const unsigned C         = raysOut.size() / sizeof(Ray);
     const unsigned FR_CAP    = finishedRays.size() / sizeof(FinishedRay);
-    (void)FR_CAP; // currently unused, kept for parity
+    (void)FR_CAP;
     const uint16_t nLocalPts = local_pts.size() / sizeof(LocalPoint);
     const uint16_t nNbrPts   = neighbor_pts.size() / sizeof(GenericPoint);
-    (void)nNbrPts; // referenced in helpers
+    (void)nNbrPts;
 
-    // Matrices & origin
     glm::mat4 invView = glm::make_mat4(view_matrix.data());
     glm::mat4 invProj = glm::make_mat4(projection_matrix.data());
     const glm::vec3 rayOrigin = glm::vec3(invView[3]);
     const uint16_t  myTile    = *tile_id;
 
-    // Clear shared state
-    // if (workerId == 0) {
-    //   sharedCounts[NW]      = 0; // "haveSeed" flag
-    //   sharedOffsets[2*NW]   = 0; // seedX
-    //   sharedOffsets[2*NW+1] = 0; // seedLocal
-    // }
-    // sharedCounts[workerId] = 0;
-    // barrier(/*phase*/1, workerId, NW);
+    // barrier(/*phase*/1, workerId);
 
-    // // Pass 1: scan incoming rays to (a) capture a seed, (b) consume finished rays
-    // passScanAndConsume(workerId, NW, C, myTile, nLocalPts, invProj, invView, rayOrigin);
+    // If a seed exists, generat columns.
+    const SeedRay* seed = readStructAt<SeedRay>(seedRay, 0);
+    const bool haveSeed = (seed->next_cluster != INVALID_RAY_ID);
+    if (haveSeed) {
+      const uint16_t x0        = seed->x;
+      const uint16_t seedLocal = static_cast<uint16_t>(seed->next_local);
 
-    // barrier(/*phase*/2, workerId, NW);
+      unsigned nCols = seed->ncols;
+      const unsigned totalRays = nCols * kFullImageHeight;
+      const unsigned writeCount = (totalRays < C) ? totalRays : C;
 
-    // // Publish 1st seed seen by any worker
-    // if (workerId == 0) publishFirstSeed(NW);
-    // barrier(/*phase*/3, workerId, NW);
+      for (unsigned i = workerId; i < writeCount; i += NW) {
+        const unsigned  col = i / kFullImageHeight;          // 0..(nCols-1)
+        const unsigned  row = i % kFullImageHeight;          // 0..H-1
+        const uint16_t  x   = static_cast<uint16_t>((x0 + col) % kFullImageWidth);
+        const uint16_t  y   = static_cast<uint16_t>(row);
 
-    // // If a seed exists, generate 3 columns (raygen_mode=4 fast-path) and return.
-    // if (sharedCounts[NW]) {
-    //   generateColumnsFromSeed(workerId, NW, C, myTile, nLocalPts, invProj, invView, rayOrigin);
-    //   if (workerId == 0) { *exec_count = *exec_count + 1; }
-    //   return true;
-    // }
+        glm::vec3 color(0.f); 
+        float trans = 1.f, t0 = 0.f;
+        const glm::vec3 rayDir = computeRayDir(x, y, invProj, invView);
+
+        int current = seedLocal;
+        Ray* out = reinterpret_cast<Ray*>(raysOut.data() + i*sizeof(Ray));
+
+        if (current < 0) {
+          writeFinishedOut(out, x, y, color, t0, trans, tileOfXY(x,y));
+          continue;
+        }
+
+        while (true) {
+          const LocalPoint* cur = readStructAt<LocalPoint>(local_pts, current);
+          float closestT;
+          const int next = findNextAndT(current, t0, closestT, rayOrigin, rayDir, nLocalPts);
+
+          accumulateColor(cur, closestT, t0, trans, color);
+
+          if (trans < 0.01f || next == -1 || next >= (int)nLocalPts) {
+            if (trans < 0.01f || next == -1) {
+              writeFinishedOut(out, x, y, color, t0, trans, tileOfXY(x,y));
+            } else {
+              const GenericPoint* nb = readStructAt<GenericPoint>(neighbor_pts, static_cast<std::size_t>(next - nLocalPts));
+              writeNeighborOut(out, x, y, color, t0, trans, nb);
+            }
+            break;
+          }
+          current = next;
+        }
+      }
+
+      // Invalidate any unused tail (head-packed list)
+      for (unsigned i = writeCount + workerId; i < C; i += NW) {
+        Ray* r = reinterpret_cast<Ray*>(raysOut.data() + i*sizeof(Ray));
+        if (r->next_cluster == INVALID_RAY_ID) break;
+        r->next_cluster = INVALID_RAY_ID;
+      }
+
+      for (uint16_t idx = workerId; idx < C; idx += NW) {
+        const Ray* in = readStructAt<Ray>(raysIn, idx);
+        if (in->next_cluster == INVALID_RAY_ID) break;
+        if (in->next_local == FINISHED_RAY_ID) {
+          const uint16_t y = unpackYCoord(in->y);
+          if (in->next_cluster != myTile) {
+            Ray* out = reinterpret_cast<Ray*>(raysOut.data() + idx*sizeof(Ray));
+            *out = *in; //spillover out collides with generated columns, need to handle
+            continue;
+          }
+          uint16_t lx, ly;
+          localXY(in->x, y, myTile, lx, ly);
+          if (lx >= kTileImageWidth || ly >= kTileImageHeight) return false;
+
+          FinishedPixel* p = fbAt(lx, ly);
+          p->r = clampToU8(in->r);
+          p->g = clampToU8(in->g);
+          p->b = clampToU8(in->b);
+          p->a = 255;
+          p->t = __builtin_ipu_f16tof32(in->t);
+        }
+      }
+      if (workerId == 0) { *exec_count = *exec_count + 1; }
+      return true;
+    }
+  
 
     // Normal path: march your stripe and write results back to same index.
     unsigned lastSeenIdx = INVALID_SEEN_ID; 
@@ -144,13 +211,13 @@ private:
   }
 
   [[gnu::always_inline]] inline void
-  barrier(unsigned phase, unsigned workerId, unsigned NW_) {
+  barrier(unsigned phase, unsigned workerId) {
     volatile unsigned* flags = readyFlags.data();
     asm volatile("" ::: "memory");
     while (true) {
       flags[workerId] = phase;
       bool all = true;
-      for (unsigned i = 0; i < NW_; ++i) if (flags[i] < phase) { all = false; break; }
+      for (unsigned i = 0; i < NW; ++i) if (flags[i] < phase) { all = false; break; }
       if (all) break;
     }
     asm volatile("" ::: "memory");
@@ -198,7 +265,7 @@ private:
   }
 
   [[gnu::always_inline]] inline bool
-  blitFinishedToFramebufferIfMine(const Ray* in, uint16_t myTile) {
+  writeFinishedToFramebuffer(const Ray* in, uint16_t myTile) {
     const uint16_t y = unpackYCoord(in->y);
     if (in->next_cluster != myTile) return false;
     uint16_t lx, ly;
@@ -306,7 +373,7 @@ private:
       tryCaptureSeed(workerId, in, myTile);
 
       if (in->next_local == FINISHED_RAY_ID) {
-        if (blitFinishedToFramebufferIfMine(in, myTile)) {
+        if (writeFinishedToFramebuffer(in, myTile)) {
           // ok
         }
         // mirror to raysOut with FINISHED_RAY_ID so routers skip it
@@ -334,7 +401,7 @@ private:
     const uint16_t x0        = static_cast<uint16_t>(sharedOffsets[2*NW_]   & 0xFFFF);
     const uint16_t seedLocal = static_cast<uint16_t>(sharedOffsets[2*NW_+1] & 0xFFFF);
 
-    constexpr unsigned nCols = 2;
+    constexpr unsigned nCols = 3;
     const unsigned totalRays = nCols * kFullImageHeight;
     const unsigned writeCount = (totalRays < C) ? totalRays : C;
 
@@ -398,9 +465,9 @@ private:
       // Not my tile? forward as-is.
       if (in->next_cluster != myTile) { *out = *in; continue; }
 
-      // Already finished? Blit if mine, then mark FINISHED in stream.
+      // Already finished? Write to framebuffer if mine, then mark FINISHED in stream.
       if (in->next_local == FINISHED_RAY_ID) {
-        if (blitFinishedToFramebufferIfMine(in, myTile)) { /*count if needed*/ }
+        if (writeFinishedToFramebuffer(in, myTile)) { /*count if needed*/ }
         *out = *in; out->next_cluster = FINISHED_RAY_ID;
         continue;
       }

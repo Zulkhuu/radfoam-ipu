@@ -21,6 +21,13 @@ struct alignas(4) Ray {
   uint16_t next_cluster; 
   uint16_t next_local;
 };
+struct alignas(4) SeedRay {
+  uint16_t x, y;
+  uint16_t ncols, nrows;
+  float pad1, pad2, pad3;
+  uint16_t next_cluster; 
+  uint16_t next_local;
+};
 
 inline constexpr uint16_t INVALID_RAY_ID = 0xFFFF;
 inline constexpr uint16_t FINISHED_RAY_ID = 0xFFFE;
@@ -34,6 +41,7 @@ public:
   // I/O
   BytesIn  RaysIn;                     // spillovers from L4 parentOut
   BytesIO  RaysOut;                    // to L4 parentIn
+  BytesIn  seedRaysOut;
 
   poplar::InOut< poplar::Vector<uint8_t> > pendingRays; // ring buffer storage
   poplar::InOut<unsigned> pendingHead;                  // ring indices
@@ -420,7 +428,7 @@ private:
   }
 };
 
-class RayGenerator : public poplar::Vertex {
+class RayGenerator2 : public poplar::Vertex {
 public:
   poplar::Input<poplar::Vector<uint8_t>>  RaysIn;
   poplar::Output<poplar::Vector<uint8_t>> RaysOut;
@@ -495,7 +503,7 @@ public:
     }
 
     // ── 3) fill remaining with generated rays
-    int raygen_mode = 0;
+    int raygen_mode = 4;
     if(raygen_mode == 0) {
       const unsigned interval = 1;
       const bool genThisFrame = ((*exec_count % interval) == 0);
@@ -606,7 +614,7 @@ public:
       const unsigned interval = 1;
       const bool genThisFrame = ((*exec_count % interval) == 0);
       if (genThisFrame) {
-        const unsigned nColsPerFrame = 2;
+        const unsigned nColsPerFrame = 3;
         const unsigned colBase = ((*exec_count)/interval) * nColsPerFrame;
         Ray g{};
         g.r = g.g = g.b = 0.0f;
@@ -651,3 +659,52 @@ public:
   }
 };
 
+// RayGen.cpp (device codelet)
+class RayGenerator : public poplar::MultiVertex {
+public:
+  // inputs you already had (camera_cell_info, matrices, etc.)
+  poplar::Input<poplar::Vector<uint8_t>> camera_cell_info;
+
+  // NEW: 1024 seeds — one slot per tracer. Each slot is sizeof(Ray).
+  poplar::InOut<poplar::Vector<uint8_t>> seedRaysOut;
+
+  poplar::InOut< poplar::Vector<unsigned>> readyFlags;    // >= NW
+  poplar::InOut< poplar::Vector<unsigned>> sharedCounts;  // >= (2*NW + 3)
+  poplar::InOut< poplar::Vector<unsigned>> sharedOffsets; // >= (5*NW + 1)
+  poplar::Output< poplar::Vector<unsigned>> debugBytes;
+
+  poplar::InOut<unsigned> exec_count;
+
+  bool compute(unsigned wid) {
+    const unsigned NW = poplar::MultiVertex::numWorkers();
+    const unsigned numTiles = kNumRayTracerTiles; // kNumRayTracerTiles
+    const unsigned bytesPerRay = sizeof(Ray);
+
+    // 1) Clear all seeds to INVALID in parallel
+    for (unsigned t = wid; t < numTiles; t += NW) {
+      Ray* slot = reinterpret_cast<Ray*>(seedRaysOut.data() + t * bytesPerRay);
+      slot->next_cluster = INVALID_RAY_ID;
+    }
+
+    // 2) Pick the destination tile and craft the seed (example uses camera cell)
+    // camera_cell_info = [cluster_lo, cluster_hi, local_lo, local_hi]
+    const uint16_t destTile = static_cast<uint16_t>(camera_cell_info[0] | (uint16_t(camera_cell_info[1]) << 8));
+    const uint16_t seedLocal = static_cast<uint16_t>(camera_cell_info[2] | (uint16_t(camera_cell_info[3]) << 8));
+
+    // choose x you want to seed from (for your 3-column mode)
+    const unsigned nColsPerFrame = 2;
+    const uint16_t colBase = ((*exec_count)) * nColsPerFrame;
+
+    if (wid == 0) {
+      SeedRay* slot = reinterpret_cast<SeedRay*>(seedRaysOut.data() + destTile * bytesPerRay);
+      slot->x            = colBase%kFullImageWidth;
+      slot->y            = 0;  
+      slot->nrows        = 0;
+      slot->ncols        = nColsPerFrame;
+      slot->next_cluster = destTile;      // consumed by that tile
+      slot->next_local   = seedLocal;     // starting cell
+      *exec_count = *exec_count + 1;
+    }
+    return true;
+  }
+};

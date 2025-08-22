@@ -79,7 +79,7 @@ private:
     const std::string h5_file_;
     bool debug_;
     bool loop_frames_;
-    static constexpr int kSubsteps = 20;
+    static constexpr int kSubsteps = 24;
     static constexpr int kRouterDebugSize = 15;
     static constexpr int kRayTracerDebugSize = 600;
 
@@ -90,8 +90,8 @@ private:
     std::vector<std::string>                                  paths_;
 
     // Poplar tensors ---------------------------------------------------------
-    poplar::Tensor rayTracerOutputRays_;
-    poplar::Tensor rayTracerInputRays_;
+    poplar::Tensor rtRaysOut;
+    poplar::Tensor rtRaysIn;
     poplar::Tensor L0RouterOut;
     poplar::Tensor L0RouterIn; 
     poplar::Tensor L1RouterOut;
@@ -102,8 +102,10 @@ private:
     poplar::Tensor L3RouterIn; 
     poplar::Tensor L4RouterOut;
     poplar::Tensor L4RouterIn; 
-    poplar::Tensor raygenOutput;
-    poplar::Tensor raygenInput;
+    // poplar::Tensor raygenOutput;
+    // poplar::Tensor raygenInput;
+    poplar::Tensor rgSeedsOut_;
+    poplar::Tensor rtSeedInput_;
 
     std::vector<ipu_utils::StreamableTensor> local_tensors_;
     std::vector<ipu_utils::StreamableTensor> neighbor_tensors_;

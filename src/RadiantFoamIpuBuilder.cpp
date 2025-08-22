@@ -156,8 +156,6 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
             fmt::format("frame_{:03d}/write_scene_data", exec_counter_));
         eng.run(getPrograms().getOrdinals().at("broadcast_matrices"),
             fmt::format("frame_{:03d}/broadcast_matrices", exec_counter_));
-        // eng.run(getPrograms().getOrdinals().at("write_camera_cell_info"),
-        //     fmt::format("frame_{:03d}/write_camera_cell_info", exec_counter_));
 
         if(loop_frames_ == true)
           eng.run(getPrograms().getOrdinals().at("frame_loop"));
@@ -166,8 +164,8 @@ void RadiantFoamIpuBuilder::execute(poplar::Engine& eng, const poplar::Device&) 
     if(loop_frames_ == false)
       eng.run(getPrograms().getOrdinals().at("frame"), fmt::format("frame_{:03d}", exec_counter_));
     
-    if(debug_)
-      readAllTiles(eng);
+    // if(debug_)
+    //   readAllTiles(eng);
 
     exec_counter_++;
 }
@@ -273,11 +271,16 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
     const size_t kRayIOBytesPerTile = kNumRays * sizeof(Ray);
     const size_t kRayTracerIoBytesAllTiles = kRayIOBytesPerTile * kNumRayTracerTiles;
     const size_t kFinishedRayBytesPerTile = kNumRays * kFinishedFactor * sizeof(FinishedRay);
+    const size_t kRayTracerSeedBytesAllTiles = kNumRayTracerTiles * sizeof(Ray);
 
-    rayTracerOutputRays_ = g.addVariable(poplar::UNSIGNED_CHAR, {kRayTracerIoBytesAllTiles}, "rt_out");
-    rayTracerInputRays_  = g.addVariable(poplar::UNSIGNED_CHAR, {kRayTracerIoBytesAllTiles}, "rt_in");
-    SetInit<uint8_t>(g, rayTracerOutputRays_,  0xFF);
-    SetInit<uint8_t>(g, rayTracerInputRays_,  0xFF);
+    rtRaysOut = g.addVariable(poplar::UNSIGNED_CHAR, {kRayTracerIoBytesAllTiles}, "rt_out");
+    rtRaysIn  = g.addVariable(poplar::UNSIGNED_CHAR, {kRayTracerIoBytesAllTiles}, "rt_in");
+    rtSeedInput_ = g.addVariable(poplar::UNSIGNED_CHAR, {kRayTracerSeedBytesAllTiles}, "rt_seed_in");
+    SetInit<uint8_t>(g, rtRaysOut,  0xFF);
+    SetInit<uint8_t>(g, rtRaysIn,  0xFF);
+    SetInit<uint8_t>(g, rtSeedInput_,  0xFF);
+
+    poputil::mapTensorLinearlyWithOffset(g, rtSeedInput_, 0);
 
     rtDebugRead_.buildTensor(g, poplar::UNSIGNED_CHAR,{kNumRayTracerTiles, kRayTracerDebugSize});
     poputil::mapTensorLinearlyWithOffset(g, rtDebugRead_.get().reshape({kNumRayTracerTiles, kRayTracerDebugSize}), 0);
@@ -323,9 +326,9 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
         g.connect(v["adjacency"],    in_adj.get());
 
         // Ray IO slices ------------------------------------------------------
-        const auto out_slice = rayTracerOutputRays_.slice(tid * kRayIOBytesPerTile,
+        const auto out_slice = rtRaysOut.slice(tid * kRayIOBytesPerTile,
                                                           (tid+1)*kRayIOBytesPerTile);
-        const auto in_slice  = rayTracerInputRays_ .slice(tid * kRayIOBytesPerTile,
+        const auto in_slice  = rtRaysIn .slice(tid * kRayIOBytesPerTile,
                                                           (tid+1)*kRayIOBytesPerTile);
         g.setTileMapping(out_slice, tid);
         g.setTileMapping(in_slice,  tid);
@@ -358,6 +361,10 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
 
         auto writeOffs = finishedWriteOffsets_.get().slice({tid},{tid+1}).reshape({});
         g.connect(v["finishedWriteOffset"],  writeOffs);
+
+        auto seedSlice = rtSeedInput_.slice(tid * sizeof(Ray), (tid + 1) * sizeof(Ray));
+        g.setTileMapping(seedSlice, tid);
+        g.connect(v["seedRay"], seedSlice);
 
         const auto kNumWorkers = 6;
         auto readyFlags    = g.addVariable(poplar::UNSIGNED_INT, {kNumWorkers}, "readyFlags");
@@ -833,31 +840,37 @@ void RadiantFoamIpuBuilder::buildRayRoutersL4(poplar::Graph& g, poplar::ComputeS
 
 void RadiantFoamIpuBuilder::buildRayGenerator(poplar::Graph& g, poplar::ComputeSet& cs) {
     const size_t kRayIOBytesPerTile = kNumRays * sizeof(Ray);
-    const unsigned kPendingFactor = 2;
+    const size_t allSeedBytes = kNumRayTracerTiles * sizeof(Ray);
+    // const unsigned kPendingFactor = 2;
 
     auto v = g.addVertex(cs, "RayGenerator");
-    raygenInput  = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile}, "raygen_in");
-    raygenOutput = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile}, "raygen_out");
-    SetInit<uint8_t>(g, raygenInput,  0xFF);
-    SetInit<uint8_t>(g, raygenOutput, 0xFF);
-    g.setTileMapping(raygenInput,  kRaygenTile);
-    g.setTileMapping(raygenOutput, kRaygenTile);
-    g.connect(v["RaysIn"],  raygenInput);
-    g.connect(v["RaysOut"], raygenOutput);
+    // raygenInput  = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile}, "raygen_in");
+    // raygenOutput = g.addVariable(poplar::UNSIGNED_CHAR,{kRayIOBytesPerTile}, "raygen_out");
+    // SetInit<uint8_t>(g, raygenInput,  0xFF);
+    // SetInit<uint8_t>(g, raygenOutput, 0xFF);
+    // g.setTileMapping(raygenInput,  kRaygenTile);
+    // g.setTileMapping(raygenOutput, kRaygenTile);
+    // g.connect(v["RaysIn"],  raygenInput);
+    // g.connect(v["RaysOut"], raygenOutput);
 
-    auto rgPending = g.addVariable(poplar::UNSIGNED_CHAR, {kPendingFactor * kRayIOBytesPerTile}, "rg_pending_rays");
-    SetInit<uint8_t>(g, rgPending, 0xFF); 
-    g.setTileMapping(rgPending, kRaygenTile);
-    g.connect(v["pendingRays"],  rgPending);
+    // auto rgPending = g.addVariable(poplar::UNSIGNED_CHAR, {kPendingFactor * kRayIOBytesPerTile}, "rg_pending_rays");
+    // SetInit<uint8_t>(g, rgPending, 0xFF); 
+    // g.setTileMapping(rgPending, kRaygenTile);
+    // g.connect(v["pendingRays"],  rgPending);
 
-    auto rgHead = g.addVariable(poplar::UNSIGNED_INT, {}, "rg_pending_head");
-    auto rgTail = g.addVariable(poplar::UNSIGNED_INT, {}, "rg_pending_tail");
-    g.setInitialValue(rgHead, poplar::ArrayRef<unsigned>({0u}));
-    g.setInitialValue(rgTail, poplar::ArrayRef<unsigned>({0u}));
-    g.setTileMapping(rgHead, kRaygenTile);
-    g.setTileMapping(rgTail, kRaygenTile);
-    g.connect(v["pendingHead"], rgHead);
-    g.connect(v["pendingTail"], rgTail);
+    // auto rgHead = g.addVariable(poplar::UNSIGNED_INT, {}, "rg_pending_head");
+    // auto rgTail = g.addVariable(poplar::UNSIGNED_INT, {}, "rg_pending_tail");
+    // g.setInitialValue(rgHead, poplar::ArrayRef<unsigned>({0u}));
+    // g.setInitialValue(rgTail, poplar::ArrayRef<unsigned>({0u}));
+    // g.setTileMapping(rgHead, kRaygenTile);
+    // g.setTileMapping(rgTail, kRaygenTile);
+    // g.connect(v["pendingHead"], rgHead);
+    // g.connect(v["pendingTail"], rgTail);
+
+    rgSeedsOut_ = g.addVariable(poplar::UNSIGNED_CHAR, {allSeedBytes}, "rg_seeds_out");
+    SetInit<uint8_t>(g, rgSeedsOut_, 0xFF);
+    g.setTileMapping(rgSeedsOut_, kRaygenTile);
+    g.connect(v["seedRaysOut"], rgSeedsOut_);
 
     cameraCellInfo_.buildTensor(g, poplar::UNSIGNED_CHAR,{4});
     g.setTileMapping(cameraCellInfo_.get(),kRaygenTile);
@@ -913,7 +926,7 @@ poplar::program::Sequence RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph
     for (uint16_t l0 = 0; l0 < kNumL0RouterTiles; ++l0) {
       const size_t baseRT = static_cast<size_t>(l0) * kChildrenPerRouter * kRayIOBytesPerTile;
       srcAll.push_back(childBlock(L0RouterOut, l0)); // 4×bytes
-      dstAll.push_back(rayTracerInputRays_.slice(baseRT, baseRT + kChildrenPerRouter * kRayIOBytesPerTile));
+      dstAll.push_back(rtRaysIn.slice(baseRT, baseRT + kChildrenPerRouter * kRayIOBytesPerTile));
     }
     data_exchange_seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
                                   /*dontOutline*/true, DebugContext{"DX/L0->RT/down"}));
@@ -921,7 +934,7 @@ poplar::program::Sequence RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph
     srcAll.clear(); dstAll.clear();
     for (uint16_t l0 = 0; l0 < kNumL0RouterTiles; ++l0) {
       const size_t baseRT = static_cast<size_t>(l0) * kChildrenPerRouter * kRayIOBytesPerTile;
-      srcAll.push_back(rayTracerOutputRays_.slice(baseRT, baseRT + kChildrenPerRouter * kRayIOBytesPerTile));
+      srcAll.push_back(rtRaysOut.slice(baseRT, baseRT + kChildrenPerRouter * kRayIOBytesPerTile));
       dstAll.push_back(childBlock(L0RouterIn, l0)); // 4×bytes
     }
     data_exchange_seq.add(poplar::program::Copy(poplar::concat(srcAll), poplar::concat(dstAll),
@@ -1088,21 +1101,34 @@ poplar::program::Sequence RadiantFoamIpuBuilder::buildDataExchange(poplar::Graph
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // L4 parent ↔ RayGen child   (DOWN: RG→L4 parent,  UP: L4 parent→RG)
+    // L4 parent out -> in self
     // ────────────────────────────────────────────────────────────────────────────
     {
         // DOWN: RayGen RaysOut -> L4 parentIn
-        data_exchange_seq.add(poplar::program::Copy(
-            raygenOutput,
-            L4RouterIn.slice(0, kNumRays*sizeof(Ray)),
-            true, DebugContext{"DX/RG->L4/down"}));
+        // data_exchange_seq.add(poplar::program::Copy(
+        //     raygenOutput,
+        //     L4RouterIn.slice(0, kNumRays*sizeof(Ray)),
+        //     true, DebugContext{"DX/RG->L4/down"}));
 
-        // UP: L4 parentOut -> RayGen RaysIn
-        data_exchange_seq.add(poplar::program::Copy(
-            L4RouterOut.slice(0, kNumRays*sizeof(Ray)),
-            raygenInput,
-            true, DebugContext{"DX/L4->RG/up"}));
+        // // UP: L4 parentOut -> RayGen RaysIn
+        // data_exchange_seq.add(poplar::program::Copy(
+        //     L4RouterOut.slice(0, kNumRays*sizeof(Ray)),
+        //     raygenInput,
+        //     true, DebugContext{"DX/L4->RG/up"}));
+
+        // data_exchange_seq.add(poplar::program::Copy(
+        //     L4RouterOut.slice(0, kNumRays*sizeof(Ray)),
+        //     L4RouterIn.slice(0, kNumRays*sizeof(Ray)),
+        //     true, DebugContext{"DX/L4->L4/updown"}));
     }
+    // ────────────────────────────────────────────────────────────────────────────
+    // RayGen -> RayTracer
+    // ────────────────────────────────────────────────────────────────────────────
+    data_exchange_seq.add(poplar::program::Copy(
+      rgSeedsOut_, rtSeedInput_,
+      /*dontOutline*/ true,
+      DebugContext{"DX/RG->RT/seed"}));
+
 
   return data_exchange_seq;
 }
