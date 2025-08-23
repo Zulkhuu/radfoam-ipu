@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
   bool enableDebug = result["debug"].as<bool>();
   int uiPort = result["port"].as<int>();
   
-  bool dynamic_camera = false;
+  bool dynamic_camera = true;
   int inital_camera_setup = 0;
   radfoam::geometry::GenericPoint initial_camera_cell;
   InterfaceServer::State initial_state;
@@ -357,9 +357,9 @@ int main(int argc, char** argv) {
       if (enableUI) {
         hostProcessing.waitForCompletion();
         state = uiServer->consumeState();
-        if (state.device == "rgb") {
+        if (state.mode == "rgb") {
           vis_mode = 0;
-        } else if(state.device == "depth") {
+        } else if(state.mode == "depth") {
           vis_mode = 1;
         }
       }
@@ -422,9 +422,9 @@ int main(int argc, char** argv) {
       if (enableUI) {
         hostProcessing.waitForCompletion();
         state = uiServer->consumeState();
-        if (state.device == "rgb") {
+        if (state.mode == "rgb") {
           vis_mode = 0;
-        } else if(state.device == "depth") {
+        } else if(state.mode == "depth") {
           vis_mode = 1;
         }
       }
