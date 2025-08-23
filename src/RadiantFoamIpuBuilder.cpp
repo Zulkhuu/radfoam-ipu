@@ -56,34 +56,32 @@ void RadiantFoamIpuBuilder::updateCameraParameters(const InterfaceServer::State&
   this->updateProjectionMatrix(inverseProj);
 
   // Update (inverse) view matrix
-  float yaw   = glm::radians(state.envRotationDegrees);
-  float pitch = glm::radians(state.envRotationDegrees2);
+  // --- camera pose from UI ---
+  const float yawDeg   = state.envRotationDegrees;   // left-right
+  const float pitchDeg = state.envRotationDegrees2;  // up-down
 
-  float maxVal = 40, minVal = -40;
+  // clamp pitch to avoid gimbal/flip
+  // const float pitch = glm::radians(glm::clamp(pitchDeg, -89.0f, 89.0f));
+  const float pitch = glm::radians(pitchDeg);
+  const float yaw   = glm::radians(yawDeg);
+
+  float maxVal = 20, minVal = -maxVal;
   float x = minVal + state.X * (maxVal - minVal);
   float y = minVal + state.Y * (maxVal - minVal);
   float z = minVal + state.Z * (maxVal - minVal);
   
   glm::vec3 position(x, y, z);
-  glm::mat4 view = glm::lookAt(
-    position,
-    position + glm::vec3(0.0f, 0.0f, -1.0f),
-    glm::vec3(0.0f, 1.0f, 0.0f)
-  );
 
   // forward vector from yaw & pitch
-  // glm::vec3 forward;
-  // forward.x = cos(pitch) * cos(yaw);
-  // forward.y = sin(pitch);
-  // forward.z = cos(pitch) * sin(yaw);
-  // forward   = glm::normalize(forward);
+  glm::vec3 forward;
+  forward.x =  cos(pitch) * cos(yaw);
+  forward.y =  sin(pitch);
+  forward.z =  cos(pitch) * sin(yaw);
+  forward   = glm::normalize(forward);
 
-  // glm::mat4 view = glm::lookAt(position, position + forward, glm::vec3(0,1,0));
+  const glm::vec3 worldUp(0.0f, 0.0f, 1.0f);
 
-  view = glm::rotate(view, yaw, glm::vec3(0.0f, 1.0f, 0.0f));
-  view = glm::rotate(view, pitch, glm::vec3(1.0f, 0.0f, 0.0f));
-  // view = glm::rotate(view, glm::radians(152.0f), glm::vec3(1.0f, 0.0f, 0.0f));
-
+  glm::mat4 view = glm::lookAt(position, position + forward, worldUp);
   glm::mat4 inverseView = glm::inverse(view);
   cameraPosition_ = glm::vec3(inverseView[3]);
   this->updateViewMatrix(inverseView);
