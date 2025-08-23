@@ -210,6 +210,9 @@ void RadiantFoamIpuBuilder::allocateGlobalTensors(poplar::Graph& g) {
 
     framebuffer_read_.buildTensor(g,  poplar::UNSIGNED_CHAR, {kNumRayTracerTiles, kTileFramebufferSize});
     poputil::mapTensorLinearlyWithOffset(g, framebuffer_read_.get().reshape({kNumRayTracerTiles, kTileFramebufferSize}), 0);
+    auto fbFlat = framebuffer_read_.get().reshape({kNumRayTracerTiles * kTileFramebufferSize});
+    std::vector<uint8_t> fbInitsZeros(fbFlat.numElements(), 0u);
+    g.setInitialValue(fbFlat, poplar::ArrayRef<uint8_t>(fbInitsZeros));
     
     const size_t kFinishedRayBytesPerTile = kNumRays * kFinishedFactor * sizeof(FinishedRay);
     // finishedRaysRead_.buildTensor(g,  poplar::UNSIGNED_CHAR, {kNumRayTracerTiles * kFinishedRayBytesPerTile});

@@ -49,7 +49,7 @@ using radfoam::geometry::FinishedPixel;
 
 using ipu_utils::logger;
 
-static std::pair<cv::Mat, size_t> AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRaysHost, int mode) {
+static std::pair<cv::Mat, size_t> AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRaysHost, std::string mode) {
   static cv::Mat rgb_img   (kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0));
   static cv::Mat depth_img (kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0));
 
@@ -115,10 +115,10 @@ static std::pair<cv::Mat, size_t> AssembleFinishedRaysImage(const std::vector<ui
     }
   }
 
-  return {(mode == 0) ? rgb_img : depth_img, updatedPixels.load()};
+  return {(mode == "depth") ? depth_img : rgb_img, updatedPixels.load()};
 }
 
-static std::pair<cv::Mat, size_t> AssembleFramebufferImage(const std::vector<uint8_t>& fbBytes, int mode)
+static std::pair<cv::Mat, size_t> AssembleFramebufferImage(const std::vector<uint8_t>& fbBytes, std::string mode)
 {
   const int W = static_cast<int>(radfoam::config::kFullImageWidth);
   const int H = static_cast<int>(radfoam::config::kFullImageHeight);
@@ -178,7 +178,7 @@ static std::pair<cv::Mat, size_t> AssembleFramebufferImage(const std::vector<uin
     }
   }
 
-  return {(mode == 0) ? rgb_img : depth_img, updated.load()};
+  return {(mode == "depth") ? depth_img : rgb_img, updated.load()};
 }
 
 size_t CountNonZeroPixels(const cv::Mat& img) {
@@ -189,12 +189,17 @@ size_t CountNonZeroPixels(const cv::Mat& img) {
     return static_cast<size_t>(cv::countNonZero(mask));
 }
 
-int main(int argc, char** argv) {
+struct CliOptions {
+  std::string inputFile = "./data/garden.h5";
+  int nRuns = 0;                       // 0 == infinite
+  bool enableUI = true;
+  bool enableLoopIPU = false;
+  bool enableDebug = false;
+  int uiPort = 5000;
+};
 
-  pvti::TraceChannel traceChannel = {"RadiantFoamIpu"};
-
+static CliOptions parseOptions(int argc, char** argv) {
   cxxopts::Options options("radiantfoam_ipu", "RadiantFoam IPU Renderer");
-
   options.add_options()
     ("i,input", "Input HDF5 file", cxxopts::value<std::string>()->default_value("./data/garden.h5"))
     ("n,nruns", "Number of runs to execute 0=inf", cxxopts::value<int>()->default_value("0"))
@@ -205,102 +210,67 @@ int main(int argc, char** argv) {
     ("h,help", "Print usage");
 
   auto result = options.parse(argc, argv);
-
   if (result.count("help")) {
     std::cout << options.help() << std::endl;
-    return 0;
+    std::exit(0);
   }
 
-  std::string inputFile = result["input"].as<std::string>();
-  int nRuns = result["nruns"].as<int>();
-  int vis_mode = 0;
-  bool enableUI = !result["no-ui"].as<bool>();
-  bool enableLoopIPU = result["ipu-loop"].as<bool>();
-  bool enableDebug = result["debug"].as<bool>();
-  int uiPort = result["port"].as<int>();
-  
-  bool dynamic_camera = true;
-  int inital_camera_setup = 0;
-  radfoam::geometry::GenericPoint initial_camera_cell;
-  InterfaceServer::State initial_state;
-  
-  if(inital_camera_setup == 0) {    
-    initial_state.fov    = glm::radians(60.f);
-    initial_state.X = 0.5f;
-    initial_state.Y = 0.5f;
-    initial_state.Z = 0.58374875f;
-    initial_state.envRotationDegrees = 92.0f;
-    initial_state.envRotationDegrees2 = 151.0f;
-    initial_camera_cell = { 6.6959f, -0.1134f,  0.2045f,
-      static_cast<uint16_t>(60),   // cluster_id
-      static_cast<uint16_t>(2476)   // local_id
-    };
-  }
-  
-  if(inital_camera_setup == 1) {
-    initial_camera_cell = radfoam::geometry::GenericPoint{
-      0.6503f, -1.2979f,  3.3524f, 
-      static_cast<uint16_t>(779),   // cluster_id
-      static_cast<uint16_t>(3532)   // local_id
-    };
-  }
+  CliOptions opts;
+  opts.inputFile     = result["input"].as<std::string>();
+  opts.nRuns         = result["nruns"].as<int>();
+  opts.enableUI      = !result["no-ui"].as<bool>();
+  opts.enableLoopIPU = result["ipu-loop"].as<bool>();
+  opts.enableDebug   = result["debug"].as<bool>();
+  opts.uiPort        = result["port"].as<int>();
+  return opts;
+}
 
-  std::unique_ptr<KDTreeManager> kdtree;
-  if (dynamic_camera) {
-    kdtree = std::make_unique<KDTreeManager>(inputFile);
-  }
-
-  auto get_camera_cell = [&](const glm::vec3& camera_pos) -> radfoam::geometry::GenericPoint {
-    if (dynamic_camera && kdtree) {
-      return kdtree->getNearestNeighbor(camera_pos);
-    }
-    return initial_camera_cell;
-  };
-
-  // ------------------------------
-  // Poplar Engine Options
-  // ------------------------------
-  poplar::OptionFlags engineOptions = {};
+static poplar::OptionFlags makeEngineOptions(bool enableDebug) {
+  poplar::OptionFlags engineOptions{};
   if (enableDebug) {
     logger()->info("Enabling Poplar auto-reporting (POPLAR_ENGINE_OPTIONS set)");
-    setenv("POPLAR_ENGINE_OPTIONS", R"({"autoReport.all":"true", "autoReport.executionProfileProgramRunCount":"10","target.hostSyncTimeout":"30", "debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
+    setenv("POPLAR_ENGINE_OPTIONS",
+           R"({"autoReport.all":"true","autoReport.executionProfileProgramRunCount":"10","target.hostSyncTimeout":"30","debug.retainDebugInformation":"true","autoReport.directory":"./report"})", 1);
     setenv("PVTI_OPTIONS", R"({"enable":"true"})", 1);
     engineOptions = {{"debug.instrument", "true"}};
   } else {
     unsetenv("POPLAR_ENGINE_OPTIONS");
     unsetenv("PVTI_OPTIONS");
     logger()->info("Poplar auto-reporting is NOT enabled");
-    engineOptions.set("streamCallbacks.multiThreadMode", "collaborative");   // host side
+    engineOptions.set("streamCallbacks.multiThreadMode", "collaborative");
     engineOptions.set("streamCallbacks.numWorkerThreads", "auto");
-    engineOptions.set("streamCallbacks.numaAware", "true");
+    engineOptions.set("streamCallbacks.numaAware",  "true");
     engineOptions.set("debug.instrument",           "false");
     engineOptions.set("debug.verify",               "false");
     engineOptions.set("target.deterministicWorkers","false");
   }
+  return engineOptions;
+}
+
+int main(int argc, char** argv) {
+
+  pvti::TraceChannel traceChannel = {"RadiantFoamIpu"};
+
+  const CliOptions opt = parseOptions(argc, argv);
+  
+  std::unique_ptr<KDTreeManager> kdtree;
+  kdtree = std::make_unique<KDTreeManager>(opt.inputFile);
+
   // ------------------------------
   // Build and Configure IPU Graph
   // ------------------------------
-  radfoam::ipu::RadiantFoamIpuBuilder builder(inputFile, enableLoopIPU, enableDebug);
+  auto engineOptions = makeEngineOptions(opt.enableDebug);
+  radfoam::ipu::RadiantFoamIpuBuilder builder(opt.inputFile, opt.enableLoopIPU, opt.enableDebug);
 
   ipu_utils::RuntimeConfig cfg{
-    /*numIpus=*/1,
-    /*numReplicas=*/1,
-    /*exeName=*/"radiantfoam_ipu",
-    /*useIpuModel=*/false,
-    /*saveExe=*/false,
-    /*loadExe=*/false,
-    /*compileOnly=*/false,
-    /*deferredAttach=*/false
+    /*numIpus=*/1, /*numReplicas=*/1, /*exeName=*/"radiantfoam_ipu",
+    /*useIpuModel=*/false, /*saveExe=*/false, /*loadExe=*/false,
+    /*compileOnly=*/false, /*deferredAttach=*/false
   };
   builder.setRuntimeConfig(cfg);
-
   ipu_utils::GraphManager mgr;
-
-  // Compile and Prepare Engine with Tracepoints
-  pvti::Tracepoint::begin(&traceChannel, "constructing_graph");
   mgr.compileOrLoad(builder, engineOptions);
   mgr.prepareEngine(engineOptions);
-  pvti::Tracepoint::end(&traceChannel, "constructing_graph");
 
   // ------------------------------
   // UI Setup
@@ -312,8 +282,8 @@ int main(int argc, char** argv) {
   InterfaceServer::State state;
   state.fov    = glm::radians(60.f);
 
-  if (enableUI && uiPort) {
-    uiServer = std::make_unique<InterfaceServer>(uiPort);
+  if (opt.enableUI && opt.uiPort) {
+    uiServer = std::make_unique<InterfaceServer>(opt.uiPort);
     uiServer->start();
     uiServer->initialiseVideoStream(imagePtr->cols, imagePtr->rows);
     uiServer->updateFov(state.fov);
@@ -324,7 +294,7 @@ int main(int argc, char** argv) {
   // ------------------------------
   AsyncTask hostProcessing;
   auto uiUpdateFunc = [&]() {
-    if (enableUI && uiServer) {
+    if (opt.enableUI && uiServer) {
       uiServer->sendPreviewImage(*imagePtrBuffered);
     }
   };
@@ -335,7 +305,17 @@ int main(int argc, char** argv) {
   bool fullImageUpdated = false;
   int step=0;
   
-  if(enableLoopIPU) { // use repeatwhiletrue for IPU execution
+  if(opt.enableLoopIPU) { // use repeatwhiletrue for IPU execution
+    {
+      if (opt.enableUI) {
+        hostProcessing.waitForCompletion();
+        state = uiServer->consumeState();
+      }
+      builder.updateCameraParameters(state);
+      auto camera_position = builder.getCameraPos();
+      auto camera_cell = kdtree->getNearestNeighbor(camera_position);
+      builder.updateCameraCell(camera_cell);
+    }
     builder.stopFlagHost_ = 1;
     std::thread ipuThread([&] {
       mgr.execute(builder);
@@ -343,25 +323,19 @@ int main(int argc, char** argv) {
 
     do {
       step++;
-      if(step==nRuns) {
+      if(step==opt.nRuns) {
         builder.stopFlagHost_ = 0;
         break;
       }
       
-      auto state_ = dynamic_camera ? state : initial_state;
-      builder.updateCameraParameters(state_);
+      builder.updateCameraParameters(state);
       auto camera_position = builder.getCameraPos();
-      auto camera_cell = get_camera_cell(camera_position);
+      auto camera_cell = kdtree->getNearestNeighbor(camera_position);
       builder.updateCameraCell(camera_cell);
 
-      if (enableUI) {
+      if (opt.enableUI) {
         hostProcessing.waitForCompletion();
         state = uiServer->consumeState();
-        if (state.mode == "rgb") {
-          vis_mode = 0;
-        } else if(state.mode == "depth") {
-          vis_mode = 1;
-        }
       }
       
       static unsigned lastFence = 0;
@@ -373,17 +347,15 @@ int main(int argc, char** argv) {
 
       // Take a stable snapshot of the streamed framebuffer bytes
       static std::vector<uint8_t> localCopy(builder.framebuffer_host.size());
-      std::memcpy(localCopy.data(),
-                  builder.framebuffer_host.data(),
-                  localCopy.size());
+      std::memcpy(localCopy.data(), builder.framebuffer_host.data(), localCopy.size());
 
-      auto [imageMat, updatedCount] = AssembleFramebufferImage(localCopy, vis_mode);
+      auto [imageMat, updatedCount] = AssembleFramebufferImage(localCopy, state.mode);
       *imagePtr = imageMat;
 
       std::swap(imagePtr, imagePtrBuffered);
-      if (enableUI) hostProcessing.run(uiUpdateFunc);
+      if (opt.enableUI) hostProcessing.run(uiUpdateFunc);
       
-      state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
+      state = opt.enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
 
       size_t nonZeroCount = CountNonZeroPixels(*imagePtr);
       if(!fullImageUpdated) {
@@ -400,7 +372,7 @@ int main(int argc, char** argv) {
 
       std::this_thread::sleep_for(std::chrono::milliseconds(1)); 
 
-    } while (!enableUI || (uiServer && !state.stop));
+    } while (!opt.enableUI || (uiServer && !state.stop));
 
     builder.stopFlagHost_ = 0;
     ipuThread.join();
@@ -409,39 +381,33 @@ int main(int argc, char** argv) {
 
     do {
       step++;
-      if(step==nRuns) {
+      if(step==opt.nRuns) {
         break;
       }
             
-      auto state_ = dynamic_camera ? state : initial_state;
-      builder.updateCameraParameters(state_);
+      builder.updateCameraParameters(state);
       auto camera_position = builder.getCameraPos();
-      auto camera_cell = get_camera_cell(camera_position);
+      auto camera_cell = kdtree->getNearestNeighbor(camera_position);
       builder.updateCameraCell(camera_cell);
 
-      if (enableUI) {
+      if (opt.enableUI) {
         hostProcessing.waitForCompletion();
         state = uiServer->consumeState();
-        if (state.mode == "rgb") {
-          vis_mode = 0;
-        } else if(state.mode == "depth") {
-          vis_mode = 1;
-        }
       }
       // per frame IPU program execution
       mgr.execute(builder);
 
-      auto [imageMat, updatedCount] = AssembleFramebufferImage(builder.framebuffer_host, vis_mode);
+      auto [imageMat, updatedCount] = AssembleFramebufferImage(builder.framebuffer_host, state.mode);
       *imagePtr = imageMat;
 
       std::swap(imagePtr, imagePtrBuffered);
-      if (enableUI) hostProcessing.run(uiUpdateFunc);
+      if (opt.enableUI) hostProcessing.run(uiUpdateFunc);
       
-      state = enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
+      state = opt.enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
 
       size_t nonZeroCount = CountNonZeroPixels(*imagePtr);
       if(!fullImageUpdated) {
-        std::cout << "Updated pixels: " << updatedCount << " Non zero: " << nonZeroCount << std::endl;
+        std::cout << step << ": Updated pixels: " << updatedCount << " Non zero: " << nonZeroCount << std::endl;
         if (nonZeroCount >= totalPixels*0.9995) {
           auto now = std::chrono::steady_clock::now();
           double elapsedSec = std::chrono::duration<double>(now - startTime).count();
@@ -451,13 +417,12 @@ int main(int argc, char** argv) {
         }
       }
 
-    } while (!enableUI || (uiServer && !state.stop));
+    } while (!opt.enableUI || (uiServer && !state.stop));
   }
 
+  if (opt.enableUI) hostProcessing.waitForCompletion();
 
-  if (enableUI) hostProcessing.waitForCompletion();
-
-  auto [imageMat, updatedCount] = AssembleFramebufferImage(builder.framebuffer_host, vis_mode);
+  auto [imageMat, updatedCount] = AssembleFramebufferImage(builder.framebuffer_host, state.mode);
   cv::imwrite("framebuffer_full.png", imageMat);
 
   return 0;
