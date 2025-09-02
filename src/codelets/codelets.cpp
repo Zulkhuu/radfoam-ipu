@@ -220,11 +220,6 @@ public:
 
         const float delta = closestT - t0;
         const float alpha = 1.f - __builtin_ipu_exp(-cur->density * delta);
-        // const float x_ = cur->density * delta;
-        // const float alpha = (x_ > -0.125f && x_ < 0.125f)
-        //                   ? (x_ - 0.5f*x_*x_)              // 2-term expm1 approx
-        //                   : (1.f - __builtin_ipu_exp(-x_));
-
         const float ta    = transmittance * alpha;
 
         color.x += ta * (cur->r / 255.f);
@@ -466,10 +461,12 @@ public:
     if(raygen_mode == 1) {
       const unsigned interval = 1;
       const unsigned nColsPerFrame = 2;
-      unsigned frame_required = interval * (kFullImageWidth / nColsPerFrame);
-      const bool genThisFrame = ((*exec_count % interval) == 0);
-      if (genThisFrame) {
-        const unsigned colBase = ((*exec_count)/interval) * nColsPerFrame;
+      const unsigned idleFramesAfterSweep = 200;
+      const unsigned sweepFrames = (kFullImageWidth + nColsPerFrame - 1) / nColsPerFrame;
+      const unsigned cycleLen = sweepFrames + idleFramesAfterSweep;
+      const unsigned phase    = (*exec_count) % cycleLen;
+      if (phase < sweepFrames) {
+        const unsigned colBase = phase * nColsPerFrame;
 
         // Don’t generate more than remaining output capacity + queue free slots
         unsigned budget = (C - outCnt) + qFree(head, tail);
@@ -700,7 +697,7 @@ public:
 
     if(workerId == 0) {
       invalidateAfterRouting();      
-      // writeDebugInfos();
+      writeDebugInfos();
     }
 
     return true;

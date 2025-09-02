@@ -2,6 +2,7 @@
 
 #include <spdlog/fmt/fmt.h>
 #include <poplar/Program.hpp>
+#include <algorithm> 
 
 // Utility macro for logging inside the class implementation
 #define RF_LOG(...) ipu_utils::logger()->info(__VA_ARGS__)
@@ -1259,12 +1260,86 @@ void RadiantFoamIpuBuilder::readAllTiles(poplar::Engine& eng) {
         }
     };
     // call once per level ----------------------------------------------------------
-    dumpRouters("L0", l0routerDebugBytesHost_, kNumL0RouterTiles);
-    dumpRouters("L1", l1routerDebugBytesHost_, kNumL1RouterTiles);
-    dumpRouters("L2", l2routerDebugBytesHost_, kNumL2RouterTiles);
-    dumpRouters("L3", l3routerDebugBytesHost_, kNumL3RouterTiles);
-    dumpRouters("L4", l4routerDebugBytesHost_, kNumL4RouterTiles);
-    dumpRouters("RG", raygenDebugBytesHost_,  1);   
+    // dumpRouters("L0", l0routerDebugBytesHost_, kNumL0RouterTiles);
+    // dumpRouters("L1", l1routerDebugBytesHost_, kNumL1RouterTiles);
+    // dumpRouters("L2", l2routerDebugBytesHost_, kNumL2RouterTiles);
+    // dumpRouters("L3", l3routerDebugBytesHost_, kNumL3RouterTiles);
+    // dumpRouters("L4", l4routerDebugBytesHost_, kNumL4RouterTiles);
+    // dumpRouters("RG", raygenDebugBytesHost_,  1);   
+
+  {
+      // Ensure 1024 slots (RT tiles)
+      if (raysCount_.size() < kNumRayTracerTiles)
+          raysCount_.resize(kNumRayTracerTiles, 0u);
+      else
+          std::fill(raysCount_.begin(), raysCount_.begin() + kNumRayTracerTiles, 0u);
+
+      for (std::size_t rid = 0; rid < kNumL0RouterTiles; ++rid) {
+          const unsigned* base = &l0routerDebugBytesHost_[rid * kRouterDebugSize];
+          for (int child = 0; child < 4; ++child) {
+              const std::size_t tid = rid * 4 + static_cast<std::size_t>(child);
+              const unsigned inV  = base[1 + child];   // child IN  [1..4]
+              const unsigned outV = base[7 + child];   // child OUT [7..10]
+              raysCount_[tid] = std::max(inV, outV);
+          }
+      }
+  }
+
+  {
+      const auto max_all_10 = [&](const unsigned* base) -> unsigned {
+          unsigned m = 0;
+          // IN: base[0..4]
+          for (int i = 0; i <= 4; ++i) m = std::max(m, base[i]);
+          // OUT: base[6], base[7..10]
+          m = std::max(m, base[6]);
+          for (int i = 7; i <= 10; ++i) m = std::max(m, base[i]);
+          return m;
+      };
+
+      // Compute total routers across levels
+      const std::size_t totalRouters =
+          kNumL0RouterTiles + kNumL1RouterTiles + kNumL2RouterTiles +
+          kNumL3RouterTiles + kNumL4RouterTiles;
+
+      const std::size_t baseRouters = kNumRayTracerTiles; // start at index 1024
+      const std::size_t needed = baseRouters + totalRouters + 1;
+
+      if (raysCount_.size() < needed) {
+          raysCount_.resize(needed, 0u);
+      } else {
+          std::fill(raysCount_.begin() + baseRouters, raysCount_.begin() + needed, 0u);
+      }
+
+      std::size_t idx = baseRouters;
+
+      // L0 routers
+      for (std::size_t rid = 0; rid < kNumL0RouterTiles; ++rid) {
+          const unsigned* base = &l0routerDebugBytesHost_[rid * kRouterDebugSize];
+          raysCount_[idx++] = max_all_10(base);
+      }
+      // L1 routers
+      for (std::size_t rid = 0; rid < kNumL1RouterTiles; ++rid) {
+          const unsigned* base = &l1routerDebugBytesHost_[rid * kRouterDebugSize];
+          raysCount_[idx++] = max_all_10(base);
+      }
+      // L2 routers
+      for (std::size_t rid = 0; rid < kNumL2RouterTiles; ++rid) {
+          const unsigned* base = &l2routerDebugBytesHost_[rid * kRouterDebugSize];
+          raysCount_[idx++] = max_all_10(base);
+      }
+      // L3 routers
+      for (std::size_t rid = 0; rid < kNumL3RouterTiles; ++rid) {
+          const unsigned* base = &l3routerDebugBytesHost_[rid * kRouterDebugSize];
+          raysCount_[idx++] = max_all_10(base);
+      }
+      // L4 routers
+      for (std::size_t rid = 0; rid < kNumL4RouterTiles; ++rid) {
+          const unsigned* base = &l4routerDebugBytesHost_[rid * kRouterDebugSize];
+          raysCount_[idx++] = max_all_10(base);
+      }
+      raysCount_.back() = kNumRays;
+  }
+
 
 }
 

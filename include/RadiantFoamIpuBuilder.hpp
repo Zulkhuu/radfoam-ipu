@@ -56,6 +56,7 @@ public:
 
     unsigned stopFlagHost_;
     std::atomic<uint32_t> frameFenceHost_{0};
+    std::vector<unsigned> raysCount_;
 
 private:
     // ───────────── helper sections used by build() ─────────────
@@ -143,6 +144,7 @@ private:
     std::vector<unsigned> l3routerDebugBytesHost_;
     std::vector<unsigned> l4routerDebugBytesHost_;
     std::vector<unsigned> raygenDebugBytesHost_;
+
 
     // Helper program sequences ----------------------------------------------
     poplar::program::Sequence per_tile_writes_;

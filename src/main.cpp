@@ -397,6 +397,10 @@ int main(int argc, char** argv) {
       // per frame IPU program execution
       mgr.execute(builder);
 
+      if (opt.enableDebug) {
+        uiServer->sendHistogram(builder.raysCount_);
+      }
+
       auto [imageMat, updatedCount] = AssembleFramebufferImage(builder.framebuffer_host, state.mode);
       *imagePtr = imageMat;
 
