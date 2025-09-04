@@ -230,8 +230,8 @@ public:
         t0       = __builtin_ipu_max(t0, closestT);
 
         // Finish or cross boundary?
-        if (transmittance < 0.5f || next == -1 || next >= nLocalPts) {
-          if (transmittance < 0.5f || next == -1) {
+        if (transmittance < 0.01f || next == -1 || next >= nLocalPts) {
+          if (transmittance < 0.01f || next == -1) {
             // Finished on this tile
             out->x = in->x; 
             out->y = packY(y_coord, 2);

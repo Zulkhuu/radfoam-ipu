@@ -49,6 +49,101 @@ using radfoam::geometry::FinishedPixel;
 
 using ipu_utils::logger;
 
+// === UI State persistence helpers ==========================================
+
+// detection idiom for optional members
+template<typename T, typename = void> struct has_fov : std::false_type{};
+template<typename T> struct has_fov<T, std::void_t<decltype(std::declval<T>().fov)>> : std::true_type{};
+
+template<typename T, typename = void> struct has_mode : std::false_type{};
+template<typename T> struct has_mode<T, std::void_t<decltype(std::declval<T>().mode)>> : std::true_type{};
+
+template<typename T, typename = void> struct has_stop : std::false_type{};
+template<typename T> struct has_stop<T, std::void_t<decltype(std::declval<T>().stop)>> : std::true_type{};
+
+template<typename T, typename = void> struct has_envYaw : std::false_type{};
+template<typename T> struct has_envYaw<T, std::void_t<decltype(std::declval<T>().envRotationDegrees)>> : std::true_type{};
+
+template<typename T, typename = void> struct has_envPitch : std::false_type{};
+template<typename T> struct has_envPitch<T, std::void_t<decltype(std::declval<T>().envRotationDegrees2)>> : std::true_type{};
+
+template<typename T, typename = void> struct has_X : std::false_type{};
+template<typename T> struct has_X<T, std::void_t<decltype(std::declval<T>().X)>> : std::true_type{};
+template<typename T, typename = void> struct has_Y : std::false_type{};
+template<typename T> struct has_Y<T, std::void_t<decltype(std::declval<T>().Y)>> : std::true_type{};
+template<typename T, typename = void> struct has_Z : std::false_type{};
+template<typename T> struct has_Z<T, std::void_t<decltype(std::declval<T>().Z)>> : std::true_type{};
+
+template<typename T, typename = void> struct has_eye : std::false_type{};
+template<typename T> struct has_eye<T, std::void_t<decltype(std::declval<T>().eye)>> : std::true_type{};
+template<typename T, typename = void> struct has_center : std::false_type{};
+template<typename T> struct has_center<T, std::void_t<decltype(std::declval<T>().center)>> : std::true_type{};
+template<typename T, typename = void> struct has_up : std::false_type{};
+template<typename T> struct has_up<T, std::void_t<decltype(std::declval<T>().up)>> : std::true_type{};
+
+static std::string vec3_to_csv(const glm::vec3& v) {
+  std::ostringstream ss; ss << v.x << "," << v.y << "," << v.z; return ss.str();
+}
+static glm::vec3 csv_to_vec3(const std::string& s) {
+  glm::vec3 v{0}; char c;
+  std::istringstream ss(s);
+  if (!(ss >> v.x)) return v;
+  if (ss >> c && c == ',') ss >> v.y;
+  if (ss >> c && c == ',') ss >> v.z;
+  return v;
+}
+
+template<typename StateT>
+void SaveStateToFile(const StateT& s, const std::string& path) {
+  std::ofstream out(path, std::ios::trunc);
+  if (!out) { std::cerr << "Failed to open UI state file for write: " << path << "\n"; return; }
+  out << "# RadiantFoam UI State\n";
+  if constexpr (has_fov<StateT>::value)   out << "fov=" << s.fov << "\n";
+  if constexpr (has_mode<StateT>::value)  out << "mode=" << s.mode << "\n";
+  if constexpr (has_stop<StateT>::value)  out << "stop=" << (s.stop ? 1 : 0) << "\n";
+  if constexpr (has_envYaw<StateT>::value)   out << "envRotationDegrees="  << s.envRotationDegrees  << "\n";
+  if constexpr (has_envPitch<StateT>::value) out << "envRotationDegrees2=" << s.envRotationDegrees2 << "\n";
+  if constexpr (has_X<StateT>::value) out << "X=" << s.X << "\n";
+  if constexpr (has_Y<StateT>::value) out << "Y=" << s.Y << "\n";
+  if constexpr (has_Z<StateT>::value) out << "Z=" << s.Z << "\n";
+}
+
+template<typename StateT>
+bool LoadStateFromFile(StateT& s, const std::string& path) {
+  std::ifstream in(path);
+  if (!in) return false;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    auto eq = line.find('=');
+    if (eq == std::string::npos) continue;
+    std::string k = line.substr(0, eq);
+    std::string v = line.substr(eq+1);
+
+    if constexpr (has_fov<StateT>::value) {
+      if (k == "fov") { s.fov = std::stof(v); continue; }
+    }
+    if constexpr (has_mode<StateT>::value) {
+      if (k == "mode") { s.mode = v; continue; }
+    }
+    if constexpr (has_stop<StateT>::value) {
+      if (k == "stop") { s.stop = (v=="1" || v=="true"); continue; }
+    }
+    if constexpr (has_envYaw<StateT>::value) {
+      if (k == "envRotationDegrees") { s.envRotationDegrees = std::stof(v); continue; }
+    }
+    if constexpr (has_envPitch<StateT>::value) {
+      if (k == "envRotationDegrees2") { s.envRotationDegrees2 = std::stof(v); continue; }
+    }
+    if constexpr (has_X<StateT>::value) { if (k == "X") { s.X = std::stof(v); continue; } }
+    if constexpr (has_Y<StateT>::value) { if (k == "Y") { s.Y = std::stof(v); continue; } }
+    if constexpr (has_Z<StateT>::value) { if (k == "Z") { s.Z = std::stof(v); continue; } }
+  }
+  return true;
+}
+
+
+
 static std::pair<cv::Mat, size_t> AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRaysHost, std::string mode) {
   static cv::Mat rgb_img   (kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0));
   static cv::Mat depth_img (kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0));
@@ -196,6 +291,9 @@ struct CliOptions {
   bool enableLoopIPU = false;
   bool enableDebug = false;
   int uiPort = 5000;
+  std::string uiStatePath = "ui_state.txt";
+  bool loadUIState = false;
+  bool saveUIState = false;
 };
 
 static CliOptions parseOptions(int argc, char** argv) {
@@ -207,7 +305,11 @@ static CliOptions parseOptions(int argc, char** argv) {
     ("ipu-loop", "Enable multi frame IPU loop before CPU read", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("debug", "Enable debug reporting", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("p,port", "UI port", cxxopts::value<int>()->default_value("5000"))
+    ("ui-state", "Path to UI state file", cxxopts::value<std::string>()->default_value("ui_state.txt"))
+    ("load-ui-state", "Load UI state from file at startup", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
+    ("save-ui-state", "Save UI state to file at shutdown", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("h,help", "Print usage");
+   
 
   auto result = options.parse(argc, argv);
   if (result.count("help")) {
@@ -222,6 +324,9 @@ static CliOptions parseOptions(int argc, char** argv) {
   opts.enableLoopIPU = result["ipu-loop"].as<bool>();
   opts.enableDebug   = result["debug"].as<bool>();
   opts.uiPort        = result["port"].as<int>();
+  opts.uiStatePath   = result["ui-state"].as<std::string>();
+  opts.loadUIState   = result["load-ui-state"].as<bool>();
+  opts.saveUIState   = result["save-ui-state"].as<bool>();
   return opts;
 }
 
@@ -281,6 +386,17 @@ int main(int argc, char** argv) {
   std::unique_ptr<InterfaceServer> uiServer;
   InterfaceServer::State state;
   state.fov    = glm::radians(60.f);
+  if (opt.loadUIState) {
+    if (LoadStateFromFile(state, opt.uiStatePath)) {
+      logger()->info("Loaded UI state from {}", opt.uiStatePath);
+      // If you want the UI controls to reflect this immediately, and if your server
+      // exposes a method to push state, call it here (e.g., uiServer->applyState(state)).
+      // For now we at least push fov if UI is on:
+    } else {
+      logger()->warn("No UI state loaded (file not found or unreadable): {}", opt.uiStatePath);
+    }
+    state.stop = false;
+  }
 
   if (opt.enableUI && opt.uiPort) {
     uiServer = std::make_unique<InterfaceServer>(opt.uiPort);
@@ -309,7 +425,8 @@ int main(int argc, char** argv) {
     {
       if (opt.enableUI) {
         hostProcessing.waitForCompletion();
-        state = uiServer->consumeState();
+        if(!opt.loadUIState)
+          state = uiServer->consumeState();
       }
       builder.updateCameraParameters(state);
       auto camera_position = builder.getCameraPos();
@@ -335,7 +452,8 @@ int main(int argc, char** argv) {
 
       if (opt.enableUI) {
         hostProcessing.waitForCompletion();
-        state = uiServer->consumeState();
+        if(!opt.loadUIState)
+          state = uiServer->consumeState();
       }
       
       static unsigned lastFence = 0;
@@ -355,7 +473,7 @@ int main(int argc, char** argv) {
       std::swap(imagePtr, imagePtrBuffered);
       if (opt.enableUI) hostProcessing.run(uiUpdateFunc);
       
-      state = opt.enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
+      // state = opt.enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
 
       size_t nonZeroCount = CountNonZeroPixels(*imagePtr);
       if(!fullImageUpdated) {
@@ -422,6 +540,11 @@ int main(int argc, char** argv) {
       }
 
     } while (!opt.enableUI || (uiServer && !state.stop));
+  }
+
+  if (opt.saveUIState) {
+    SaveStateToFile(state, opt.uiStatePath);
+    logger()->info("Saved UI state to {}", opt.uiStatePath);
   }
 
   if (opt.enableUI) hostProcessing.waitForCompletion();
