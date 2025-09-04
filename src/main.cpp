@@ -426,8 +426,11 @@ int main(int argc, char** argv) {
 
   if (opt.enableUI) hostProcessing.waitForCompletion();
 
-  auto [imageMat, updatedCount] = AssembleFramebufferImage(builder.framebuffer_host, state.mode);
-  cv::imwrite("framebuffer_full.png", imageMat);
+  auto [rgbMat, updatedCountRGB] = AssembleFramebufferImage(builder.framebuffer_host, "rgb");
+  cv::imwrite("rgb_image.png", rgbMat);
+
+  auto [depthMat, updatedCountDepth] = AssembleFramebufferImage(builder.framebuffer_host, "depth");
+  cv::imwrite("depth_image.png", depthMat);
 
   return 0;
 }

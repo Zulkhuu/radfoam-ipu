@@ -220,6 +220,7 @@ public:
 
         const float delta = closestT - t0;
         const float alpha = 1.f - __builtin_ipu_exp(-cur->density * delta);
+        const float transmittance0 = transmittance;
         const float ta    = transmittance * alpha;
 
         color.x += ta * (cur->r / 255.f);
@@ -229,15 +230,16 @@ public:
         t0       = __builtin_ipu_max(t0, closestT);
 
         // Finish or cross boundary?
-        if (transmittance < 0.01f || next == -1 || next >= nLocalPts) {
-          if (transmittance < 0.01f || next == -1) {
+        if (transmittance < 0.5f || next == -1 || next >= nLocalPts) {
+          if (transmittance < 0.5f || next == -1) {
             // Finished on this tile
             out->x = in->x; 
             out->y = packY(y_coord, 2);
             out->r = color.x; 
             out->g = color.y; 
             out->b = color.z;
-            out->t = __builtin_ipu_f32tof16(t0);
+            float d = t0 + (1.f/cur->density)*__builtin_ipu_ln(transmittance0/0.01f);
+            out->t = __builtin_ipu_f32tof16(d);
             out->transmittance = __builtin_ipu_f32tof16(transmittance);
             out->next_cluster  = tileOfXY(in->x, y_coord);   // << route to FB owner tile
             out->next_local  = FINISHED_RAY_ID;   //
