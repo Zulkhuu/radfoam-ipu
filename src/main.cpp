@@ -143,7 +143,6 @@ bool LoadStateFromFile(StateT& s, const std::string& path) {
 }
 
 
-
 static std::pair<cv::Mat, size_t> AssembleFinishedRaysImage(const std::vector<uint8_t>& finishedRaysHost, std::string mode) {
   static cv::Mat rgb_img   (kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0));
   static cv::Mat depth_img (kFullImageHeight, kFullImageWidth, CV_8UC3, cv::Scalar(0,0,0));
@@ -223,20 +222,12 @@ static std::pair<cv::Mat, size_t> AssembleFramebufferImage(const std::vector<uin
   const int tilesY = static_cast<int>(radfoam::config::kNumRayTracerTilesY);
   const std::size_t bytesPerTile = radfoam::config::kTileFramebufferSize;
 
-  cv::Mat rgb_img  (H, W, CV_8UC3, cv::Scalar(0,0,0));
-  cv::Mat depth_img(H, W, CV_8UC3, cv::Scalar(0,0,0));
+  cv::Mat rgb_img   (H, W, CV_8UC3, cv::Scalar(0,0,0));
+  cv::Mat depth_img;        
+  cv::Mat depth_gray(H, W, CV_8UC1, cv::Scalar(0)); // per-pixel 0..255 depth intensity
 
-  // precompute HSV->BGR LUT for t in [0..80]
-  static std::array<cv::Vec3b, 81> T2BGR_LUT = []{
-    std::array<cv::Vec3b, 81> lut{};
-    for (int t = 0; t <= 80; ++t) {
-      const int hue = static_cast<int>(std::lround(t * (179.0 / 80.0)));
-      cv::Mat hsv(1, 1, CV_8UC3, cv::Scalar(hue, 255, 255));
-      cv::Mat bgr; cv::cvtColor(hsv, bgr, cv::COLOR_HSV2BGR);
-      lut[t] = bgr.at<cv::Vec3b>(0, 0);
-    }
-    return lut;
-  }();
+  // Set your scene max depth here (was 80 earlier). Increase/decrease as desired.
+  const float kMaxDepth = 40.f;
 
   std::atomic<size_t> updated{0};
 
@@ -250,7 +241,8 @@ static std::pair<cv::Mat, size_t> AssembleFramebufferImage(const std::vector<uin
       for (int ly = 0; ly < tileH; ++ly) {
         const int y = ty * tileH + ly;
         uint8_t* dstRGB   = rgb_img.ptr<uint8_t>(y);
-        uint8_t* dstDepth = depth_img.ptr<uint8_t>(y);
+        uint8_t* dstGray  = depth_gray.ptr<uint8_t>(y);
+
         for (int lx = 0; lx < tileW; ++lx) {
           const int x = tx * tileW + lx;
           const FinishedPixel& p = tile[ly * tileW + lx];
@@ -263,18 +255,21 @@ static std::pair<cv::Mat, size_t> AssembleFramebufferImage(const std::vector<uin
           uint8_t* rgb = dstRGB + x*3;
           rgb[2] = p.r; rgb[1] = p.g; rgb[0] = p.b;
 
-          // depth pseudo-color from p.t (clamp 0..80)
-          int tt = static_cast<int>(std::lround(std::max(0.f, std::min(80.f, p.t))));
-          const cv::Vec3b bgr = T2BGR_LUT[tt];
-          uint8_t* d = dstDepth + x*3;
-          d[0] = bgr[0]; d[1] = bgr[1]; d[2] = bgr[2];
+          // Grayscale depth 0..255 from p.t in [0..kMaxDepth]
+          const float t_clamped = std::max(0.f, std::min(kMaxDepth, p.t));
+          const float norm = t_clamped / kMaxDepth;                      // 0..1
+          const uint8_t g = static_cast<uint8_t>(std::lround(norm * 255.f));
+          dstGray[x] = g;
         }
       }
     }
   }
 
+  cv::applyColorMap(255-depth_gray, depth_img, cv::COLORMAP_TURBO);
+
   return {(mode == "depth") ? depth_img : rgb_img, updated.load()};
 }
+
 
 size_t CountNonZeroPixels(const cv::Mat& img) {
     // Convert to grayscale mask (any nonzero channel -> 255)
@@ -473,7 +468,8 @@ int main(int argc, char** argv) {
       std::swap(imagePtr, imagePtrBuffered);
       if (opt.enableUI) hostProcessing.run(uiUpdateFunc);
       
-      // state = opt.enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
+      auto state2 = opt.enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
+      state.stop = state2.stop;
 
       size_t nonZeroCount = CountNonZeroPixels(*imagePtr);
       if(!fullImageUpdated) {

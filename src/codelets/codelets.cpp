@@ -239,7 +239,7 @@ public:
             out->g = color.y; 
             out->b = color.z;
             float d = t0 + (1.f/cur->density)*__builtin_ipu_ln(transmittance0/0.01f);
-            out->t = __builtin_ipu_f32tof16(d);
+            out->t = __builtin_ipu_f32tof16(closestT);
             out->transmittance = __builtin_ipu_f32tof16(transmittance);
             out->next_cluster  = tileOfXY(in->x, y_coord);   // << route to FB owner tile
             out->next_local  = FINISHED_RAY_ID;   //
