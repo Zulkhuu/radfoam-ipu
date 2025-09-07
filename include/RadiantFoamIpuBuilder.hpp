@@ -35,7 +35,7 @@ namespace ipu {
 
 class RadiantFoamIpuBuilder final : public ipu_utils::BuilderInterface {
 public:
-    explicit RadiantFoamIpuBuilder(std::string h5_scene_file, bool loop_frames = false, bool debug = false);
+    explicit RadiantFoamIpuBuilder(std::string h5_scene_file, bool loop_frames = false, unsigned substeps=1, bool debug = false);
 
     // BuilderInterface -------------------------------------------------------
     void build(poplar::Graph& graph, const poplar::Target& target) override;
@@ -80,7 +80,8 @@ private:
     const std::string h5_file_;
     bool debug_;
     bool loop_frames_;
-    static constexpr int kSubsteps = 20;
+    unsigned substeps_ = 1;
+    // static constexpr int kSubsteps = 1;
     static constexpr int kRouterDebugSize = 15;
     static constexpr int kRayTracerDebugSize = 600;
 

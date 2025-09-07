@@ -289,6 +289,7 @@ struct CliOptions {
   std::string uiStatePath = "ui_state.txt";
   bool loadUIState = false;
   bool saveUIState = false;
+  unsigned substeps = 1;
 };
 
 static CliOptions parseOptions(int argc, char** argv) {
@@ -300,6 +301,7 @@ static CliOptions parseOptions(int argc, char** argv) {
     ("ipu-loop", "Enable multi frame IPU loop before CPU read", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("debug", "Enable debug reporting", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("p,port", "UI port", cxxopts::value<int>()->default_value("5000"))
+    ("s,substeps", "Number of substeps per frame (>=1)", cxxopts::value<unsigned>()->default_value("1"))
     ("ui-state", "Path to UI state file", cxxopts::value<std::string>()->default_value("ui_state.txt"))
     ("load-ui-state", "Load UI state from file at startup", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
     ("save-ui-state", "Save UI state to file at shutdown", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
@@ -322,6 +324,7 @@ static CliOptions parseOptions(int argc, char** argv) {
   opts.uiStatePath   = result["ui-state"].as<std::string>();
   opts.loadUIState   = result["load-ui-state"].as<bool>();
   opts.saveUIState   = result["save-ui-state"].as<bool>();
+  opts.substeps      = std::max(1u, result["substeps"].as<unsigned>());
   return opts;
 }
 
@@ -360,7 +363,7 @@ int main(int argc, char** argv) {
   // Build and Configure IPU Graph
   // ------------------------------
   auto engineOptions = makeEngineOptions(opt.enableDebug);
-  radfoam::ipu::RadiantFoamIpuBuilder builder(opt.inputFile, opt.enableLoopIPU, opt.enableDebug);
+  radfoam::ipu::RadiantFoamIpuBuilder builder(opt.inputFile, opt.enableLoopIPU, opt.substeps, opt.enableDebug);
 
   ipu_utils::RuntimeConfig cfg{
     /*numIpus=*/1, /*numReplicas=*/1, /*exeName=*/"radiantfoam_ipu",
@@ -384,9 +387,6 @@ int main(int argc, char** argv) {
   if (opt.loadUIState) {
     if (LoadStateFromFile(state, opt.uiStatePath)) {
       logger()->info("Loaded UI state from {}", opt.uiStatePath);
-      // If you want the UI controls to reflect this immediately, and if your server
-      // exposes a method to push state, call it here (e.g., uiServer->applyState(state)).
-      // For now we at least push fov if UI is on:
     } else {
       logger()->warn("No UI state loaded (file not found or unreadable): {}", opt.uiStatePath);
     }
@@ -511,7 +511,7 @@ int main(int argc, char** argv) {
       // per frame IPU program execution
       mgr.execute(builder);
 
-      if (opt.enableDebug) {
+      if (opt.enableDebug && opt.enableUI) {
         uiServer->sendHistogram(builder.raysCount_);
       }
 

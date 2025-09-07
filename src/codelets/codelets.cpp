@@ -463,7 +463,7 @@ public:
     if(raygen_mode == 1) {
       const unsigned interval = 1;
       const unsigned nColsPerFrame = 2;
-      const unsigned idleFramesAfterSweep = 200;
+      const unsigned idleFramesAfterSweep = 50;
       const unsigned sweepFrames = (kFullImageWidth + nColsPerFrame - 1) / nColsPerFrame;
       const unsigned cycleLen = sweepFrames + idleFramesAfterSweep;
       const unsigned phase    = (*exec_count) % cycleLen;

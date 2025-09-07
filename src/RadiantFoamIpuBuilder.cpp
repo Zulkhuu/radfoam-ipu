@@ -19,9 +19,11 @@ using namespace radfoam::config;
 using ipu_utils::logger;
 using poplar::DebugContext;
 
-RadiantFoamIpuBuilder::RadiantFoamIpuBuilder(std::string h5_scene_file, bool loop_frames, bool debug)
+RadiantFoamIpuBuilder::RadiantFoamIpuBuilder(std::string h5_scene_file, bool loop_frames, unsigned substeps, bool debug)
   : h5_file_(std::move(h5_scene_file)),
+  substeps_(substeps),
   loop_frames_(loop_frames),
+
   debug_(debug) {
       exec_counter_ = 0;
 }
@@ -120,18 +122,18 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& g, const poplar::Target&) {
 
   auto frameFenceStream_ = g.addDeviceToHostFIFO("frame-fence", poplar::UNSIGNED_INT, 1);
   auto rgExec = exec_counts_.get().slice({kNumRayTracerTiles},{kNumRayTracerTiles+1}).reshape({}); // 1 x UINT
-  // batch frames: (compute set -> exchange) x kSubsteps then host copy
+  // batch frames: (compute set -> exchange) x substeps_ then host copy
   // no batching: compute set -> exchange -> host copy
   poplar::program::Sequence frame_;
   frame_.add(broadcastMatrices_);
-  if(kSubsteps == 1) {
+  if(substeps_ == 1) {
     frame_.add(poplar::program::Execute(cs));
     frame_.add(dataExchangeSeq);
   } else {
     poplar::program::Sequence substepProgram;
     substepProgram.add(poplar::program::Execute(cs));
     substepProgram.add(dataExchangeSeq);
-    frame_.add(poplar::program::Repeat(kSubsteps, substepProgram));
+    frame_.add(poplar::program::Repeat(substeps_, substepProgram));
   }
   frame_.add(framebuffer_read_.buildRead(g,true));
   frame_.add(poplar::program::Copy(rgExec, frameFenceStream_));
