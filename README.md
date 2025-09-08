@@ -6,7 +6,7 @@ IPU implementation of a paper [Radiant Foam: Real-Time Differentiable Ray Tracin
 
 ## Installation
 
-The implementation consists of two parts: ipu based renderer that runs on server and remote local viewer
+The demo consists of two parts: IPU based renderer that runs on cloud and remote local viewer.
 
 ### Build the renderer on cloud machine with IPU
 
@@ -33,11 +33,6 @@ cmake ..
 make
 ```
 
-#### Run the renderer
-```
-./main -i ../data/playroom.h5
-```
-
 ### On your local laptop or workstation:
 
 #### Clone and build the remote viewer
@@ -49,7 +44,17 @@ cmake -G Ninja ..
 ninja -j16
 ```
 
-#### Run the remote viewer
+## Data
+Scene partitioned MipNeRF360 dataset files can be downloaded from [here](https://drive.google.com/drive/folders/1Ld3mUZJYZW05Yrm6Jb_VFWbP3qg8kyE4?usp=sharing)
+
+## Running the demo
+
+#### Start the renderer on cloud machine:
+```
+./main -i <input_file>
+```
+
+#### Run the remote viewer on your local machine:
 ```
 ./remote-ui -w 1600 -h 1100 --port 5000
 ```
