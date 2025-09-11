@@ -227,7 +227,7 @@ static std::pair<cv::Mat, size_t> AssembleFramebufferImage(const std::vector<uin
   cv::Mat depth_gray(H, W, CV_8UC1, cv::Scalar(0)); // per-pixel 0..255 depth intensity
 
   // Set your scene max depth here (was 80 earlier). Increase/decrease as desired.
-  const float kMaxDepth = 40.f;
+  const float kMaxDepth = 20.f;
 
   std::atomic<size_t> updated{0};
 

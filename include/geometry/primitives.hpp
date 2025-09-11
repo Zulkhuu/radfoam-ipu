@@ -22,11 +22,29 @@ static_assert(sizeof(GenericPoint) == 16, "GenericPoint size mismatch");
 struct Ray {
   uint16_t x, y;
   uint16_t t, transmittance; // uint16_t is placeholder for float16
-  float r, g, b;
+  uint16_t r, g, b, d;
   uint16_t next_cluster; 
   uint16_t next_local;
 };
-static_assert(sizeof(Ray) == 24, "Ray size mismatch");
+static_assert(sizeof(Ray) == 20, "Ray size mismatch");
+
+// struct Ray {
+//   uint16_t x, y;
+//   uint16_t t, transmittance; // uint16_t is placeholder for float16
+//   float r, g, b;
+//   uint16_t next_cluster; 
+//   uint16_t next_local;
+// };
+// static_assert(sizeof(Ray) == 24, "Ray size mismatch");
+
+// struct Ray {
+//   uint16_t x, y;
+//   float t, transmittance; // uint16_t is placeholder for float16
+//   float r, g, b;
+//   uint16_t next_cluster; 
+//   uint16_t next_local;
+// };
+// static_assert(sizeof(Ray) == 28, "Ray size mismatch");
 
 struct FinishedRay {
   uint16_t x, y;

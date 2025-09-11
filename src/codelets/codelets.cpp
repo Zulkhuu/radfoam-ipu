@@ -19,7 +19,7 @@ using radfoam::geometry::FinishedRay;
 struct alignas(4) Ray {
   uint16_t x, y;
   half t, transmittance;
-  float r, g, b;
+  half r, g, b, d;
   uint16_t next_cluster; 
   uint16_t next_local;
 };
@@ -61,8 +61,6 @@ public:
   poplar::InOut<poplar::Vector<unsigned>> sharedOffsets;
   poplar::InOut<poplar::Vector<unsigned>> readyFlags;
 
-  // poplar::Input<unsigned> kSubsteps;
-
   // aliasing guards
   [[poplar::constraint("elem(*raysIn)!=elem(*raysOut)")]]
   [[poplar::constraint("elem(*framebuffer)!=elem(*raysIn)")]]
@@ -80,7 +78,6 @@ public:
   [[poplar::constraint("elem(*readyFlags)!=elem(*exec_count)")]]
 
   bool compute(unsigned workerId) {
-    const unsigned kSubSteps = 6;
     const unsigned C  = raysOut.size() / sizeof(Ray);
     const unsigned FR_CAP = finishedRays.size() / sizeof(FinishedRay);
     const uint16_t nLocalPts = local_pts.size() / sizeof(LocalPoint);
@@ -129,6 +126,7 @@ public:
       uint16_t y_coord = unpackYCoord(in->y);
       uint8_t y_info = unpackYInfo(in->y);
       Ray* out = reinterpret_cast<Ray*>(raysOut.data() + idx*sizeof(Ray));
+      out->d = in->d;
       
       if (in->next_cluster != myTile) { // spillover, immediately return
         std::memcpy(out, in, sizeof(Ray));
@@ -148,7 +146,7 @@ public:
             p->g = clampToU8(in->g);
             p->b = clampToU8(in->b);
             p->a = 255;
-            p->t = __builtin_ipu_f16tof32(in->t);
+            p->t = __builtin_ipu_f16tof32(out->d);
             ++consumedFinishedOnThisTile;
           }
           *out = *in;
@@ -163,8 +161,8 @@ public:
       glm::vec3 rayDir = computeRayDir(in->x, y_coord, invProj, invView);
 
       glm::vec3 color(in->r, in->g, in->b);
-      float transmittance = __builtin_ipu_f16tof32(in->transmittance);
-      float t0    = __builtin_ipu_f16tof32(in->t);
+      float transmittance = in->transmittance; //__builtin_ipu_f16tof32(in->transmittance);
+      float t0    = in->t; //__builtin_ipu_f16tof32(in->t);
 
       int current = in->next_local;
       if (current < 0 || current >= nLocalPts) {
@@ -218,9 +216,11 @@ public:
           if (t > 0.f && t < closestT) { closestT = t; next = nbrIdx; }
         }
 
+        const float transmittance0 = transmittance;
+        const float t_seg_start   = t0;
+
         const float delta = closestT - t0;
         const float alpha = 1.f - __builtin_ipu_exp(-cur->density * delta);
-        const float transmittance0 = transmittance;
         const float ta    = transmittance * alpha;
 
         color.x += ta * (cur->r / 255.f);
@@ -229,20 +229,35 @@ public:
         transmittance   *= (1.f - alpha);
         t0       = __builtin_ipu_max(t0, closestT);
 
+        float depth_quantile = 0.5f;
+        float transmittance_threshold = 0.01f;
+        
+        // if ((transmittance0 > depth_quantile) && (transmittance <= depth_quantile)) {
+          //   const float t_cross = t_seg_start + (1.f / cur->density) * __builtin_ipu_ln(transmittance0 / depth_quantile);
+        //   out->d = t_cross;
+        // } 
+        if ((transmittance0 > depth_quantile) && (transmittance <= depth_quantile) && cur->density > 0 && in->d == 0) {
+          const float ratio   = __builtin_ipu_max(1e-6f, transmittance0 / depth_quantile);
+          float t_cross = t_seg_start + (1.f / cur->density) * __builtin_ipu_ln(ratio);
+          // numerical safety: keep inside [segment start, segment end]
+          t_cross = __builtin_ipu_min(__builtin_ipu_max(t_cross, t_seg_start), closestT);
+          out->d =  __builtin_ipu_f32tof16(t_cross);
+        }
+        
         // Finish or cross boundary?
-        if (transmittance < 0.01f || next == -1 || next >= nLocalPts) {
-          if (transmittance < 0.01f || next == -1) {
+        if (transmittance < transmittance_threshold || next == -1 || next >= nLocalPts) {
+          if (transmittance < transmittance_threshold || next == -1) {
             // Finished on this tile
             out->x = in->x; 
             out->y = packY(y_coord, 2);
             out->r = color.x; 
             out->g = color.y; 
             out->b = color.z;
-            float d = t0 + (1.f/cur->density)*__builtin_ipu_ln(transmittance0/0.01f);
-            out->t = __builtin_ipu_f32tof16(closestT);
-            out->transmittance = __builtin_ipu_f32tof16(transmittance);
+            out->t = closestT; //__builtin_ipu_f32tof16(closestT);
+            // out->d = closestT;
+            out->transmittance = transmittance; //__builtin_ipu_f32tof16(transmittance);
             out->next_cluster  = tileOfXY(in->x, y_coord);   // << route to FB owner tile
-            out->next_local  = FINISHED_RAY_ID;   //
+            out->next_local  = FINISHED_RAY_ID;
             ++localFinished;
             *result_u16 = FINISHED_RAY_ID;
             *result_float = color.x;
@@ -254,8 +269,8 @@ public:
             out->r = color.x; 
             out->g = color.y; 
             out->b = color.z;
-            out->t = __builtin_ipu_f32tof16(t0);
-            out->transmittance = __builtin_ipu_f32tof16(transmittance); //__builtin_ipu_max(0.f, __builtin_ipu_min(1.f, transmittance)));
+            out->t = t0; //__builtin_ipu_f32tof16(t0);
+            out->transmittance = transmittance; //__builtin_ipu_f32tof16(transmittance); //__builtin_ipu_max(0.f, __builtin_ipu_min(1.f, transmittance)));
             out->next_cluster  = nb->cluster_id;
             out->next_local    = nb->local_id;
 
@@ -432,18 +447,21 @@ public:
     int raygen_mode = 1;
     if(raygen_mode == 0) {
       const unsigned interval = 1;
-      const bool genThisFrame = ((*exec_count % interval) == 0);
-      if (genThisFrame) {
-        const unsigned nRowsPerFrame = 1;
-        const unsigned rowBase = ((*exec_count)/interval) * nRowsPerFrame;
+      const unsigned nRowsPerFrame = 1;
+      const unsigned idleFramesAfterSweep = 200;
+      const unsigned sweepFrames = (kFullImageHeight + nRowsPerFrame - 1) / nRowsPerFrame;
+      const unsigned cycleLen = sweepFrames + idleFramesAfterSweep;
+      const unsigned phase    = (*exec_count) % cycleLen;
+      if (phase < sweepFrames) {
+        const unsigned rowBase = phase * nRowsPerFrame;
 
         // Don’t generate more than remaining output capacity + queue free slots
         unsigned budget = (C - outCnt) + qFree(head, tail);
 
         Ray g{};
         g.r = g.g = g.b = 0.0f;
-        g.t = __builtin_ipu_f32tof16(0.0f);
-        g.transmittance = __builtin_ipu_f32tof16(1.0f);
+        g.t = 0.0f; g.d = 0.0f;
+        g.transmittance = 1.0f;
         g.next_cluster = cluster_id;
         g.next_local   = local_id;
         for (uint16_t cy = 0; cy < nRowsPerFrame; ++cy) {
@@ -463,7 +481,7 @@ public:
     if(raygen_mode == 1) {
       const unsigned interval = 1;
       const unsigned nColsPerFrame = 2;
-      const unsigned idleFramesAfterSweep = 50;
+      const unsigned idleFramesAfterSweep = 200;
       const unsigned sweepFrames = (kFullImageWidth + nColsPerFrame - 1) / nColsPerFrame;
       const unsigned cycleLen = sweepFrames + idleFramesAfterSweep;
       const unsigned phase    = (*exec_count) % cycleLen;
@@ -475,8 +493,8 @@ public:
 
         Ray g{};
         g.r = g.g = g.b = 0.0f;
-        g.t = __builtin_ipu_f32tof16(0.0f);
-        g.transmittance = __builtin_ipu_f32tof16(1.0f);
+        g.t = 0.0f; g.d = 0.0f;
+        g.transmittance = 1.0f;
         g.next_cluster = cluster_id;
         g.next_local   = local_id;
         for (uint16_t cx = 0; cx < nColsPerFrame && budget; ++cx) {
@@ -499,8 +517,8 @@ public:
         unsigned budget = (C - outCnt) + qFree(head, tail);
         Ray g{};
         g.r = g.g = g.b = 0.0f;
-        g.t = __builtin_ipu_f32tof16(0.0f);
-        g.transmittance = __builtin_ipu_f32tof16(1.0f);
+        g.t = 0.0f;
+        g.transmittance = 1.0f;
         g.next_cluster = cluster_id;
         g.next_local   = local_id;
         g.x = 200; 
@@ -522,8 +540,8 @@ public:
         unsigned step = *exec_count % total;
         Ray g{};
         g.r = g.g = g.b = 0.0f;
-        g.t = __builtin_ipu_f32tof16(0.0f);
-        g.transmittance = __builtin_ipu_f32tof16(1.0f);
+        g.t = 0.0f;
+        g.transmittance = 1.0f;
         g.next_cluster = cluster_id;
         g.next_local   = local_id;
         for(int basex=0; basex < kFullImageWidth/bx; basex++) {
@@ -547,8 +565,8 @@ public:
         const unsigned colBase = ((*exec_count)/interval) * nColsPerFrame;
         Ray g{};
         g.r = g.g = g.b = 0.0f;
-        g.t = __builtin_ipu_f32tof16(0.0f);
-        g.transmittance = __builtin_ipu_f32tof16(1.0f);
+        g.t = 0.0f;
+        g.transmittance = 1.0f;
         g.next_cluster = cluster_id;
         g.next_local   = local_id;
         g.x = colBase% kFullImageWidth; 
@@ -749,12 +767,13 @@ private:
     unsigned*       __restrict d_raw = reinterpret_cast<unsigned*>(dst);
     unsigned *d = d_raw; 
     // exact unroll (6 x 32-bit)
-    ipu::store_postinc(&d, s[0], 1);
-    ipu::store_postinc(&d, s[1], 1);
-    ipu::store_postinc(&d, s[2], 1);
-    ipu::store_postinc(&d, s[3], 1);
-    ipu::store_postinc(&d, s[4], 1);
-    ipu::store_postinc(&d, s[5], 1);
+    for(int i=0; i<sizeof(Ray)/4; i++)
+      ipu::store_postinc(&d, s[i], 1);
+    // ipu::store_postinc(&d, s[1], 1);
+    // ipu::store_postinc(&d, s[2], 1);
+    // ipu::store_postinc(&d, s[3], 1);
+    // ipu::store_postinc(&d, s[4], 1);
+    // ipu::store_postinc(&d, s[5], 1);
   }
 
   [[gnu::always_inline]]
@@ -1175,12 +1194,14 @@ private:
     unsigned* d = reinterpret_cast<unsigned*>(dst);  // NOTE: no __restrict here
 
     // exact unroll helps codegen
-    ipu::store_postinc(&d, s[0], 1);
-    ipu::store_postinc(&d, s[1], 1);
-    ipu::store_postinc(&d, s[2], 1);
-    ipu::store_postinc(&d, s[3], 1);
-    ipu::store_postinc(&d, s[4], 1);
-    ipu::store_postinc(&d, s[5], 1);
+    for(int i=0; i<sizeof(Ray)/4; i++)
+      ipu::store_postinc(&d, s[i], 1);
+    // ipu::store_postinc(&d, s[0], 1);
+    // ipu::store_postinc(&d, s[1], 1);
+    // ipu::store_postinc(&d, s[2], 1);
+    // ipu::store_postinc(&d, s[3], 1);
+    // ipu::store_postinc(&d, s[4], 1);
+    // ipu::store_postinc(&d, s[5], 1);
   }
 
   [[gnu::always_inline]]
