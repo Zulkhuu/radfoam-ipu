@@ -47,7 +47,8 @@ include_directories(
 # ───── Main Executable ─────────────────────────────────────────────
 add_executable(main 
   src/main.cpp
-  src/RadiantFoamIpuBuilder.cpp  )
+  src/RadiantFoamIpuBuilder.cpp 
+  src/util/cmdline_options.cpp )
 
 # ───── Target Configuration ────────────────────────────────────────
 target_include_directories(main
