@@ -1,0 +1,11 @@
+h5py
+imageio
+ipykernel
+matplotlib
+numpy
+notebook
+open3d
+pandas
+plyfile
+pyvista
+shapely
