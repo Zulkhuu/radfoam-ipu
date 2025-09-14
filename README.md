@@ -5,13 +5,15 @@ This repository provides an **IPU-accelerated renderer** designed to leverage Gr
 
 ![Radiant Foam — garden](./assets/garden_rgb_image.png)
 
-## What’s inside
+## What’s Inside
 
-- **IPU renderer** (C++): builds and runs inside a Docker image on a cloud machine with IPUs.  
-- **Scene partitioning** (Python): utilities/notebook to preprocess scenes and save outputs.
+- **IPU Renderer** (C++): The core renderer that builds and runs inside a Docker image on a cloud machine equipped with Graphcore IPUs.  
+- **Scene Partitioning** (Python): A set of utilities and Jupyter notebooks for preprocessing scenes and saving partitioned outputs.  
 
-### Also required:
-- **Remote viewer** (C++): runs on your laptop/workstation and streams frames from the renderer. The Remote Viewer can be installed from the repository: [remote_render_ui](https://github.com/Zulkhuu/remote_render_ui).
+### Also Required
+- **Remote Viewer** (C++): A lightweight client that runs on your laptop or workstation and streams frames from the renderer in real time.  
+  The Remote Viewer can be installed from the official repository: [remote_render_ui](https://github.com/Zulkhuu/remote_render_ui).  
+
 
 
 ## Quick start
