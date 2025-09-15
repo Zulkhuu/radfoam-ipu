@@ -95,7 +95,7 @@ glm::vec3 RadiantFoamIpuBuilder::getCameraPos() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  build() – graph construction (called exactly once)
+//  build() – graph construction
 // ─────────────────────────────────────────────────────────────────────────────
 void RadiantFoamIpuBuilder::build(poplar::Graph& g, const poplar::Target&) {
   RF_LOG("Building RadiantFoam graph");
@@ -139,8 +139,7 @@ void RadiantFoamIpuBuilder::build(poplar::Graph& g, const poplar::Target&) {
   frame_.add(poplar::program::Copy(rgExec, frameFenceStream_));
   getPrograms().add("frame", frame_);
 
-  // RepeatWhileTrue program setup
-  // called once from main and loop frame program until stopflag is enabled
+  // RepeatWhileTrue called once from main and loop frame program until stopflag is enabled
   auto condProgram = stopFlag_.buildWrite(g, true);
   auto frameLoopProgram = poplar::program::RepeatWhileTrue(condProgram, stopFlag_.get(), frame_);
   getPrograms().add("frame_loop", frameLoopProgram);
@@ -405,7 +404,6 @@ void RadiantFoamIpuBuilder::buildRayTracers(poplar::Graph& g, poplar::ComputeSet
     broadcastMatrices_.add(poplar::program::Copy(srcProj, dstProj, /*dontOutline*/true,
                                                 DebugContext{"broadcast_matrices/proj"}));
 
-    // getPrograms().add("RayTraceCSExecution", poplar::program::Execute(cs));
     getPrograms().add("broadcast_matrices", broadcastMatrices_);
     getPrograms().add("write_scene_data", per_tile_writes_);
 }
@@ -523,7 +521,6 @@ void RadiantFoamIpuBuilder::buildRayRoutersL1(poplar::Graph& g, poplar::ComputeS
         const uint16_t tile = router_tile_offset + router_id;
         auto v = g.addVertex(cs, "RayRouter");
 
-        // IO buffer slicing logic same as L0
         const size_t base = router_id * kRouterPerTileBuffer;
         auto sliceIn  = [&](size_t idx){return L1RouterIn.slice (base+idx*kRayIOBytesPerTile,
                                                                  base+(idx+1)*kRayIOBytesPerTile);} ;
@@ -600,7 +597,7 @@ void RadiantFoamIpuBuilder::buildRayRoutersL2(poplar::Graph& g, poplar::ComputeS
         router_tile_offset
     );
 
-    // Child cluster IDs: spacing by 64 (since L2 handles 64 clusters)
+    // Child cluster IDs: spacing by 16 (since L2 handles 16 clusters)
     std::vector<uint16_t> clusterIds;
     clusterIds.reserve(kNumL2RouterTiles * kChildrenPerRouter);
     for (size_t r = 0; r < kNumL2RouterTiles; ++r) {

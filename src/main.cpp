@@ -133,7 +133,6 @@ static std::pair<cv::Mat, size_t> AssembleFramebufferImage(const std::vector<uin
   cv::Mat depth_img;        
   cv::Mat depth_gray(H, W, CV_8UC1, cv::Scalar(0)); // per-pixel 0..255 depth intensity
 
-  // Set your scene max depth here (was 80 earlier). Increase/decrease as desired.
   const float kMaxDepth = 20.f;
 
   std::atomic<size_t> updated{0};
@@ -171,8 +170,13 @@ static std::pair<cv::Mat, size_t> AssembleFramebufferImage(const std::vector<uin
       }
     }
   }
+  
+  cv::Mat filtered;
+  cv::medianBlur(depth_gray, filtered, 3);
 
-  cv::applyColorMap(255-depth_gray, depth_img, cv::COLORMAP_TURBO);
+  cv::Mat mask = (depth_gray < 20);
+  filtered.copyTo(depth_gray, mask);
+  cv::applyColorMap(255 - depth_gray, depth_img, cv::COLORMAP_TURBO);
 
   return {(mode == "depth") ? depth_img : rgb_img, updated.load()};
 }
@@ -298,18 +302,18 @@ int main(int argc, char** argv) {
   bool fullImageUpdated = false;
   int step=0;
   
-  if(opt.enableDeviceLoop) { // use repeatwhiletrue for IPU execution
-    {
-      if (opt.enableUI) {
-        hostProcessing.waitForCompletion();
-        if(!opt.loadUIState)
-          state = uiServer->consumeState();
-      }
-      builder.updateCameraParameters(state);
-      auto camera_position = builder.getCameraPos();
-      auto camera_cell = kdtree->getNearestNeighbor(camera_position);
-      builder.updateCameraCell(camera_cell);
+  {
+    if (opt.enableUI) {
+      hostProcessing.waitForCompletion();
+      if(!opt.loadUIState)
+        state = uiServer->consumeState();
     }
+    builder.updateCameraParameters(state);
+    auto camera_position = builder.getCameraPos();
+    auto camera_cell = kdtree->getNearestNeighbor(camera_position);
+    builder.updateCameraCell(camera_cell);
+  }
+  if(opt.enableDeviceLoop) { // use repeatwhiletrue for IPU execution
     builder.stopFlagHost_ = 1;
     std::thread ipuThread([&] {
       mgr.execute(builder);
@@ -347,8 +351,17 @@ int main(int argc, char** argv) {
       auto [imageMat, updatedCount] = AssembleFramebufferImage(localCopy, state.mode);
       *imagePtr = imageMat;
 
+      if (opt.enableUI) {
+        hostProcessing.waitForCompletion();
+        state = uiServer->consumeState();
+      }
+
       if (opt.enableUI) hostProcessing.run(uiUpdateFunc);
       
+      if (opt.enableDebug && opt.enableUI) {
+        uiServer->sendHistogram(builder.raysCount_);
+      }
+
       auto state2 = opt.enableUI && uiServer ? uiServer->consumeState() : InterfaceServer::State{};
       state.stop = state2.stop;
 

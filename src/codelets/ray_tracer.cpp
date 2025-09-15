@@ -81,7 +81,7 @@ public:
     };
     auto localXY = [&](uint16_t x, uint16_t y, uint16_t tile, uint16_t &lx, uint16_t &ly){
       lx = static_cast<uint16_t>(x - tileX * kTileImageWidth);
-      ly = static_cast<uint16_t>(y   - tileY * kTileImageHeight);
+      ly = static_cast<uint16_t>(y - tileY * kTileImageHeight);
     };
     auto fbAt = [&](uint16_t lx, uint16_t ly)->FinishedPixel* {
       FinishedPixel* fb = reinterpret_cast<FinishedPixel*>(framebuffer.data());
@@ -216,19 +216,20 @@ public:
         transmittance   *= (1.f - alpha);
         t0       = __builtin_ipu_max(t0, closestT);
 
-        float depth_quantile = 0.5f;
+        half depth_quantile = 0.5f;
         float transmittance_threshold = 0.01f;
         
         // if ((transmittance0 > depth_quantile) && (transmittance <= depth_quantile)) {
           //   const float t_cross = t_seg_start + (1.f / cur->density) * __builtin_ipu_ln(transmittance0 / depth_quantile);
         //   out->d = t_cross;
         // } 
-        if ((transmittance0 > depth_quantile) && (transmittance <= depth_quantile) && cur->density > 0 && in->d == 0) {
+        if ((transmittance0 > depth_quantile) && (transmittance <= depth_quantile) && cur->density > 0.0f && in->d == 0 && closestT > 0.48) {
           const float ratio   = __builtin_ipu_max(1e-6f, transmittance0 / depth_quantile);
           float t_cross = t_seg_start + (1.f / cur->density) * __builtin_ipu_ln(ratio);
           // numerical safety: keep inside [segment start, segment end]
-          t_cross = __builtin_ipu_min(__builtin_ipu_max(t_cross, t_seg_start), closestT);
-          out->d =  __builtin_ipu_f32tof16(t_cross);
+        //   t_cross = __builtin_ipu_min(__builtin_ipu_max(t_cross, t_seg_start), closestT);
+        //   out->d =  __builtin_ipu_f32tof16(t_cross);
+          out->d  = t0;
         }
         
         // Finish or cross boundary?

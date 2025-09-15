@@ -12,7 +12,8 @@ namespace ipu::geometry {
 struct alignas(4) Ray {
 uint16_t x, y;
 half t, transmittance;
-half r, g, b, d;
+half r, g, b;
+half d;
 uint16_t next_cluster; 
 uint16_t next_local;
 };

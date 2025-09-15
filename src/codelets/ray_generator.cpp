@@ -95,7 +95,7 @@ public:
     }
 
     // ── 3) fill remaining with generated rays
-    int raygen_mode = 1;
+    int raygen_mode = 0;
     if(raygen_mode == 0) {
       const unsigned interval = 1;
       const unsigned nRowsPerFrame = 1;
