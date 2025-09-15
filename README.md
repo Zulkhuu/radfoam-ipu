@@ -87,13 +87,16 @@ It builds on and uses the following projects:
 - [3D Gaussian Splatting on Graphcore IPUs](https://github.com/nmjfry/gaussian_splat_ipu)
 - [Remote User Interface (remote viewer)](https://github.com/Zulkhuu/remote_render_ui)
 
-The following public libraries are included via Git submodules under the external/ directory and are fetched when cloning recursively:
+We also make use of several excellent open-source libraries, which are retrieved when cloning recursively or installed as part of the build process. We are grateful to their authors and maintainers for making them publicly available:
 
-- **GLM** — OpenGL Mathematics library  
-  `external/glm` → <https://github.com/g-truc/glm>
+- **GLM** — OpenGL Mathematics library → <https://github.com/g-truc/glm>
 
-- **packetcomms** — Lightweight packet-based communications helpers  
-  `external/packetcomms` → <https://github.com/mpups/packetcomms>
+- **packetcomms** — Lightweight packet-based communications helpers → <https://github.com/mpups/packetcomms>
 
-- **videolib** — Utilities for video/stream handling  
-  `external/videolib` → <https://github.com/markp-gc/videolib>
+- **videolib** — Utilities for video/stream handling → <https://github.com/markp-gc/videolib>
+
+- **highfive** — Header-only C++14 friendly interface for libhdf5 → <https://github.com/BlueBrain/HighFive>
+
+- **nanoflann** — Header-only library for building KD-Trees → <https://github.com/jlblancoc/nanoflann>
+
+- **cxxopts** — Lightweight C++ command line option parser → <https://github.com/jarro2783/cxxopts>
